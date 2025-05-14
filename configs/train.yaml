@@ -1,0 +1,106 @@
+# UnderwaterEnhanceNet 训练配置
+
+# 实验配置
+experiment:
+  name: underwater_enhance_run
+  output_dir: experiments/train
+  auto_naming: true  # 自动为每次实验添加时间戳
+  timestamp_format: "%Y%m%d_%H%M%S"  # 时间戳格式
+
+# 模型配置
+model:
+  base_channels: 48
+  levels: 4
+  heads: 8
+  bottleneck_blocks: 4
+
+# 训练配置
+train:
+  epochs: 100
+  val_interval: 1
+  vis_interval: 100  # 每多少个batch记录一次可视化数据
+  param_vis_interval: 500  # 每多少个batch记录一次参数直方图
+  save_best: true  # 是否保存最佳模型
+  save_interval: 10  # 每多少个epoch保存一次模型
+
+# GPU配置
+gpu:
+  use_gpu: true  # 是否使用GPU
+  device_ids: [0]  # 使用的GPU ID列表，为空时使用所有可用GPU
+  mixed_precision: true  # 是否使用混合精度训练
+  distributed: true  # 是否使用分布式训练 (优先使用DDP)
+  backend: "nccl"  # 分布式后端，可选 "nccl" (GPU) 或 "gloo" (CPU)
+  sync_bn: true  # 是否使用SyncBatchNorm
+  find_unused_parameters: false  # 是否在DDP中查找未使用参数
+
+# 数据配置
+data:
+  format: "folder"  # 数据格式: "folder" 或 "lmdb"
+  dataset_type: "multi_degradation"  # 数据集类型，统一使用multi_degradation框架处理
+  train_root: "DATA/train"  # 训练数据集路径
+  val_root: "DATA/val"      # 验证数据集路径
+  folder_structure:  # 固定文件夹结构，仅在format="folder"时有效
+    gt: "gt"        # 目标图像文件夹名
+    depth: "depth"  # 深度图文件夹名
+  # 退化图像文件夹列表 - 用于控制输入数据
+  degradation_folders: ["raw"]  # 单输入：设置为["raw"]；多输入：设置为["deg1", "deg2", "deg3"...]
+  lmdb_paths:  # LMDB路径，仅在format="lmdb"时有效
+    train: DATA/train.lmdb"
+    val: "DATA/val.lmdb"
+  batch_size: 2
+  num_workers: 32
+  resolution: 128  # 训练分辨率，可以是单值或[h, w]格式
+  augment_prob: 0.1  # 数据增强概率
+  augmentations:  # 数据增强配置
+    flip_h: true
+    flip_v: false
+    color_jitter: true
+    random_crop: true
+
+# 优化器配置
+optimizer:
+  name: adamw  # adam, adamw, sgd
+  lr: 0.0001
+  weight_decay: 0.01
+  beta1: 0.9
+  beta2: 0.99
+  momentum: 0.9  # 仅对SGD有效
+  nesterov: true  # 仅对SGD有效
+
+# 学习率调度器
+scheduler:
+  name: plateau  # cosine, cosine_warmup, multistep, step, plateau
+  warmup_epochs: 5
+  min_lr: 0.000001
+  milestones: [60, 80]  # 仅对multistep有效
+  gamma: 0.1  # 衰减因子，仅对multistep和step有效
+  patience: 5  # 仅对plateau有效
+  factor: 0.5  # 仅对plateau有效
+
+# 损失函数权重
+loss:
+  lambda_img: 1.0    # L1 像素损失
+  lambda_ssim: 0.5   # 结构相似度损失
+  lambda_perc: 0.1   # 感知损失
+  lambda_fft: 0.05   # 频域损失
+  lambda_grad: 0.1   # 梯度损失
+  lambda_depth: 1.0  # 深度预测损失
+  lambda_smooth: 0.01  # 深度平滑损失
+  teacher_student:
+    feat_weight: 0.5  # 特征对齐损失权重
+    attn_weight: 0.2  # 注意力对齐损失权重
+
+# 可视化配置
+visualization:
+  save_images: true
+  save_features: true
+  save_depth_fusion: true
+  max_images_per_batch: 4  # 每个批次最多保存多少图像
+  vis_freq: 100  # 每多少个batch保存一次可视化
+  val_images:
+    save: true  # 是否保存验证集图像
+    max_samples: 8  # 最多保存多少个验证样本
+    save_comparison: true  # 是否保存对比图(输入/输出/GT)
+    save_metrics: true  # 是否在图像上标注指标
+  save_model_graph: true  # 是否保存模型结构图
+  plot_lr: true  # 是否绘制学习率曲线 

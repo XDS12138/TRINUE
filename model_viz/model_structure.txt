@@ -1,0 +1,301 @@
+UnderwaterEnhanceNet(
+  (sfe): ShallowFeatureExtractor(
+    (conv1): Conv2d(3, 48, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), bias=False)
+    (norm1): GroupNorm(1, 48, eps=1e-05, affine=True)
+    (act1): GELU(approximate='none')
+    (conv2): Conv2d(48, 48, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), bias=False)
+    (norm2): GroupNorm(1, 48, eps=1e-05, affine=True)
+    (act2): GELU(approximate='none')
+  )
+  (depth_extractor): DepthFeatureExtractor(
+    (blocks): ModuleList(
+      (0): Sequential(
+        (0): Conv2d(1, 48, kernel_size=(3, 3), stride=(2, 2), padding=(1, 1), bias=False)
+        (1): ReLU(inplace=True)
+        (2): Conv2d(48, 48, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), bias=False)
+        (3): ReLU(inplace=True)
+      )
+      (1-3): 3 x Sequential(
+        (0): Conv2d(48, 48, kernel_size=(3, 3), stride=(2, 2), padding=(1, 1), bias=False)
+        (1): ReLU(inplace=True)
+        (2): Conv2d(48, 48, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), bias=False)
+        (3): ReLU(inplace=True)
+      )
+    )
+  )
+  (depth_head): MonoDepthHead(
+    (encoder): Sequential(
+      (0): Conv2d(48, 48, kernel_size=(3, 3), stride=(2, 2), padding=(1, 1), bias=False)
+      (1): ReLU(inplace=True)
+      (2): Conv2d(48, 96, kernel_size=(3, 3), stride=(2, 2), padding=(1, 1), bias=False)
+      (3): ReLU(inplace=True)
+    )
+    (decoder): Sequential(
+      (0): ConvTranspose2d(96, 48, kernel_size=(2, 2), stride=(2, 2))
+      (1): GELU(approximate='none')
+      (2): ConvTranspose2d(48, 48, kernel_size=(2, 2), stride=(2, 2))
+      (3): GELU(approximate='none')
+    )
+    (proj): Conv2d(48, 1, kernel_size=(1, 1), stride=(1, 1))
+    (act): Sigmoid()
+  )
+  (encoder): RawEncoder(
+    (sfe): ShallowFeatureExtractor(
+      (conv1): Conv2d(3, 48, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), bias=False)
+      (norm1): GroupNorm(1, 48, eps=1e-05, affine=True)
+      (act1): GELU(approximate='none')
+      (conv2): Conv2d(48, 48, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), bias=False)
+      (norm2): GroupNorm(1, 48, eps=1e-05, affine=True)
+      (act2): GELU(approximate='none')
+    )
+    (depth_extractor): DepthFeatureExtractor(
+      (blocks): ModuleList(
+        (0): Sequential(
+          (0): Conv2d(1, 48, kernel_size=(3, 3), stride=(2, 2), padding=(1, 1), bias=False)
+          (1): ReLU(inplace=True)
+          (2): Conv2d(48, 48, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), bias=False)
+          (3): ReLU(inplace=True)
+        )
+        (1-3): 3 x Sequential(
+          (0): Conv2d(48, 48, kernel_size=(3, 3), stride=(2, 2), padding=(1, 1), bias=False)
+          (1): ReLU(inplace=True)
+          (2): Conv2d(48, 48, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), bias=False)
+          (3): ReLU(inplace=True)
+        )
+      )
+    )
+    (gt_encoder): GTEncoder(
+      (blocks): ModuleList(
+        (0): Sequential(
+          (0): Conv2d(3, 48, kernel_size=(3, 3), stride=(2, 2), padding=(1, 1), bias=False)
+          (1): GELU(approximate='none')
+          (2): Conv2d(48, 48, kernel_size=(3, 3), stride=(2, 2), padding=(1, 1), bias=False)
+          (3): GELU(approximate='none')
+        )
+        (1-3): 3 x Sequential(
+          (0): Conv2d(48, 48, kernel_size=(3, 3), stride=(2, 2), padding=(1, 1), bias=False)
+          (1): GELU(approximate='none')
+          (2): Conv2d(48, 48, kernel_size=(3, 3), stride=(2, 2), padding=(1, 1), bias=False)
+          (3): GELU(approximate='none')
+        )
+      )
+    )
+    (down_convs): ModuleList(
+      (0-3): 4 x Sequential(
+        (0): Conv2d(48, 48, kernel_size=(3, 3), stride=(2, 2), padding=(1, 1), bias=False)
+        (1): GroupNorm(1, 48, eps=1e-05, affine=True)
+        (2): GELU(approximate='none')
+      )
+    )
+    (cross_attns): ModuleList(
+      (0-3): 4 x CrossAttention(
+        (to_q): Conv2d(48, 48, kernel_size=(1, 1), stride=(1, 1), bias=False)
+        (to_k): Conv2d(48, 48, kernel_size=(1, 1), stride=(1, 1), bias=False)
+        (to_v): Conv2d(48, 48, kernel_size=(1, 1), stride=(1, 1), bias=False)
+        (proj): Conv2d(48, 48, kernel_size=(1, 1), stride=(1, 1), bias=False)
+      )
+    )
+    (transformers): ModuleList(
+      (0-3): 4 x Sequential(
+        (0): RestormerBlock(
+          (norm1): LayerNorm2d(
+            (norm): LayerNorm((48,), eps=1e-05, elementwise_affine=True)
+          )
+          (attn): MDTA(
+            (qkv): Conv2d(48, 144, kernel_size=(1, 1), stride=(1, 1), bias=False)
+            (dw_conv): Conv2d(144, 144, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), groups=144, bias=False)
+            (proj): Conv2d(48, 48, kernel_size=(1, 1), stride=(1, 1), bias=False)
+          )
+          (norm2): LayerNorm2d(
+            (norm): LayerNorm((48,), eps=1e-05, elementwise_affine=True)
+          )
+          (ffn): GDFN(
+            (project_in): Conv2d(48, 96, kernel_size=(1, 1), stride=(1, 1), bias=False)
+            (dw_conv): Conv2d(96, 96, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), groups=96, bias=False)
+            (gate_conv): Conv2d(96, 96, kernel_size=(1, 1), stride=(1, 1), bias=False)
+            (act): GELU(approximate='none')
+            (project_out): Conv2d(96, 48, kernel_size=(1, 1), stride=(1, 1), bias=False)
+          )
+        )
+        (1): RestormerBlock(
+          (norm1): LayerNorm2d(
+            (norm): LayerNorm((48,), eps=1e-05, elementwise_affine=True)
+          )
+          (attn): MDTA(
+            (qkv): Conv2d(48, 144, kernel_size=(1, 1), stride=(1, 1), bias=False)
+            (dw_conv): Conv2d(144, 144, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), groups=144, bias=False)
+            (proj): Conv2d(48, 48, kernel_size=(1, 1), stride=(1, 1), bias=False)
+          )
+          (norm2): LayerNorm2d(
+            (norm): LayerNorm((48,), eps=1e-05, elementwise_affine=True)
+          )
+          (ffn): GDFN(
+            (project_in): Conv2d(48, 96, kernel_size=(1, 1), stride=(1, 1), bias=False)
+            (dw_conv): Conv2d(96, 96, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), groups=96, bias=False)
+            (gate_conv): Conv2d(96, 96, kernel_size=(1, 1), stride=(1, 1), bias=False)
+            (act): GELU(approximate='none')
+            (project_out): Conv2d(96, 48, kernel_size=(1, 1), stride=(1, 1), bias=False)
+          )
+        )
+      )
+    )
+  )
+  (bottleneck): Sequential(
+    (0): RestormerBlock(
+      (norm1): LayerNorm2d(
+        (norm): LayerNorm((48,), eps=1e-05, elementwise_affine=True)
+      )
+      (attn): MDTA(
+        (qkv): Conv2d(48, 144, kernel_size=(1, 1), stride=(1, 1), bias=False)
+        (dw_conv): Conv2d(144, 144, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), groups=144, bias=False)
+        (proj): Conv2d(48, 48, kernel_size=(1, 1), stride=(1, 1), bias=False)
+      )
+      (norm2): LayerNorm2d(
+        (norm): LayerNorm((48,), eps=1e-05, elementwise_affine=True)
+      )
+      (ffn): GDFN(
+        (project_in): Conv2d(48, 96, kernel_size=(1, 1), stride=(1, 1), bias=False)
+        (dw_conv): Conv2d(96, 96, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), groups=96, bias=False)
+        (gate_conv): Conv2d(96, 96, kernel_size=(1, 1), stride=(1, 1), bias=False)
+        (act): GELU(approximate='none')
+        (project_out): Conv2d(96, 48, kernel_size=(1, 1), stride=(1, 1), bias=False)
+      )
+    )
+    (1): RestormerBlock(
+      (norm1): LayerNorm2d(
+        (norm): LayerNorm((48,), eps=1e-05, elementwise_affine=True)
+      )
+      (attn): MDTA(
+        (qkv): Conv2d(48, 144, kernel_size=(1, 1), stride=(1, 1), bias=False)
+        (dw_conv): Conv2d(144, 144, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), groups=144, bias=False)
+        (proj): Conv2d(48, 48, kernel_size=(1, 1), stride=(1, 1), bias=False)
+      )
+      (norm2): LayerNorm2d(
+        (norm): LayerNorm((48,), eps=1e-05, elementwise_affine=True)
+      )
+      (ffn): GDFN(
+        (project_in): Conv2d(48, 96, kernel_size=(1, 1), stride=(1, 1), bias=False)
+        (dw_conv): Conv2d(96, 96, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), groups=96, bias=False)
+        (gate_conv): Conv2d(96, 96, kernel_size=(1, 1), stride=(1, 1), bias=False)
+        (act): GELU(approximate='none')
+        (project_out): Conv2d(96, 48, kernel_size=(1, 1), stride=(1, 1), bias=False)
+      )
+    )
+    (2): RestormerBlock(
+      (norm1): LayerNorm2d(
+        (norm): LayerNorm((48,), eps=1e-05, elementwise_affine=True)
+      )
+      (attn): MDTA(
+        (qkv): Conv2d(48, 144, kernel_size=(1, 1), stride=(1, 1), bias=False)
+        (dw_conv): Conv2d(144, 144, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), groups=144, bias=False)
+        (proj): Conv2d(48, 48, kernel_size=(1, 1), stride=(1, 1), bias=False)
+      )
+      (norm2): LayerNorm2d(
+        (norm): LayerNorm((48,), eps=1e-05, elementwise_affine=True)
+      )
+      (ffn): GDFN(
+        (project_in): Conv2d(48, 96, kernel_size=(1, 1), stride=(1, 1), bias=False)
+        (dw_conv): Conv2d(96, 96, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), groups=96, bias=False)
+        (gate_conv): Conv2d(96, 96, kernel_size=(1, 1), stride=(1, 1), bias=False)
+        (act): GELU(approximate='none')
+        (project_out): Conv2d(96, 48, kernel_size=(1, 1), stride=(1, 1), bias=False)
+      )
+    )
+    (3): RestormerBlock(
+      (norm1): LayerNorm2d(
+        (norm): LayerNorm((48,), eps=1e-05, elementwise_affine=True)
+      )
+      (attn): MDTA(
+        (qkv): Conv2d(48, 144, kernel_size=(1, 1), stride=(1, 1), bias=False)
+        (dw_conv): Conv2d(144, 144, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), groups=144, bias=False)
+        (proj): Conv2d(48, 48, kernel_size=(1, 1), stride=(1, 1), bias=False)
+      )
+      (norm2): LayerNorm2d(
+        (norm): LayerNorm((48,), eps=1e-05, elementwise_affine=True)
+      )
+      (ffn): GDFN(
+        (project_in): Conv2d(48, 96, kernel_size=(1, 1), stride=(1, 1), bias=False)
+        (dw_conv): Conv2d(96, 96, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), groups=96, bias=False)
+        (gate_conv): Conv2d(96, 96, kernel_size=(1, 1), stride=(1, 1), bias=False)
+        (act): GELU(approximate='none')
+        (project_out): Conv2d(96, 48, kernel_size=(1, 1), stride=(1, 1), bias=False)
+      )
+    )
+  )
+  (decoder): MultiTaskDecoder(
+    (deblur_ups): ModuleList(
+      (0-2): 3 x PixelShuffle(upscale_factor=2)
+    )
+    (scale_mlp): Sequential(
+      (0): Conv2d(192, 48, kernel_size=(1, 1), stride=(1, 1), bias=False)
+      (1): GELU(approximate='none')
+      (2): Conv2d(48, 4, kernel_size=(1, 1), stride=(1, 1))
+    )
+    (gate_conv): Conv2d(48, 1, kernel_size=(1, 1), stride=(1, 1), bias=False)
+    (deblur_fuse_convs): ModuleList(
+      (0): Conv2d(96, 48, kernel_size=(1, 1), stride=(1, 1), bias=False)
+      (1): Conv2d(144, 48, kernel_size=(1, 1), stride=(1, 1), bias=False)
+      (2): Conv2d(192, 48, kernel_size=(1, 1), stride=(1, 1), bias=False)
+    )
+    (deblur_blocks): ModuleList(
+      (0-2): 3 x Sequential(
+        (0): RestormerBlock(
+          (norm1): LayerNorm2d(
+            (norm): LayerNorm((48,), eps=1e-05, elementwise_affine=True)
+          )
+          (attn): MDTA(
+            (qkv): Conv2d(48, 144, kernel_size=(1, 1), stride=(1, 1), bias=False)
+            (dw_conv): Conv2d(144, 144, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), groups=144, bias=False)
+            (proj): Conv2d(48, 48, kernel_size=(1, 1), stride=(1, 1), bias=False)
+          )
+          (norm2): LayerNorm2d(
+            (norm): LayerNorm((48,), eps=1e-05, elementwise_affine=True)
+          )
+          (ffn): GDFN(
+            (project_in): Conv2d(48, 96, kernel_size=(1, 1), stride=(1, 1), bias=False)
+            (dw_conv): Conv2d(96, 96, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), groups=96, bias=False)
+            (gate_conv): Conv2d(96, 96, kernel_size=(1, 1), stride=(1, 1), bias=False)
+            (act): GELU(approximate='none')
+            (project_out): Conv2d(96, 48, kernel_size=(1, 1), stride=(1, 1), bias=False)
+          )
+        )
+        (1): RestormerBlock(
+          (norm1): LayerNorm2d(
+            (norm): LayerNorm((48,), eps=1e-05, elementwise_affine=True)
+          )
+          (attn): MDTA(
+            (qkv): Conv2d(48, 144, kernel_size=(1, 1), stride=(1, 1), bias=False)
+            (dw_conv): Conv2d(144, 144, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), groups=144, bias=False)
+            (proj): Conv2d(48, 48, kernel_size=(1, 1), stride=(1, 1), bias=False)
+          )
+          (norm2): LayerNorm2d(
+            (norm): LayerNorm((48,), eps=1e-05, elementwise_affine=True)
+          )
+          (ffn): GDFN(
+            (project_in): Conv2d(48, 96, kernel_size=(1, 1), stride=(1, 1), bias=False)
+            (dw_conv): Conv2d(96, 96, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), groups=96, bias=False)
+            (gate_conv): Conv2d(96, 96, kernel_size=(1, 1), stride=(1, 1), bias=False)
+            (act): GELU(approximate='none')
+            (project_out): Conv2d(96, 48, kernel_size=(1, 1), stride=(1, 1), bias=False)
+          )
+        )
+      )
+    )
+    (deblur_recon): Conv2d(48, 3, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))
+    (color_ups): Upsample(scale_factor=8.0, mode='bilinear')
+    (color_gate): DepthGate(
+      (gate_conv): Conv2d(48, 1, kernel_size=(1, 1), stride=(1, 1), bias=False)
+      (sigmoid): Sigmoid()
+    )
+    (global_pool): AdaptiveAvgPool2d(output_size=1)
+    (mlp): Sequential(
+      (0): Linear(in_features=48, out_features=96, bias=False)
+      (1): GELU(approximate='none')
+      (2): Linear(in_features=96, out_features=96, bias=False)
+    )
+    (depth_proj): Conv2d(96, 48, kernel_size=(1, 1), stride=(1, 1), bias=False)
+    (color_proj): Conv2d(48, 48, kernel_size=(1, 1), stride=(1, 1), bias=False)
+    (fused_proj): Conv2d(192, 96, kernel_size=(1, 1), stride=(1, 1), bias=False)
+  )
+  (recon): ReconHead()
+)
