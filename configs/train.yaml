@@ -9,10 +9,17 @@ experiment:
 
 # 模型配置
 model:
-  base_channels: 48
+  base_channels: 48 
   levels: 4
   heads: 8
   bottleneck_blocks: 4
+  encoder_window_size: 8  # 增加窗口大小，避免内存爆炸
+  bottleneck_window_size: 8  # 启用瓶颈窗口
+  decoder_block_window_size: 8  # 增加窗口大小，避免内存爆炸
+  double_forward: true  # 是否使用双次前向推理模式（Pass-1生成深度，Pass-2增强RGB）
+  depth_processor_config:
+    double_channels: False
+    use_cross_attn: true
 
 # 训练配置
 train:
@@ -22,7 +29,9 @@ train:
   param_vis_interval: 500  # 每多少个batch记录一次参数直方图
   save_best: true  # 是否保存最佳模型
   save_interval: 10  # 每多少个epoch保存一次模型
-
+#  lambda_decl: 0.1  # 深度边缘颜色损失权重
+  stageA_epoch: 10 # 阶段A结束的epoch，此前训练RGB解码器，之后训练深度解码器
+  stageB_epoch: 10 # 阶段B结束的epoch，此前训练深度解码器，之后训练RGB解码器
 # GPU配置
 gpu:
   use_gpu: true  # 是否使用GPU
@@ -36,27 +45,31 @@ gpu:
 # 数据配置
 data:
   format: "folder"  # 数据格式: "folder" 或 "lmdb"
-  dataset_type: "multi_degradation"  # 数据集类型，统一使用multi_degradation框架处理
+  dataset_type: multi_degradation
   train_root: "DATA/train"  # 训练数据集路径
   val_root: "DATA/val"      # 验证数据集路径
   folder_structure:  # 固定文件夹结构，仅在format="folder"时有效
     gt: "gt"        # 目标图像文件夹名
     depth: "depth"  # 深度图文件夹名
   # 退化图像文件夹列表 - 用于控制输入数据
-  degradation_folders: ["raw"]  # 单输入：设置为["raw"]；多输入：设置为["deg1", "deg2", "deg3"...]
+  degradation_folders: ['raw']  # which folders to use
   lmdb_paths:  # LMDB路径，仅在format="lmdb"时有效
     train: DATA/train.lmdb"
     val: "DATA/val.lmdb"
-  batch_size: 2
+  batch_size: 1
   num_workers: 32
-  resolution: 128  # 训练分辨率，可以是单值或[h, w]格式
-  augment_prob: 0.1  # 数据增强概率
-  augmentations:  # 数据增强配置
-    flip_h: true
-    flip_v: false
-    color_jitter: true
-    random_crop: true
+  resolution: 512  # 训练分辨率，可以是单值或[h, w]格式
+  augment_prob: 0.1
+  augmentations:
+    random_crop: True
+    flip_h: True
+    flip_v: False
+    color_jitter: True
 
+
+depth_processor_config:
+  double_channels: false
+  use_cross_attn: true
 # 优化器配置
 optimizer:
   name: adamw  # adam, adamw, sgd
@@ -66,11 +79,12 @@ optimizer:
   beta2: 0.99
   momentum: 0.9  # 仅对SGD有效
   nesterov: true  # 仅对SGD有效
+  attn_lr_scale: 0.1  # 交叉注意力模块的学习率缩放因子
 
 # 学习率调度器
 scheduler:
-  name: plateau  # cosine, cosine_warmup, multistep, step, plateau
-  warmup_epochs: 5
+  name: cosine_warmup  # cosine, cosine_warmup, multistep, step, plateau
+  warmup_epochs: 10
   min_lr: 0.000001
   milestones: [60, 80]  # 仅对multistep有效
   gamma: 0.1  # 衰减因子，仅对multistep和step有效
@@ -79,6 +93,11 @@ scheduler:
 
 # 损失函数权重
 loss:
+  # 自动调参设置
+  use_uncertainty_weighting: true  # 是否使用自动调参（不确定性加权）。设为false时使用下面的静态权重
+  sigma_init:                      # 不确定性权重初始值
+    rgb: 0.2                       # RGB损失初始权重
+    depth: 0.2                     # 深度损失初始权重
   lambda_img: 1.0    # L1 像素损失
   lambda_ssim: 0.5   # 结构相似度损失
   lambda_perc: 0.1   # 感知损失
@@ -86,9 +105,31 @@ loss:
   lambda_grad: 0.1   # 梯度损失
   lambda_depth: 1.0  # 深度预测损失
   lambda_smooth: 0.01  # 深度平滑损失
-  teacher_student:
-    feat_weight: 0.5  # 特征对齐损失权重
-    attn_weight: 0.2  # 注意力对齐损失权重
+  lambda_decl: 0.1  # 深度边缘颜色损失权重
+  lambda_cons: 0.1  # 交叉注意力一致性损失权重
+  depth_weight: 1.0  # 深度回归损失权重（用于连续深度预测）
+  depth_processing:
+    use_log_transform: true  # 是否使用对数变换
+    min_depth: 5000.0  # 最小有效深度值
+    max_depth: 65000.0  # 最大有效深度值
+    edge_weight: 0.5  # 边缘感知损失权重
+    use_edge_aware_loss: true  # 是否使用边缘感知损失
+    # 添加对数和线性变换的独立深度范围
+    min_depth_log: 5000.0  # 对数变换时的最小深度
+    max_depth_log: 65000.0  # 对数变换时的最大深度
+    min_depth_linear: 5000.0  # 线性变换时的最小深度
+    max_depth_linear: 65000.0  # 线性变换时的最大深度
+    use_cross_attn: true
+
+  # 深度边缘颜色损失配置
+  depth_edge_color:
+    w_edge: 1.0  # 边缘权重
+    w_depth: 0.5  # 深度权重
+  # 交叉注意力一致性损失配置
+  cross_attention:
+    norm_type: 1  # 使用L1范数计算差异
+    reduction: "mean"  # 使用平均值聚合损失
+    enable_saving: true  # 是否启用注意力图保存
 
 # 可视化配置
 visualization:
@@ -97,6 +138,8 @@ visualization:
   save_depth_fusion: true
   max_images_per_batch: 4  # 每个批次最多保存多少图像
   vis_freq: 100  # 每多少个batch保存一次可视化
+  val_vis_interval: 50  # 验证时每多少个batch记录一次TensorBoard可视化
+  max_val_vis_samples: 10  # 验证时最多在TensorBoard中可视化多少个样本
   val_images:
     save: true  # 是否保存验证集图像
     max_samples: 8  # 最多保存多少个验证样本
@@ -104,3 +147,10 @@ visualization:
     save_metrics: true  # 是否在图像上标注指标
   save_model_graph: true  # 是否保存模型结构图
   plot_lr: true  # 是否绘制学习率曲线 
+  save_attention_maps: false  # 是否保存注意力图
+
+
+logging:
+  console_level: "ERROR"  # 控制台日志级别："DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"
+                         # 设置为"CRITICAL"将使日志只写入文件而不显示到终端
+  file_level: "DEBUG"    # 文件日志级别，建议保持"DEBUG"以捕获所有信息

@@ -8,71 +8,211 @@ import numpy as np
 import torchvision.utils as vutils
 import matplotlib.pyplot as plt
 from typing import Dict, List, Optional, Union, Tuple
-import matplotlib.cm as cm
+from matplotlib import cm
+import sys
+import warnings
+import logging.handlers
 
-def setup_logger(log_dir: str,
-                 log_file: str = "train.log",
-                 metrics_file: str = "metrics.csv",
-                 level: int = logging.INFO):
-    """
-    Set up a comprehensive logger that writes to console, a log file, TensorBoard, and a CSV metrics file.
+DEFAULT_LOG_FORMAT = '%(asctime)s [%(levelname)s] [%(name)s] %(message)s (%(filename)s:%(lineno)d)'
+DEFAULT_LOG_FORMAT_CONSOLE = '%(asctime)s [%(levelname)s] [%(name)s] %(message)s'
 
-    Args:
-        log_dir (str): Directory where logs, TB events, and CSV will be saved.
-        log_file (str): Name of the text log file.
-        metrics_file (str): Name of the CSV file for scalar metrics.
-        level (int): Logging level.
+# Store the original sys.excepthook
+original_sys_excepthook = sys.excepthook
 
-    Returns:
-        logger (logging.Logger): Configured Python logger.
-        tb_writer (SummaryWriter): TensorBoard writer.
-        csv_path (str): Path to the CSV metrics file.
-        debug_logger (logging.Logger): 专用于调试信息的logger
-    """
+def custom_excepthook(exc_type, exc_value, exc_traceback):
+    # Log the exception using the root logger
+    # Using a logger named 'CRITICAL' or similar for unhandled exceptions
+    exception_logger = logging.getLogger('UnhandledException')
+    exception_logger.critical("Unhandled exception:", exc_info=(exc_type, exc_value, exc_traceback))
+    # Call the original excepthook to ensure Python's default behavior (e.g., printing to stderr)
+    original_sys_excepthook(exc_type, exc_value, exc_traceback)
+
+def setup_logger(config, log_dir, main_logger_name=None, include_pid=False):
+    # Centralized log configuration
+    log_level_str = config.get('log_level', 'INFO').upper()
+    log_level = getattr(logging, log_level_str, logging.INFO)
+
+    console_log_level_str = config.get('console_log_level', 'INFO').upper()
+    console_log_level_actual = getattr(logging, console_log_level_str, logging.INFO)
+
+    log_format_file = config.get('log_format_file', DEFAULT_LOG_FORMAT)
+    log_format_console = config.get('log_format_console', DEFAULT_LOG_FORMAT_CONSOLE)
+
+    # === Aggressive Pre-emptive Silencing and Handler Clearing ===
+    # Clear handlers on root logger first
+    if main_logger_name is None or main_logger_name == "" or main_logger_name == logging.root.name:
+        logging.root.handlers = []
+
+    # Clear handlers and silence specific known noisy loggers before any other setup
+    for logger_name_to_clear in ['py.warnings', 'PIL.PngImagePlugin']:
+        existing_logger = logging.getLogger(logger_name_to_clear)
+        existing_logger.handlers = []      # Remove any pre-existing handlers
+        existing_logger.propagate = False  # Stop propagation immediately
+        existing_logger.setLevel(logging.CRITICAL + 1) # Silence until we reconfigure
+    # =============================================================
+
+    # Fallback basicConfig for the root logger. This will only add a handler if root has none.
+    # Since we cleared root's handlers, this will set a default stderr handler.
+    # Its level is WARNING, so it won't be too noisy if other things aren't caught.
+    logging.basicConfig(level=logging.WARNING, format='[%(levelname)s] %(name)s: %(message)s')
+
+    # Main/Root Logger (application logger)
+    # If main_logger_name is None or empty string, it refers to the root logger.
+    if main_logger_name is None or main_logger_name == "":
+        main_logger = logging.getLogger() # Get the root logger
+    else:
+        main_logger = logging.getLogger(main_logger_name)
+
+    main_logger.setLevel(log_level) # Main logger processes messages from this level onwards
+
+    # Prevent main_logger from propagating to root if it's not the root logger itself.
+    # If it IS the root logger, propagate is irrelevant for it.
+    if main_logger_name is not None and main_logger_name != "":
+        main_logger.propagate = False
+
+
+    # --- Console Handler for Main Logger ---
+    # This handler is specifically for the main application logs to the console.
+    main_logger_console_handler = logging.StreamHandler(sys.stdout)
+    main_logger_console_handler.setFormatter(logging.Formatter(log_format_console))
+    main_logger_console_handler.setLevel(console_log_level_actual)
+    main_logger.addHandler(main_logger_console_handler)
+    if main_logger_name is None or main_logger_name == "": # If root logger
+        logging.info(f"Root logger console log level set to: {console_log_level_str}")
+    else:
+        main_logger.info(f"Logger '{main_logger_name}' console log level set to: {console_log_level_str}")
+
+
+    # --- File Handlers (common for main_logger, py.warnings, PIL) ---
+    # Ensure log_dir exists
     os.makedirs(log_dir, exist_ok=True)
 
-    # 1) Python logger
-    logger = logging.getLogger("UnderwaterEnhance")
-    logger.setLevel(level)
-    if not logger.handlers:
-        # Console handler
-        ch = logging.StreamHandler()
-        ch.setLevel(level)
-        ch.setFormatter(logging.Formatter("[%(asctime)s] [%(levelname)s] %(message)s",
-                                          datefmt="%Y-%m-%d %H:%M:%S"))
-        logger.addHandler(ch)
+    # Create a unique sub-directory for each run using a timestamp
+    # or use a simpler scheme if preferred.
+    current_time_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_log_dir = os.path.join(log_dir, f"run_{current_time_str}")
+    if include_pid:
+        run_log_dir += f"_pid{os.getpid()}"
+    os.makedirs(run_log_dir, exist_ok=True)
 
-        # File handler
-        fh = logging.FileHandler(os.path.join(log_dir, log_file))
-        fh.setLevel(level)
-        fh.setFormatter(logging.Formatter("[%(asctime)s] [%(levelname)s] %(message)s",
-                                          datefmt="%Y-%m-%d %H:%M:%S"))
-        logger.addHandler(fh)
+    # Debug log file (all levels from log_level)
+    debug_log_file = os.path.join(run_log_dir, config.get('debug_log_filename', 'debug.log'))
+    debug_file_handler = logging.handlers.RotatingFileHandler(
+        debug_log_file,
+        maxBytes=config.get('log_max_bytes', 10*1024*1024), # 10MB
+        backupCount=config.get('log_backup_count', 5)
+    )
+    debug_file_handler.setFormatter(logging.Formatter(log_format_file))
+    debug_file_handler.setLevel(log_level) # Capture from main log_level (e.g. DEBUG or INFO)
+    main_logger.addHandler(debug_file_handler)
+
+    # Info log file (INFO and above) - or rather, a general "train.log"
+    # For this file, let's set its level to INFO, regardless of the main log_level,
+    # unless main log_level is higher (e.g. WARNING), in which case it takes precedence.
+    info_file_log_level = max(logging.INFO, log_level) # Ensures it's at least INFO
+    info_log_file = os.path.join(run_log_dir, config.get('info_log_filename', 'train.log'))
+    info_file_handler = logging.handlers.RotatingFileHandler(
+        info_log_file,
+        maxBytes=config.get('log_max_bytes', 10*1024*1024),
+        backupCount=config.get('log_backup_count', 5)
+    )
+    info_file_handler.setFormatter(logging.Formatter(log_format_file))
+    info_file_handler.setLevel(info_file_log_level)
+    main_logger.addHandler(info_file_handler)
+
+    main_logger.info(f"Logging initialized. File logs in: {run_log_dir}")
+
+
+    # --- Setup for 'py.warnings' logger ---
+    # This logger is used by the custom warnings.showwarning handler
+    warnings_logger = logging.getLogger('py.warnings')
+    warnings_logger.handlers = [] # Ensure it's clean before adding our handlers
+    warnings_logger.setLevel(logging.DEBUG) # Capture all warnings internally
+
+    # Console handler for py.warnings
+    py_warnings_console_handler = logging.StreamHandler(sys.stdout)
+    py_warnings_console_handler.setFormatter(logging.Formatter(log_format_console))
+    # Use the same console_log_level as the main logger for warnings on console
+    py_warnings_console_handler.setLevel(console_log_level_actual)
+    warnings_logger.addHandler(py_warnings_console_handler)
+
+    # File handlers for py.warnings
+    warnings_logger.addHandler(debug_file_handler) # Already configured with its level
+    warnings_logger.addHandler(info_file_handler)  # Already configured with its level
+
+    warnings_logger.propagate = False # Do not propagate to main_logger to avoid duplicate handling / filtering issues
+
+
+    # --- Setup for 'PIL.PngImagePlugin' logger ---
+    pil_logger = logging.getLogger('PIL.PngImagePlugin')
+    pil_logger.handlers = [] # Ensure it's clean
+    pil_logger.setLevel(logging.WARNING) # Process WARNING+ internally for file logs
+    pil_console_handler = logging.StreamHandler(sys.stdout)
+    pil_console_handler.setFormatter(logging.Formatter(log_format_console))
+    pil_console_handler.setLevel(logging.CRITICAL) # Silence PIL on console
+    pil_logger.addHandler(pil_console_handler)
+
+    # File handlers for PIL (to capture its WARNING/ERROR messages)
+    # These are the same file handler instances used by main_logger and warnings_logger.
+    # This is fine as handlers can be shared.
+    pil_logger.addHandler(debug_file_handler)
+    pil_logger.addHandler(info_file_handler)
+
+    pil_logger.propagate = False # Do not propagate to main_logger
+
+
+    # --- Setup for UnhandledException logger ---
+    # This logger is used by the custom sys.excepthook
+    exception_logger = logging.getLogger('UnhandledException')
+    # Set level to CRITICAL as these are unhandled exceptions
+    exception_logger.setLevel(logging.CRITICAL)
+
+    # Add all handlers to it, as critical errors should go everywhere.
+    # Console handler for exceptions (should always appear on console)
+    exception_console_handler = logging.StreamHandler(sys.stderr) # Use stderr for critical errors
+    exception_console_handler.setFormatter(logging.Formatter(log_format_console))
+    exception_console_handler.setLevel(logging.CRITICAL) # Ensure it outputs critical messages
+    exception_logger.addHandler(exception_console_handler)
+
+    exception_logger.addHandler(debug_file_handler)
+    exception_logger.addHandler(info_file_handler)
+    exception_logger.propagate = False # Self-contained
+
+    # Set the custom excepthook
+    # We only want to set this once.
+    if sys.excepthook == original_sys_excepthook:
+        sys.excepthook = custom_excepthook
+        # Log that we've set it, using the main logger if available, or root.
+        logging.getLogger(main_logger_name or '').info("Custom sys.excepthook set up.")
+    else:
+        logging.getLogger(main_logger_name or '').warning("Custom sys.excepthook was already modified. Not overriding.")
+
+
+    # Return the main logger instance and the specific run_log_dir
+    # The logger returned here is the one named main_logger_name, or root if not specified.
+    return main_logger, run_log_dir
+
+
+# Helper function to get a logger instance, typically used by other modules.
+# It's better for other modules to just call logging.getLogger(__name__)
+# and let the setup_logger configure the handlers for root or named loggers.
+def get_logger(name=None, config=None, log_dir=None):
+    if name is None:
+        # If no name is provided, assume it's the root logger that should be configured by setup_logger.
+        # However, setup_logger should ideally be called once in the main script.
+        # This function is a bit ambiguous if setup_logger hasn't run.
+        # Let's assume if config and log_dir are provided, it's a hint to ensure setup.
+        if config and log_dir:
+             # This might re-initialize if called multiple times, be careful.
+            logger, _ = setup_logger(config, log_dir, main_logger_name=None)
+            return logger
+        return logging.getLogger() # Get root logger, hoping it's configured
     
-    # 创建专用于调试的logger
-    debug_logger = logging.getLogger("UnderwaterEnhance.Debug")
-    debug_logger.setLevel(logging.DEBUG)
-    if not debug_logger.handlers:
-        # 仅文件处理，不输出到控制台
-        debug_fh = logging.FileHandler(os.path.join(log_dir, "debug.log"))
-        debug_fh.setLevel(logging.DEBUG)
-        debug_fh.setFormatter(logging.Formatter("[%(asctime)s] [%(levelname)s] %(message)s",
-                                          datefmt="%Y-%m-%d %H:%M:%S"))
-        debug_logger.addHandler(debug_fh)
-        # 防止调试信息传递给根logger
-        debug_logger.propagate = False
-
-    # 2) TensorBoard writer
-    tb_log_dir = os.path.join(log_dir, "tensorboard", datetime.now().strftime("%Y%m%d-%H%M%S"))
-    tb_writer = SummaryWriter(tb_log_dir)
-
-    # 3) CSV metrics file setup: create header on first write
-    csv_path = os.path.join(log_dir, metrics_file)
-    if not os.path.exists(csv_path):
-        # ensure exists; header will be written on first log_metrics call
-        open(csv_path, 'w').close()
-
-    return logger, tb_writer, csv_path, debug_logger
+    logger = logging.getLogger(name)
+    # If this logger has no handlers, it will propagate to the root logger.
+    # We assume the root logger (or a relevant parent) has been configured by setup_logger.
+    # No specific configuration here, relies on propagation unless logger 'name' is specially handled.
+    return logger
 
 
 class MetricLogger:
@@ -174,7 +314,7 @@ art)."""
             self.logger.info("TensorBoard数据已刷新到磁盘")
         except Exception as e:
             self.logger.error(f"刷新TensorBoard数据时出错: {str(e)}")
-            
+
     def log_image(self, tag: str, image: torch.Tensor, step: int = None):
         """
         Log a single image tensor to TensorBoard.
@@ -190,30 +330,40 @@ art)."""
         # 制作图像副本以避免修改原始数据
         image = image.detach().clone()
         
-        # 特殊处理深度图 - 使用min-max归一化，并应用更好的可视化策略
-        if "depth" in tag and image.shape[1] == 1:
+        # 特殊处理深度图 - 针对16位深度图优化显示
+        if ("depth" in tag or "gate" in tag) and image.shape[1] == 1:
             # 创建一个新的图像列表来存储转换后的彩色图像
             colored_images = []
             
             for i in range(image.shape[0]):
                 img = image[i]
                 min_val, max_val = img.min(), img.max()
-                # 仅在值的范围足够大时才进行归一化，避免噪声放大
-                if max_val > min_val + 1e-5:
-                    # 归一化到0-1范围
-                    norm_img = (img - min_val) / (max_val - min_val)
-                    # 将单通道图像转为三通道热力图来提高可视化效果
-                    img_np = norm_img.cpu().numpy()
-                    colored = cm.jet(img_np[0])[:,:,:3]  # 删除alpha通道
-                    colored_tensor = torch.from_numpy(colored).permute(2, 0, 1)  # (H,W,3) -> (3,H,W)
-                    colored_images.append(colored_tensor)
-                else:
-                    # 如果没有有效范围，只复制为三通道灰度
-                    colored_images.append(img.repeat(3, 1, 1))
                 
                 # 记录深度图的值范围，便于调试
-                if i == 0:  # 只记录第一个样本
-                    self.logger.info(f"Depth image '{tag}' value range: [{min_val:.6f}, {max_val:.6f}], shape: {img.shape}")
+                self.logger.info(f"Depth image '{tag}' value range: [{min_val:.6f}, {max_val:.6f}], shape: {img.shape}")
+                
+                # 优化16位深度图的显示
+                if max_val > 1000:  # 可能是原始16位深度图
+                    # 使用对数变换增强可视化效果
+                    img_np = img.cpu().numpy()
+                    log_img = np.log(img_np + 1.0)
+                    # 再归一化到0-1
+                    if log_img.max() > log_img.min():
+                        norm_img = (log_img - log_img.min()) / (log_img.max() - log_img.min())
+                    else:
+                        norm_img = np.zeros_like(log_img)
+                else:
+                    # 已经是归一化的深度图或门控图，直接使用
+                    if max_val > min_val + 1e-5:
+                        norm_img = (img - min_val) / (max_val - min_val)
+                        norm_img = norm_img.cpu().numpy()
+                    else:
+                        norm_img = img.cpu().numpy()
+                
+                # 将单通道图像转为三通道热力图
+                colored = cm.turbo(norm_img[0])[:,:,:3]  # 使用turbo colormap，删除alpha通道
+                colored_tensor = torch.from_numpy(colored).permute(2, 0, 1)  # (H,W,3) -> (3,H,W)
+                colored_images.append(colored_tensor)
             
             # 替换原始图像列表为彩色图像
             colored_batch = torch.stack(colored_images)
@@ -292,18 +442,27 @@ art)."""
         for i, img in enumerate(images):
             if isinstance(img, torch.Tensor):
                 img = img.detach().cpu().numpy()
-                if img.shape[0] == 1:  # 灰度图
-                    img = img[0]
-                    # 特殊处理深度图 - 使用更好的colormap
-                    if "depth" in tag:
-                        img_min, img_max = img.min(), img.max()
-                        if img_max > img_min + 1e-5:  # 避免除以零或接近零的值
-                            img = (img - img_min) / (img_max - img_min)
-                        axs[i].imshow(img, cmap='turbo')  # 使用turbo而不是灰度
-                    else:
-                        axs[i].imshow(img, cmap='gray')
-                else:  # RGB
-                    img = np.transpose(img, (1, 2, 0))
+                # 首先确保我们有一个可以直接显示的形状
+                if img.ndim == 3:  # (C,H,W)
+                    if img.shape[0] == 1:  # 单通道图像
+                        img = img[0]  # 从(1,H,W)变为(H,W)
+                    else:  # RGB图像
+                        img = np.transpose(img, (1, 2, 0))  # 转为(H,W,C)
+                elif img.ndim == 4 and img.shape[0] == 1:  # (1,C,H,W)
+                    if img.shape[1] == 1:  # 单通道图像
+                        img = img[0, 0]  # 从(1,1,H,W)变为(H,W)
+                    else:  # RGB图像
+                        img = np.transpose(img[0], (1, 2, 0))  # 从(1,C,H,W)变为(H,W,C)
+                
+                # 特殊处理深度图 - 使用更好的colormap
+                if "depth" in tag and img.ndim == 2:
+                    img_min, img_max = img.min(), img.max()
+                    if img_max > img_min + 1e-5:  # 避免除以零或接近零的值
+                        img = (img - img_min) / (img_max - img_min)
+                    axs[i].imshow(img, cmap='turbo')  # 使用turbo而不是灰度
+                elif img.ndim == 2:  # 其他灰度图
+                    axs[i].imshow(img, cmap='gray')
+                else:  # RGB图
                     if img.max() > 1.0 or img.min() < 0:
                         img = np.clip((img + 1) / 2, 0, 1)
                     axs[i].imshow(img)
@@ -501,7 +660,14 @@ art)."""
             # 绘制对比图
             images = [feature_vis, gate_vis, gated_vis]
             titles = ['Original Feature', 'Gate Map', 'Gated Feature']
-            self.log_image_comparison(f"{tag}/sample{b}", images, titles, step or self.global_step)
+            
+            try:
+                self.log_image_comparison(f"{tag}/sample{b}", images, titles, step or self.global_step)
+            except Exception as e:
+                self.logger.error(f"门控效果可视化失败: {str(e)}")
+                # 提供额外的诊断信息
+                for i, img in enumerate(images):
+                    self.logger.info(f"图像 {i} ({titles[i]}) 形状: {img.shape}, 类型: {img.dtype if isinstance(img, torch.Tensor) else type(img)}")
 
     def _prepare_feature_for_vis(self, feature: torch.Tensor) -> torch.Tensor:
         """Helper to convert feature tensor to RGB visualization."""
@@ -579,4 +745,64 @@ art)."""
     def close(self):
         """Close the TensorBoard writer."""
         self.tb_writer.close()
+
+    def log_depth_comparison(self, tag: str, 
+                           depth_gt: torch.Tensor, 
+                           depth_pred: torch.Tensor,
+                           step: int = None):
+        """
+        创建深度预测与真值的对比可视化
+        
+        Args:
+            tag (str): e.g. 'val/depth_comparison'
+            depth_gt (Tensor): 真实深度图 [B,1,H,W]
+            depth_pred (Tensor): 预测深度图 [B,1,H,W]
+            step (int): 步骤索引
+        """
+        # 确保输入是正确的形状
+        if depth_gt.dim() == 3:  # [B,H,W]
+            depth_gt = depth_gt.unsqueeze(1)  # [B,1,H,W]
+        if depth_pred.dim() == 3:
+            depth_pred = depth_pred.unsqueeze(1)
+        
+        B = min(depth_gt.shape[0], depth_pred.shape[0])
+        
+        for b in range(min(B, 4)):  # 最多显示4个样本
+            # 获取当前批次的深度图
+            gt = depth_gt[b:b+1]  # 保持 [1,1,H,W] 形状
+            pred = depth_pred[b:b+1]  # 保持 [1,1,H,W] 形状
+            
+            # 创建深度差异图
+            with torch.no_grad():
+                # 如果真实深度是16位深度图，需要首先归一化
+                if gt.max() > 1000:  # 可能是原始16位深度图
+                    # 对数归一化
+                    log_gt = torch.log(gt + 1.0)
+                    log_min = torch.log(torch.tensor(5000.0, device=gt.device) + 1.0)
+                    log_max = torch.log(torch.tensor(65000.0, device=gt.device) + 1.0)
+                    norm_gt = (log_gt - log_min) / (log_max - log_min + 1e-6)
+                    norm_gt = torch.clamp(norm_gt, 0, 1)
+                else:
+                    # 已经归一化的深度图
+                    norm_gt = gt
+                
+                # 计算差异 - 保持相同的形状
+                diff = torch.abs(norm_gt - pred)
+                
+                # 记录三种图 - 使用log_image直接处理原始格式
+                self.log_image(f"{tag}/gt_{b}", gt, step)
+                self.log_image(f"{tag}/pred_{b}", pred, step)
+                self.log_image(f"{tag}/diff_{b}", diff, step)
+                
+                # 创建对比可视化 - 这里不再需要特别处理
+                images = [norm_gt, pred, diff]
+                titles = ["Ground Truth", "Prediction", "Absolute Difference"]
+                
+                try:
+                    self.log_image_comparison(f"{tag}/sample_{b}", images, titles, step)
+                except Exception as e:
+                    self.logger.error(f"记录深度对比图像时发生错误: {str(e)}")
+                    # 提供详细的调试信息
+                    for i, img in enumerate(images):
+                        self.logger.info(f"图像 {i} 形状: {img.shape}, 类型: {img.dtype}, 范围: [{img.min().item():.4f}, {img.max().item():.4f}]")
 

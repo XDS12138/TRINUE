@@ -1,263 +1,437 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from .depth_gate import DepthGate
-from .transformer_block import RestormerBlock
+from .depth import DepthGate
+from .blocks import RestormerBlock, DACBlock
+import logging
+
+logger = logging.getLogger(__name__)
 
 class MultiTaskDecoder(nn.Module):
     """
     Multi-task Decoder for Deblur and Color Correction with Dense Skip and Adaptive Depth Fusion
     -------------------------------------------------------------------------------------------
     Inputs:
-      - fused_feat: Tensor[B, C, H/8, W/8]    (Joint Bottleneck output)
+      - fused_feat: Tensor[B, C_bottleneck, H_bottleneck, W_bottleneck] (Joint Bottleneck output)
       - skip_feats: list of RGB encoder features [F0_raw, F1_raw, ..., Fn_raw]
+                    Expected to have self.levels + 1 features, with varying channel sizes.
       - depth_feats: list of Depth features [F0_dep, F1_dep, ..., Fn_dep]
+                     Expected to have self.levels + 1 features, with varying channel sizes.
       - raw: Tensor[B, 3, H, W]             (Original image for Color branch)
 
     Outputs:
       - res_d: Tensor[B, 3, H, W]  Deblur residual
       - res_c: Tensor[B, 3, H, W]  Color correction residual
     """
-    def __init__(self, base_channels=48, levels=3):
+    def __init__(self, base_channels=48, input_channels_bottleneck=384, levels=3, decoder_block_window_size=8, num_encoder_feature_levels=None):
         super().__init__()
-        self.levels = levels  # Number of upsampling stages
-        self.depth_levels = levels + 1  # Total number of depth feature scales
-        self.base_channels = base_channels # Store this for reference
+        self.levels = levels
+        self.base_channels = base_channels
+        self.input_channels_bottleneck = input_channels_bottleneck
+
+        if num_encoder_feature_levels is None:
+            self.num_encoder_feature_levels = levels + 1 
+        else:
+            self.num_encoder_feature_levels = num_encoder_feature_levels
+
+        logger.info(f"MultiTaskDecoder initialized with {levels} decoder levels, {self.num_encoder_feature_levels} expected encoder feature levels (for depth fusion weights).")
 
         # Deblur Branch
-        # PixelShuffle upsampling for each stage - 注意使用正确的通道数
-        # 对于PixelShuffle(2)，输入通道需要是输出通道的4倍，才能保持通道数不变
-        self.deblur_ups = nn.ModuleList([
-            nn.Sequential(
-                nn.Conv2d(base_channels, base_channels*4, kernel_size=1, bias=False),
-                nn.PixelShuffle(2)
-            ) for _ in range(levels)
-        ])
+        self.deblur_ups = nn.ModuleList()
+        self.deblur_blocks = nn.ModuleList() # Initialize as empty list first
+        self.deblur_skips = nn.ModuleList()
+        self.deblur_fuse_convs = nn.ModuleList() # Moved initialization up
+
+        current_channels_deblur = input_channels_bottleneck
+        for i in range(levels):
+            out_c_deblur = self.base_channels * (2**(levels - 1 - i)) if levels > 1 else self.base_channels
+            # Upsampling for deblur branch (example from a more complete version)
+            self.deblur_ups.append(
+                nn.Sequential(
+                    nn.Conv2d(current_channels_deblur, out_c_deblur * 4, kernel_size=1, bias=False),
+                    nn.PixelShuffle(2)
+                )
+            )
+            # Skip connection conv for deblur branch
+            encoder_skip_channels_deblur = self.base_channels * (2**(self.num_encoder_feature_levels - 1 - i)) if self.num_encoder_feature_levels > 1 else self.base_channels
+            self.deblur_skips.append(
+                 nn.Conv2d(encoder_skip_channels_deblur + out_c_deblur, out_c_deblur, kernel_size=1, bias=True)
+            )
+            # Fuse conv for deblur branch
+            self.deblur_fuse_convs.append(
+                 nn.Conv2d(out_c_deblur * 2, out_c_deblur, kernel_size=1, bias=False) # Assuming skip and upsample result in out_c_deblur each
+            )
+            # RestormerBlock for deblur branch
+            self.deblur_blocks.append(RestormerBlock(out_c_deblur, heads=8, window_size=decoder_block_window_size)) # Corrected call
+            current_channels_deblur = out_c_deblur
         
-        # Adaptive Depth Fusion Components
-        # 1. Scale-MLP: predicts fusion weights for different depth scales
+        self.deblur_recon = nn.Conv2d(current_channels_deblur, 3, kernel_size=3, padding=1)
+
+        # Adaptive Depth Fusion Components (ensure these are correctly placed and initialized)
         self.scale_mlp = nn.Sequential(
-            nn.Conv2d(base_channels * self.depth_levels, base_channels, kernel_size=1, bias=False),
+            nn.Conv2d(base_channels * self.num_encoder_feature_levels, base_channels, kernel_size=1, bias=False),
             nn.GELU(),
-            nn.Conv2d(base_channels, self.depth_levels, kernel_size=1)  # 输出每个尺度一个分数
+            nn.Conv2d(base_channels, self.num_encoder_feature_levels, kernel_size=1)
         )
-        
-        # 2. Single gate convolution for final gating (replaces DepthGate modulelist)
         self.gate_conv = nn.Conv2d(base_channels, 1, kernel_size=1, bias=False)
         
-        # 1x1 conv to compress concatenated channels back to C
-        # stages: i=0..levels-1, input channels = C*(1 + (i+1))
-        self.deblur_fuse_convs = nn.ModuleList([
-            nn.Conv2d(base_channels * (i + 2), base_channels, kernel_size=1, bias=False)
+        # 为颜色分支添加深度加权组件
+        self.scale_mlp_color = nn.Sequential(
+            nn.Conv2d(base_channels * self.num_encoder_feature_levels, base_channels, kernel_size=1, bias=False),
+            nn.GELU(),
+            nn.Conv2d(base_channels, self.num_encoder_feature_levels, kernel_size=1)
+        )
+        self.gate_conv_color = nn.Conv2d(base_channels, 1, kernel_size=1, bias=False)
+        
+        # 添加DAC块到颜色分支
+        self.dac_blocks = nn.ModuleList([
+            DACBlock(self.base_channels * (2**(levels - 1 - i)) if levels > 1 else self.base_channels)
             for i in range(levels)
         ])
         
-        # Transformer blocks after fusion
-        self.deblur_blocks = nn.ModuleList([
-            nn.Sequential(
-                RestormerBlock(base_channels),
-                RestormerBlock(base_channels)
-            ) for _ in range(levels)
-        ])
-        
-        # Final reconstruction conv for Deblur branch
-        self.deblur_recon = nn.Conv2d(base_channels, 3, kernel_size=3, padding=1)
+        # Color Branch
+        self.color_ups = nn.ModuleList() # Initialize as empty list
+        self.color_blocks = nn.ModuleList() # Initialize as empty list
+        self.color_skips = nn.ModuleList()
+        self.color_fuse_convs = nn.ModuleList() # Added fuse_convs for color branch consistency
 
-        # Color Branch (unchanged)
-        self.color_ups = nn.Upsample(scale_factor=2**levels, mode='bilinear', align_corners=False)
-        self.color_gate = DepthGate(base_channels)
+        current_channels_color = input_channels_bottleneck
+        for i in range(levels):
+            out_c_color = self.base_channels * (2**(levels - 1 - i)) if levels > 1 else self.base_channels
+            # Upsampling for color branch (example from a more complete version)
+            self.color_ups.append(
+            nn.Sequential(
+                    nn.Conv2d(current_channels_color, out_c_color * 4, kernel_size=1, bias=False),
+                    nn.PixelShuffle(2)
+                )
+            )
+            # Skip connection conv for color branch
+            encoder_skip_channels_color = self.base_channels * (2**(self.num_encoder_feature_levels - 1 - i)) if self.num_encoder_feature_levels > 1 else self.base_channels
+            self.color_skips.append(
+                 nn.Conv2d(encoder_skip_channels_color + out_c_color, out_c_color, kernel_size=1, bias=True)
+            )
+            # Fuse conv for color branch
+            self.color_fuse_convs.append(
+                 nn.Conv2d(out_c_color * 2, out_c_color, kernel_size=1, bias=False) # Assuming skip and upsample result in out_c_color each
+            )
+            # RestormerBlock for color branch
+            self.color_blocks.append(RestormerBlock(out_c_color, heads=8, window_size=decoder_block_window_size)) # Corrected call
+            current_channels_color = out_c_color
+            
+        self.color_recon = nn.Conv2d(current_channels_color, 3, kernel_size=3, padding=1) # Recon for color branch
+
+        # Global components for color correction (if needed, from a different design pattern)
+        # self.color_gate = DepthGate(base_channels)
         self.global_pool = nn.AdaptiveAvgPool2d(1)
         self.mlp = nn.Sequential(
-            nn.Linear(base_channels, base_channels * 2, bias=False),
-            nn.GELU(),
-            nn.Linear(base_channels * 2, base_channels * 2, bias=False)
+            nn.Linear(self.base_channels, self.base_channels),
+            nn.ReLU(inplace=True),
+            nn.Linear(self.base_channels, self.base_channels * 2)
         )
+        # self.color_proj = nn.Conv2d(self.input_channels_bottleneck, self.base_channels, kernel_size=1, bias=False)
+        self.color_proj_bottleneck = nn.Conv2d(self.input_channels_bottleneck, self.base_channels, kernel_size=1, bias=False) # Define color_proj_bottleneck
         
-        # 预定义的投影层，用于处理不同维度的情况
-        # 为深度特征预创建的投影层（在需要时使用）
-        self.depth_proj = nn.Conv2d(base_channels*2, base_channels, kernel_size=1, bias=False)
-        # 新增: 为单通道深度特征添加专用投影层
-        self.depth_proj_1ch = nn.Conv2d(1, base_channels, kernel_size=1, bias=False)
-        
-        # 为颜色分支预创建的投影层
-        self.color_proj = nn.Conv2d(base_channels, base_channels, kernel_size=1, bias=False)
-        
-        # 为融合特征预创建的投影层
-        self.fused_proj = nn.ModuleDict()
-        # 我们不能简单地依赖理论计算的通道数，因为实际运行时可能会有差异
-        # 为每一层创建一个临时变量，在forward中根据实际channels动态创建相应的投影层
-
-        # 创建属性用于存储每次调用的深度融合权重
+        self.skip_feature_projections = nn.ModuleDict()
+        self.depth_channel_projections = nn.ModuleDict()
+        logger.info(f"Initialized MultiTaskDecoder. Projection layers for skip/depth will be lazily created.")
         self.last_fusion_weights = None
 
-    def forward(self, fused_feat, skip_feats, depth_feats, raw):
-        B, C, _, _ = fused_feat.shape
+    def _get_projection_layer(self, proj_dict: nn.ModuleDict, in_channels: int, out_channels: int, device: torch.device):
+        """Helper to get or create a LazyConv2d projection layer."""
+        layer_key = f"{in_channels}_to_{out_channels}" # Key based on in_channels and out_channels
+        if layer_key not in proj_dict:
+            # We specify out_channels, kernel_size, and bias.
+            lazy_layer = nn.LazyConv2d(out_channels, kernel_size=1, bias=False)
+            lazy_layer.to(device)  # Move to the target device immediately after creation
+            # Add to ModuleDict. It will be properly registered and moved to device with the parent module.
+            proj_dict[layer_key] = lazy_layer
+            logger.info(f"Created lazy projection layer for {in_channels} -> {out_channels} channels (key: {layer_key}) in {proj_dict._get_name()}")
+        return proj_dict[layer_key]
 
-        # Verify depth_feats dimensions - adjust if needed
-        if depth_feats[0].shape[1] != self.base_channels:
-            # Depth features have different channel dimensions
-            # Use predefined projection layer instead of creating one dynamically
-            projected_depth_feats = []
-            for df in depth_feats:
-                # 根据实际通道数选择正确的投影层
+    def forward(self, fused_feat, skip_feats, depth_feats, raw):
+        B, C_bottleneck, H_bottleneck, W_bottleneck = fused_feat.shape
+        current_device = fused_feat.device
+
+        # --- Project depth_feats to self.base_channels if necessary (using LazyConv2d) ---
+        processed_depth_feats = []
+        if depth_feats is not None:
+            # Pad/truncate if adaptive depth fusion relies on exact number.
+            # The scale_mlp expects input from self.num_encoder_feature_levels features.
+            if len(depth_feats) != self.num_encoder_feature_levels:
+                logger.warning(f"MultiTaskDecoder: Expected {self.num_encoder_feature_levels} depth_feats, got {len(depth_feats)}. Adjusting for scale_mlp.")
+                temp_depth_feats = list(depth_feats)
+                if len(temp_depth_feats) > self.num_encoder_feature_levels:
+                    depth_feats_for_processing = temp_depth_feats[:self.num_encoder_feature_levels]
+                else:
+                    depth_feats_for_processing = temp_depth_feats
+                    if temp_depth_feats: # Check if not empty before trying to access last element
+                        while len(depth_feats_for_processing) < self.num_encoder_feature_levels:
+                            depth_feats_for_processing.append(temp_depth_feats[-1]) # Pad with last valid feature
+                    else: # If temp_depth_feats was empty, pad with Nones
+                        while len(depth_feats_for_processing) < self.num_encoder_feature_levels:
+                            depth_feats_for_processing.append(None)
+            else:
+                depth_feats_for_processing = depth_feats
+
+            for df_idx, df in enumerate(depth_feats_for_processing):
+                if df is None:
+                    processed_depth_feats.append(None)
+                    # logger.warning(f"Encountered None in depth_feats at index {df_idx} during projection.")
+                    continue
+                
                 if df.shape[1] != self.base_channels:
-                    if df.shape[1] == 1:
-                        # 单通道输入 (如门控图) 使用专用投影层
-                        df = self.depth_proj_1ch(df)
-                    elif df.shape[1] == self.base_channels * 2:
-                        # 双倍通道使用原有投影层
-                        df = self.depth_proj(df)
-                    else:
-                        # 其他通道数需创建动态投影层
-                        layer_key = f'depth_proj_{df.shape[1]}'
-                        if not hasattr(self, layer_key):
-                            # 动态创建投影层并添加为模块属性
-                            setattr(self, layer_key, 
-                                   nn.Conv2d(df.shape[1], self.base_channels, 
-                                           kernel_size=1, bias=False).to(df.device))
-                        # 使用动态创建的投影层
-                        df = getattr(self, layer_key)(df)
-                projected_depth_feats.append(df)
-            depth_feats = projected_depth_feats
+                    proj_layer = self._get_projection_layer(self.depth_channel_projections, df.shape[1], self.base_channels, current_device)
+                    try:
+                        df_float = df.float() # Ensure df is float32 before potentially disabling autocast
+                        # Temporarily disable autocast for projection operation (numerical stability)
+                        with torch.amp.autocast(device_type='cuda', enabled=False):
+                            projected_df = proj_layer(df_float) # Pass float32 df_float to proj_layer
+                        processed_depth_feats.append(projected_df)
+                    except Exception as e:
+                        logger.error(f"Error projecting depth_feat (idx {df_idx}) from {df.shape[1]} to {self.base_channels} chans: {e}. Appending original.")
+                        processed_depth_feats.append(df.to(current_device))
+                else:
+                    processed_depth_feats.append(df)
+        else: # depth_feats is None
+            # Fill processed_depth_feats with Nones to match num_encoder_feature_levels for scale_mlp padding logic later
+            processed_depth_feats = [None] * self.num_encoder_feature_levels
 
         # ----- Deblur Branch with Dense Skip & Adaptive Depth Fusion -----
         x = fused_feat
-        x_color = fused_feat  # 色彩分支初始特征
-        
-        # 创建一个列表用于收集所有层级的权重
-        all_weights = []
+        all_weights_for_logging = []
         
         for i in range(self.levels):
-            # 1) Upsample previous resolution
-            x = self.deblur_ups[i](x)  # shape [B, C, H/2^(levels-i-1), W/...]
-            
-            # 2) Collect gated skips from all encoder levels up to current
+            x = self.deblur_ups[i](x)
             gated_skips = []
-            for j in range(i + 1):
-                # Use deepest skip first: skip_feats[levels-1 - j]
-                skip = skip_feats[self.levels - 1 - j]
+            
+            num_skips_to_use_at_level_i = i + 1
+            for k_skip_idx in range(num_skips_to_use_at_level_i):
+                if k_skip_idx >= len(skip_feats):
+                    logger.warning(f"Attempting to access skip_feat index {k_skip_idx} but only {len(skip_feats)} available at decoder level {i}.")
+                    continue 
                 
-                # Align spatial size
-                skip_up = F.interpolate(skip, size=x.shape[-2:], mode='bilinear', align_corners=False)
+                skip_raw = skip_feats[k_skip_idx]
+                if skip_raw is None:
+                    logger.warning(f"Encountered None skip_feat at index {k_skip_idx} for decoder level {i}.")
+                    continue
+
+                skip_up = F.interpolate(skip_raw, size=x.shape[-2:], mode='bilinear', align_corners=False)
+                projected_skip = skip_up
+                if skip_up.shape[1] != self.base_channels:
+                    proj_layer = self._get_projection_layer(self.skip_feature_projections, skip_up.shape[1], self.base_channels, current_device)
+                    try:
+                        projected_skip = proj_layer(skip_up)
+                    except Exception as e:
+                        logger.error(f"Error projecting skip_feat (idx {k_skip_idx}) from {skip_up.shape[1]} to {self.base_channels} chans: {e}. Using original.")
                 
-                # ----- Adaptive Depth Fusion -----
-                # Upscale all depth features to current resolution
-                up_depths = [
-                    F.interpolate(depth_feat, size=x.shape[-2:], mode='bilinear', align_corners=False)
-                    for depth_feat in depth_feats  # All available depth scales
-                ]
+                # Adaptive Depth Fusion
+                # Use processed_depth_feats which should now have self.num_encoder_feature_levels elements (some might be None)
+                up_depths_for_fusion_step = []
+                valid_depth_count_for_fusion_step = 0
+                for df_processed in processed_depth_feats:
+                    if df_processed is not None:
+                        up_depths_for_fusion_step.append(F.interpolate(df_processed, size=x.shape[-2:], mode='bilinear', align_corners=False))
+                        valid_depth_count_for_fusion_step += 1
+                    else: # df_processed is None
+                        # Pad with zeros if a None is encountered, to maintain channel count for cat
+                        dummy_zeros = torch.zeros(B, self.base_channels, x.shape[2], x.shape[3], device=current_device)
+                        up_depths_for_fusion_step.append(dummy_zeros)
                 
-                # Channel-wise concatenation of depth features
-                depth_cat = torch.cat(up_depths, dim=1)  # [B, C*depth_levels, h, w]
-                
-                # Predict scale attention scores
-                scores = self.scale_mlp(depth_cat)  # [B, depth_levels, h, w]
-                weights = torch.softmax(scores, dim=1)  # Normalize along scale dimension
-                
-                # 收集当前层级的权重
-                if j == 0:  # 只记录每个解码器级别的第一个跳跃连接的权重
-                    all_weights.append(weights)
-                
-                # Weighted fusion of depth features
-                depth_fusion = sum(weights[:, k:k+1] * up_depths[k] 
-                                  for k in range(self.depth_levels))
-                
-                # Generate gate map from fused depth feature
-                gate_map = torch.sigmoid(self.gate_conv(depth_fusion))  # [B, 1, h, w]
-                
-                # Apply gate to skip feature
-                gated = skip_up * gate_map
+                if valid_depth_count_for_fusion_step > 0:
+                    # Ensure up_depths_for_fusion_step has self.num_encoder_feature_levels items for cat
+                    # This should be guaranteed by the initial padding/truncation of depth_feats_for_processing
+                    # and the subsequent padding of Nones with zeros here.
+                    if len(up_depths_for_fusion_step) == self.num_encoder_feature_levels:
+                        depth_cat_for_mlp = torch.cat(up_depths_for_fusion_step, dim=1)
+                        scores = self.scale_mlp(depth_cat_for_mlp)
+                        weights = torch.softmax(scores, dim=1)
+                        if k_skip_idx == 0: all_weights_for_logging.append(weights)
+                        
+                        depth_fusion_sum = sum(weights[:,j:j+1] * up_depths_for_fusion_step[j] for j in range(self.num_encoder_feature_levels))
+                        gate_map = torch.sigmoid(self.gate_conv(depth_fusion_sum))
+                        gated = projected_skip * gate_map
+                    else:
+                        logger.error(f"Decoder level {i}, skip {k_skip_idx}: Mismatch in depth features for MLP after processing. Expected {self.num_encoder_feature_levels}, got {len(up_depths_for_fusion_step)}. Using skip directly.")
+                        gated = projected_skip
+                else:
+                    gated = projected_skip 
+                    if k_skip_idx == 0 and i == 0 : logger.info("MultiTaskDecoder: No valid depth features provided for fusion for first skip.")
+
                 gated_skips.append(gated)
                 
-            # 3) Concatenate x with all gated skips
             fused = torch.cat([x] + gated_skips, dim=1)
             
-            # Check if the number of channels in fused matches the expected input for deblur_fuse_convs[i]
-            expected_channels = self.base_channels * (i + 2)
-            actual_channels = fused.shape[1]
+            if fused.shape[1] != self.deblur_fuse_convs[i].in_channels:
+                logger.warning(
+                    f"Decoder level {i}: Channel mismatch for deblur_fuse_convs. Fused: {fused.shape[1]}, Expected: {self.deblur_fuse_convs[i].in_channels}. "
+                    f"Skips provided: {len(gated_skips)} (expected {i+1}). Attempting emergency projection."
+                )
+                proj_layer_fused = self._get_projection_layer(
+                    self.skip_feature_projections, 
+                    fused.shape[1], 
+                    self.deblur_fuse_convs[i].in_channels, 
+                    current_device
+                )
+                try:
+                    fused = proj_layer_fused(fused)
+                except Exception as e:
+                    logger.error(f"Error in emergency projection of fused features at level {i}: {e}. Passing as is.")
             
-            if actual_channels != expected_channels:
-                # 检查是否已经为这个层级和通道数创建了投影层
-                layer_key = f'level_{i}_{actual_channels}'
-                if layer_key not in self.fused_proj:
-                    # 动态创建一个新的投影层并添加到ModuleDict
-                    # 输出通道必须与deblur_fuse_convs[i]的输入匹配，即expected_channels
-                    self.fused_proj[layer_key] = nn.Conv2d(
-                        actual_channels, 
-                        expected_channels, 
-                        kernel_size=1, 
-                        bias=False
-                    ).to(fused.device)
-                
-                # 使用正确的投影层
-                fused = self.fused_proj[layer_key](fused)
-            
-            # 4) Compress channels and apply Transformer blocks
+            logger.debug(f"Decoder level {i}: About to call deblur_fuse_convs[{i}] (expected in: {self.deblur_fuse_convs[i].in_channels if hasattr(self.deblur_fuse_convs[i], 'in_channels') else 'N/A'}) with fused shape {fused.shape}")
             fused = self.deblur_fuse_convs[i](fused)
             x = self.deblur_blocks[i](fused)
             
-            # ----- Color Branch (only for shallow layers) -----
-            if i >= self.levels // 2:  # 浅层级
-                # 修复：调整x_color到与gated_skips相同的空间维度
-                upsampled_color = F.interpolate(fused_feat, size=x.shape[-2:], mode='bilinear', align_corners=False)
-                # 使用预定义的投影层而不是动态创建
-                x_color = self.color_proj(upsampled_color)
-                
-                # 现在可以安全地拼接，因为空间维度已对齐
-                color_fused = torch.cat([x_color] + gated_skips, dim=1)
-                
-                # 应用深度门控，确保深度特征也调整到正确大小
-                # 重用当前层的gated_skips[0]的空间尺寸
-                current_size = x.shape[-2:]
-                skip_current = F.interpolate(skip_feats[i], size=current_size, mode='bilinear', align_corners=False)
-                depth_current = F.interpolate(depth_feats[i], size=current_size, mode='bilinear', align_corners=False)
-                x_color = self.color_gate(skip_current, depth_current)
-            else:
-                # 深层与deblur分支共享
-                x_color = x
-        
-        # 如果收集了权重，将其保存为单个张量以便后续查询
-        if all_weights:
-            # 首先将所有权重调整到相同的空间尺寸
-            target_size = x.shape[-2:]  # 使用最终输出的尺寸
-            resized_weights = []
-            
-            for weight in all_weights:
-                # 如果尺寸不同，则调整到目标尺寸
-                if weight.shape[-2:] != target_size:
-                    # 对每个深度层级分别进行调整
-                    weight_channels = weight.shape[1]  # 深度层级数量
-                    resized = []
-                    
-                    for c in range(weight_channels):
-                        # 提取当前深度层级的权重，保持批次维度
-                        w_c = weight[:, c:c+1]
-                        # 调整尺寸
-                        w_c_resized = F.interpolate(w_c, size=target_size, mode='bilinear', align_corners=False)
-                        resized.append(w_c_resized)
-                    
-                    # 沿着通道维度拼接回调整后的权重
-                    resized_weight = torch.cat(resized, dim=1)
-                    resized_weights.append(resized_weight)
-                else:
-                    # 如果尺寸已经匹配，直接添加
-                    resized_weights.append(weight)
-            
-            # 堆叠调整后的所有层级的权重 [levels, B, depth_levels, H, W]
-            stacked_weights = torch.stack(resized_weights, dim=0)
-            # 转置为 [B, levels, depth_levels, H, W]
-            self.last_fusion_weights = stacked_weights.permute(1, 0, 2, 3, 4)
-        
-        # 5) Reconstruction to RGB residual
         res_d = self.deblur_recon(x)
         
-        # 确保 res_d 与输入图像 raw 大小匹配
-        if res_d.shape[2:] != raw.shape[2:]:
-            res_d = F.interpolate(res_d, size=raw.shape[2:], mode='bilinear', align_corners=False)
-
-        # 输出两个残差分支
-        res_c = res_d
+        # ----- 颜色分支 - 深度加权实现 -----
+        x_color = fused_feat
+        all_weights_for_logging_color = []
         
+        for i in range(self.levels):
+            x_color = self.color_ups[i](x_color)
+            gated_skips_color = []
+            
+            num_skips_to_use_at_level_i = i + 1
+            for k_skip_idx in range(num_skips_to_use_at_level_i):
+                if k_skip_idx >= len(skip_feats):
+                    logger.warning(f"颜色分支: 尝试访问索引为 {k_skip_idx} 的skip_feat，但解码层 {i} 只有 {len(skip_feats)} 个可用。")
+                    continue 
+                
+                skip_raw = skip_feats[k_skip_idx]
+                if skip_raw is None:
+                    logger.warning(f"颜色分支: 在索引 {k_skip_idx} 处发现空的skip_feat，解码层 {i}。")
+                    continue
+
+                skip_up = F.interpolate(skip_raw, size=x_color.shape[-2:], mode='bilinear', align_corners=False)
+                projected_skip = skip_up
+                if skip_up.shape[1] != self.base_channels:
+                    proj_layer = self._get_projection_layer(self.skip_feature_projections, skip_up.shape[1], self.base_channels, current_device)
+                    try:
+                        projected_skip = proj_layer(skip_up)
+                    except Exception as e:
+                        logger.error(f"颜色分支: 投影skip_feat时出错 (idx {k_skip_idx}): {e}。使用原始特征。")
+                
+                # 自适应深度融合
+                up_depths_for_fusion_step = []
+                valid_depth_count_for_fusion_step = 0
+                for df_processed in processed_depth_feats:
+                    if df_processed is not None:
+                        up_depths_for_fusion_step.append(F.interpolate(df_processed, size=x_color.shape[-2:], mode='bilinear', align_corners=False))
+                        valid_depth_count_for_fusion_step += 1
+                    else: # df_processed is None
+                        # 如果遇到None则用零填充，以保持通道数一致
+                        dummy_zeros = torch.zeros(B, self.base_channels, x_color.shape[2], x_color.shape[3], device=current_device)
+                        up_depths_for_fusion_step.append(dummy_zeros)
+                
+                if valid_depth_count_for_fusion_step > 0:
+                    if len(up_depths_for_fusion_step) == self.num_encoder_feature_levels:
+                        depth_cat_for_mlp = torch.cat(up_depths_for_fusion_step, dim=1)
+                        scores = self.scale_mlp_color(depth_cat_for_mlp)
+                        weights = torch.softmax(scores, dim=1)
+                        if k_skip_idx == 0: all_weights_for_logging_color.append(weights)
+                        
+                        depth_fusion_sum = sum(weights[:,j:j+1] * up_depths_for_fusion_step[j] for j in range(self.num_encoder_feature_levels))
+                        gate_map = torch.sigmoid(self.gate_conv_color(depth_fusion_sum))
+                        
+                        # 亮度/曝光掩码保护颜色
+                        if 'raw' in locals():
+                            # 计算亮度
+                            luma = raw.mean(1, keepdim=True)
+                            # 创建亮度掩码
+                            bright_mask = (luma > 0.98) | (luma < 0.02)
+                            # 确保bright_mask尺寸与gate_map一致
+                            if bright_mask.shape[-2:] != gate_map.shape[-2:]:
+                                bright_mask = F.interpolate(bright_mask.float(), size=gate_map.shape[-2:], mode='nearest')
+                                bright_mask = bright_mask.bool()  # 转回布尔类型
+                            # 应用掩码
+                            gate_map = gate_map.masked_fill(bright_mask, 1.0)
+                            
+                        gated = projected_skip * gate_map
+                    else:
+                        logger.error(f"颜色分支: 解码层 {i}, skip {k_skip_idx}: MLP处理后深度特征不匹配。预期 {self.num_encoder_feature_levels}, 得到 {len(up_depths_for_fusion_step)}。直接使用skip。")
+                        gated = projected_skip
+                else:
+                    gated = projected_skip 
+                    if k_skip_idx == 0 and i == 0: 
+                        logger.info("颜色分支: 首个skip没有提供有效深度特征进行融合。")
+
+                gated_skips_color.append(gated)
+                
+            fused = torch.cat([x_color] + gated_skips_color, dim=1)
+            
+            if fused.shape[1] != self.color_fuse_convs[i].in_channels:
+                logger.warning(
+                    f"颜色分支: 解码层 {i}: 颜色融合卷积通道不匹配。融合特征: {fused.shape[1]}, 预期: {self.color_fuse_convs[i].in_channels}。"
+                    f"提供的跳连数: {len(gated_skips_color)} (预期 {i+1})。尝试应急投影。"
+                )
+                proj_layer_fused = self._get_projection_layer(
+                    self.skip_feature_projections, 
+                    fused.shape[1], 
+                    self.color_fuse_convs[i].in_channels, 
+                    current_device
+                )
+                try:
+                    fused = proj_layer_fused(fused)
+                except Exception as e:
+                    logger.error(f"颜色分支: 解码层 {i} 特征融合应急投影出错: {e}。原样传递。")
+            
+            logger.debug(f"颜色分支: 解码层 {i}: 调用color_fuse_convs[{i}] (预期输入: {self.color_fuse_convs[i].in_channels if hasattr(self.color_fuse_convs[i], 'in_channels') else 'N/A'}) 融合特征形状 {fused.shape}")
+            fused = self.color_fuse_convs[i](fused)
+            
+            # 通过DACBlock并应用深度加权
+            if i < len(self.dac_blocks):
+                # 提取当前级别的深度权重
+                if processed_depth_feats and any(df is not None for df in processed_depth_feats):
+                    # 选择一个有效的深度特征用于权重计算
+                    valid_depth = next((df for df in processed_depth_feats if df is not None), None)
+                    if valid_depth is not None:
+                        # 计算深度权重
+                        depth_w = F.interpolate(valid_depth, size=fused.shape[2:], mode='bilinear', align_corners=False)
+                        # 获取深度置信度 (最后一个元素可能是置信度图)
+                        conf = depth_w.mean() if len(processed_depth_feats) < self.num_encoder_feature_levels + 1 else processed_depth_feats[-1]
+                        
+                        # 如果置信度过低则不使用深度加权
+                        if isinstance(conf, torch.Tensor) and conf.mean() < 0.1:
+                            w = torch.ones_like(depth_w)
+                            logger.debug(f"颜色分支: 解码层 {i}: 深度置信度过低 ({conf.mean().item():.3f})，使用统一权重")
+                        else:
+                            w = depth_w
+                    else:
+                        w = torch.ones_like(fused)
+                else:
+                    w = torch.ones_like(fused)
+                
+                x_color = self.dac_blocks[i](fused, w)
+            else:
+                # 如果没有对应的DACBlock，则使用RestormerBlock
+                x_color = self.color_blocks[i](fused)
+                
+        # 使用颜色重建头生成残差
+        res_c = self.color_recon(x_color)
+
+        if all_weights_for_logging:
+            target_size = x.shape[-2:]
+            resized_weights_list = []
+            for w_log in all_weights_for_logging:
+                if w_log.shape[-2:] != target_size:
+                    num_depth_scales_in_w = w_log.shape[1]
+                    per_scale_resized = []
+                    for s_idx in range(num_depth_scales_in_w):
+                        per_scale_resized.append(F.interpolate(w_log[:,s_idx:s_idx+1], size=target_size, mode='bilinear', align_corners=False))
+                    resized_weights_list.append(torch.cat(per_scale_resized, dim=1))
+                else:
+                    resized_weights_list.append(w_log)
+            if resized_weights_list:
+                try:
+                    self.last_fusion_weights = torch.stack(resized_weights_list, dim=1) 
+                except Exception as e:
+                    logger.error(f"Error stacking fusion weights: {e}. Shapes: {[rw.shape for rw in resized_weights_list]}")
+                    self.last_fusion_weights = None
+            else:
+                self.last_fusion_weights = None
+        else:
+            self.last_fusion_weights = None
+            
         return res_d, res_c
 
 @torch.no_grad()
