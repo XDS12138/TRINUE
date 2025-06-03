@@ -1699,93 +1699,119 @@ def distributed_worker(rank, world_size, config, args):
         raise e_dist
 
 
-def set_train_stage(model, epoch, stageA_epoch=20, stageB_epoch=10):
+def resume_from_checkpoint(checkpoint_dir: str,
+                         model: torch.nn.Module,
+                         optimizer: torch.optim.Optimizer = None,
+                         scheduler: torch.optim.lr_scheduler._LRScheduler = None,
+                         device = None,
+                         scaler = None) -> tuple:
     """
-    设置模型的训练阶段，实现三阶段冻结策略：
-      Stage-A: 只训练 RGB（冻结 Depth 和 Cross-Attention）
-      Stage-B: 只训练 Depth（冻结 RGB 和 Cross-Attention）
-      Stage-C: 联合训练 RGB、Depth 和 Cross-Attention
-
+    从检查点目录恢复训练，支持混合精度训练
+    
     Args:
-        model: 模型实例（可能是 DDP 包装后的，交叉注意力在 model.encoder 中）
-        epoch: 当前 epoch（从 0 开始）
-        stageA_epoch: Stage-A 的结束 epoch（[0, stageA_epoch)）
-        stageB_epoch: Stage-B 的阶段长度，当 epoch 在 [stageA_epoch, stageA_epoch+stageB_epoch) 时为 Stage-B
+        checkpoint_dir (str): 包含检查点文件的目录
+        model (nn.Module): 要加载状态的模型
+        optimizer (Optimizer, optional): 要加载状态的优化器
+        scheduler (_LRScheduler, optional): 要加载状态的调度器
+        device: 加载设备
+        scaler: 混合精度训练的梯度缩放器
+        
+    Returns:
+        epoch (int): 恢复的起始epoch
+        best_metric (float): 目前为止的最佳验证指标
     """
-    # 计算各阶段边界
-    stageB_start = stageA_epoch
-    stageC_start = stageA_epoch + stageB_epoch
+    # 查找最新的检查点
+    if not os.path.isdir(checkpoint_dir): # Check if dir exists
+        print(f"检查点目录不存在: {checkpoint_dir}")
+        return 0, 0.0
 
-    # 确保拿到实际模型（若是 DDP 则为 model.module）
-    actual_model = model.module if hasattr(model, 'module') else model
-
-    # Helper：冻结/解冻 Cross-Attention 模块
-    def set_cross_attn_requires_grad(req):
-        if hasattr(actual_model.encoder, 'depth2rgb_attn_blocks'):
-            for attn in actual_model.encoder.depth2rgb_attn_blocks:
-                for p in attn.parameters():
-                    p.requires_grad = req
-        if hasattr(actual_model.encoder, 'rgb2depth_attn_blocks'):
-            for attn in actual_model.encoder.rgb2depth_attn_blocks:
-                for p in attn.parameters():
-                    p.requires_grad = req
-
-    # 判断当前属于哪个阶段
-    if epoch < stageA_epoch:
-        # --- Stage-A: 只训练 RGB 解码器 ---
-        # 冻结 Depth 解码器
-        for p in actual_model.depth_decoder.parameters():
-            p.requires_grad = False
-        # 解冻 RGB 解码器
-        for p in actual_model.decoder.parameters():
-            p.requires_grad = True
-        # 冻结 Cross-Attention
-        set_cross_attn_requires_grad(False)
-
-        current_stage = 'A-RGB'
-    elif epoch < stageC_start:
-        # --- Stage-B: 只训练 Depth 解码器 ---
-        # 解冻 Depth 解码器
-        for p in actual_model.depth_decoder.parameters():
-            p.requires_grad = True
-        # 冻结 RGB 解码器
-        for p in actual_model.decoder.parameters():
-            p.requires_grad = False
-        # 冻结 Cross-Attention
-        set_cross_attn_requires_grad(False)
-
-        current_stage = 'B-Depth'
+    files = [f for f in os.listdir(checkpoint_dir) if f.endswith(".pth.tar")]
+    if not files:
+        print(f"在目录 {checkpoint_dir} 中未找到检查点文件。")
+        return 0, 0.0  # 没有找到检查点文件
+        
+    # 按修改时间排序，找到最新的检查点
+    # latest = max(files, key=lambda x: os.path.getmtime(os.path.join(checkpoint_dir, x)))
+    # Prioritize 'best_model.pth.tar' if available
+    best_checkpoint_name = 'best_model.pth.tar'
+    if best_checkpoint_name in files:
+        latest_file = best_checkpoint_name
     else:
-        # --- Stage-C: 联合训练 RGB、Depth、Cross-Attention ---
-        # 解冻 Depth 解码器
-        for p in actual_model.depth_decoder.parameters():
-            p.requires_grad = True
-        # 解冻 RGB 解码器
-        for p in actual_model.decoder.parameters():
-            p.requires_grad = True
-        # 解冻 Cross-Attention
-        set_cross_attn_requires_grad(True)
+        # Fallback to most recently modified .pth.tar if best_model is not found
+        latest_file = max(files, key=lambda x: os.path.getmtime(os.path.join(checkpoint_dir, x)))
 
-        current_stage = 'C-Joint'
+    
+    checkpoint_path = os.path.join(checkpoint_dir, latest_file)
+    print(f"从检查点恢复: {checkpoint_path}")
+    
+    # 加载检查点
+    map_location = device if device is not None else torch.device('cpu')
+    checkpoint = torch.load(checkpoint_path, map_location=map_location)
+    
+    # 加载模型权重
+    if 'state_dict' in checkpoint:
+        state_dict_to_load = checkpoint['state_dict'] # Renamed
+    elif isinstance(checkpoint, dict) and all(isinstance(k, str) for k in checkpoint.keys()): # Heuristic for raw state_dict
+        state_dict_to_load = checkpoint
+    else:
+        print(f"检查点格式无效: {checkpoint_path}")
+        return 0, 0.0
+        
+    # 处理DataParallel/DDP前缀
+    new_state_dict = {}
+    is_ddp_model = isinstance(model, DDP)
+    
+    for k, v in state_dict_to_load.items():
+        name = k
+        if k.startswith('module.') and not is_ddp_model:
+            name = k[7:]  # remove `module.`
+        elif not k.startswith('module.') and is_ddp_model:
+            name = 'module.' + k # add `module.`
+        new_state_dict[name] = v
+        
+    try:
+        model.load_state_dict(new_state_dict)
+    except RuntimeError as e_load:
+        print(f"加载模型状态字典时出错: {e_load}. 尝试非严格加载...")
+        try:
+            model.load_state_dict(new_state_dict, strict=False)
+            print("非严格加载模型状态成功。")
+        except RuntimeError as e_load_nostrict:
+            print(f"非严格加载模型状态也失败: {e_load_nostrict}")
+            return 0, 0.0 # Propagate error or handle as critical
+    
+    # 加载优化器状态
+    if optimizer is not None and 'optimizer' in checkpoint:
+        try:
+            optimizer.load_state_dict(checkpoint['optimizer'])
+            # 将优化器状态移动到正确的设备
+            if device is not None:
+                for state in optimizer.state.values():
+                    for k_opt, v_opt in state.items(): # Renamed loop vars
+                        if isinstance(v_opt, torch.Tensor):
+                            state[k_opt] = v_opt.to(device)
+        except Exception as e_optim: # Renamed exception var
+            print(f"警告: 无法加载优化器状态: {e_optim}")
+    
+    # 加载学习率调度器状态
+    if scheduler is not None and 'scheduler' in checkpoint:
+        try:
+            scheduler.load_state_dict(checkpoint['scheduler'])
+        except Exception as e_sched: # Renamed exception var
+            print(f"警告: 无法加载学习率调度器状态: {e_sched}")
+            
+    # 加载AMP梯度缩放器状态（用于混合精度训练）
+    if scaler is not None and 'scaler' in checkpoint:
+        try:
+            scaler.load_state_dict(checkpoint['scaler'])
+        except Exception as e_scaler: # Renamed exception var
+            print(f"警告: 无法加载混合精度缩放器状态: {e_scaler}")
+    
+    start_epoch_res = checkpoint.get('epoch', 0) # Renamed
+    best_metric_res = checkpoint.get('best_metric', 0.0) # Renamed
+    
+    return start_epoch_res, best_metric_res
 
-    # 打印当前阶段的参数统计
-    rgb_params = sum(p.numel() for p in actual_model.decoder.parameters() if p.requires_grad)
-    depth_params = sum(p.numel() for p in actual_model.depth_decoder.parameters() if p.requires_grad)
-    # 统计 Cross-Attention 可训练参数数目
-    cross_params = 0
-    if hasattr(actual_model.encoder, 'depth2rgb_attn_blocks'):
-        for attn in actual_model.encoder.depth2rgb_attn_blocks:
-            cross_params += sum(p.numel() for p in attn.parameters() if p.requires_grad)
-    if hasattr(actual_model.encoder, 'rgb2depth_attn_blocks'):
-        for attn in actual_model.encoder.rgb2depth_attn_blocks:
-            cross_params += sum(p.numel() for p in attn.parameters() if p.requires_grad)
-    total_params = sum(p.numel() for p in actual_model.parameters() if p.requires_grad)
-
-    logger.info(f"当前训练阶段: {current_stage}")
-    logger.info(f"RGB解码器参数: {rgb_params:,} ({rgb_params/total_params*100:.2f}%)")
-    logger.info(f"深度解码器参数: {depth_params:,} ({depth_params/total_params*100:.2f}%)")
-    logger.info(f"交叉注意力参数: {cross_params:,} ({cross_params/total_params*100:.2f}%)")
-    logger.info(f"总可训练参数: {total_params:,}")
 
 def main_worker(config, args):
     """单进程/DDP训练主函数"""
@@ -1905,26 +1931,7 @@ def main_worker(config, args):
     save_best = config.get('train', {}).get('save_best', True)
     val_interval = config.get('train', {}).get('val_interval', 1)
 
-    # 从配置中读取三阶段的分界点（可在 config.yaml 中添加以下字段）
-    stageA_epoch = config['train'].get('stageA_epoch', 20)      # Stage-A 结束
-    stageB_epoch = config['train'].get('stageB_epoch', 10)      # Stage-B 长度
-    # Stage-C 从 stageA_epoch + stageB_epoch 开始
-
     for epoch in range(start_epoch, epochs):
-        # 设置三阶段冻结/解冻逻辑
-        set_train_stage(model, epoch, stageA_epoch, stageB_epoch)
-
-        # 如果需要在阶段边界重新构建优化器以仅包含可训练参数，可以在此处判断
-        # 例如，当 epoch == stageA_epoch 或 epoch == stageA_epoch+stageB_epoch 时：
-        if epoch in {stageA_epoch, stageA_epoch + stageB_epoch}:
-            params_to_optimize = [p for p in model.parameters() if p.requires_grad]
-            optimizer = optim.AdamW(
-                params_to_optimize,
-                lr=config['optimizer']['lr'],
-                weight_decay=config['optimizer'].get('weight_decay', 0.01)
-            )
-            logger.info(f"在 epoch {epoch} 重构优化器，参数数量: {len(params_to_optimize):,}")
-
         # 分布式采样器的 epoch 设定
         if train_sampler is not None and hasattr(train_sampler, 'set_epoch'):
             train_sampler.set_epoch(epoch)
@@ -2007,122 +2014,6 @@ def main_worker(config, args):
 
     if metric_logger is not None:
         metric_logger.close()
-
-
-
-
-def resume_from_checkpoint(checkpoint_dir: str,
-                         model: torch.nn.Module,
-                         optimizer: torch.optim.Optimizer = None,
-                         scheduler: torch.optim.lr_scheduler._LRScheduler = None,
-                         device = None,
-                         scaler = None) -> tuple:
-    """
-    从检查点目录恢复训练，支持混合精度训练
-    
-    Args:
-        checkpoint_dir (str): 包含检查点文件的目录
-        model (nn.Module): 要加载状态的模型
-        optimizer (Optimizer, optional): 要加载状态的优化器
-        scheduler (_LRScheduler, optional): 要加载状态的调度器
-        device: 加载设备
-        scaler: 混合精度训练的梯度缩放器
-        
-    Returns:
-        epoch (int): 恢复的起始epoch
-        best_metric (float): 目前为止的最佳验证指标
-    """
-    # 查找最新的检查点
-    if not os.path.isdir(checkpoint_dir): # Check if dir exists
-        print(f"检查点目录不存在: {checkpoint_dir}")
-        return 0, 0.0
-
-    files = [f for f in os.listdir(checkpoint_dir) if f.endswith(".pth.tar")]
-    if not files:
-        print(f"在目录 {checkpoint_dir} 中未找到检查点文件。")
-        return 0, 0.0  # 没有找到检查点文件
-        
-    # 按修改时间排序，找到最新的检查点
-    # latest = max(files, key=lambda x: os.path.getmtime(os.path.join(checkpoint_dir, x)))
-    # Prioritize 'best_model.pth.tar' if available
-    best_checkpoint_name = 'best_model.pth.tar'
-    if best_checkpoint_name in files:
-        latest_file = best_checkpoint_name
-    else:
-        # Fallback to most recently modified .pth.tar if best_model is not found
-        latest_file = max(files, key=lambda x: os.path.getmtime(os.path.join(checkpoint_dir, x)))
-
-    
-    checkpoint_path = os.path.join(checkpoint_dir, latest_file)
-    print(f"从检查点恢复: {checkpoint_path}")
-    
-    # 加载检查点
-    map_location = device if device is not None else torch.device('cpu')
-    checkpoint = torch.load(checkpoint_path, map_location=map_location)
-    
-    # 加载模型权重
-    if 'state_dict' in checkpoint:
-        state_dict_to_load = checkpoint['state_dict'] # Renamed
-    elif isinstance(checkpoint, dict) and all(isinstance(k, str) for k in checkpoint.keys()): # Heuristic for raw state_dict
-        state_dict_to_load = checkpoint
-    else:
-        print(f"检查点格式无效: {checkpoint_path}")
-        return 0, 0.0
-        
-    # 处理DataParallel/DDP前缀
-    new_state_dict = {}
-    is_ddp_model = isinstance(model, DDP)
-    
-    for k, v in state_dict_to_load.items():
-        name = k
-        if k.startswith('module.') and not is_ddp_model:
-            name = k[7:]  # remove `module.`
-        elif not k.startswith('module.') and is_ddp_model:
-            name = 'module.' + k # add `module.`
-        new_state_dict[name] = v
-        
-    try:
-        model.load_state_dict(new_state_dict)
-    except RuntimeError as e_load:
-        print(f"加载模型状态字典时出错: {e_load}. 尝试非严格加载...")
-        try:
-            model.load_state_dict(new_state_dict, strict=False)
-            print("非严格加载模型状态成功。")
-        except RuntimeError as e_load_nostrict:
-            print(f"非严格加载模型状态也失败: {e_load_nostrict}")
-            return 0, 0.0 # Propagate error or handle as critical
-    
-    # 加载优化器状态
-    if optimizer is not None and 'optimizer' in checkpoint:
-        try:
-            optimizer.load_state_dict(checkpoint['optimizer'])
-            # 将优化器状态移动到正确的设备
-            if device is not None:
-                for state in optimizer.state.values():
-                    for k_opt, v_opt in state.items(): # Renamed loop vars
-                        if isinstance(v_opt, torch.Tensor):
-                            state[k_opt] = v_opt.to(device)
-        except Exception as e_optim: # Renamed exception var
-            print(f"警告: 无法加载优化器状态: {e_optim}")
-    
-    # 加载学习率调度器状态
-    if scheduler is not None and 'scheduler' in checkpoint:
-        try:
-            scheduler.load_state_dict(checkpoint['scheduler'])
-        except Exception as e_sched: # Renamed exception var
-            print(f"警告: 无法加载学习率调度器状态: {e_sched}")
-            
-    # 加载AMP梯度缩放器状态（用于混合精度训练）
-    if scaler is not None and 'scaler' in checkpoint:
-        try:
-            scaler.load_state_dict(checkpoint['scaler'])
-        except Exception as e_scaler: # Renamed exception var
-            print(f"警告: 无法加载混合精度缩放器状态: {e_scaler}")
-    
-    start_epoch_res = checkpoint.get('epoch', 0) # Renamed
-    best_metric_res = checkpoint.get('best_metric', 0.0) # Renamed
-    
-    return start_epoch_res, best_metric_res
 
 
 def main():

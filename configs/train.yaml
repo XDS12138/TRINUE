@@ -30,8 +30,7 @@ train:
   save_best: true  # 是否保存最佳模型
   save_interval: 10  # 每多少个epoch保存一次模型
 #  lambda_decl: 0.1  # 深度边缘颜色损失权重
-  stageA_epoch: 10 # 阶段A结束的epoch，此前训练RGB解码器，之后训练深度解码器
-  stageB_epoch: 10 # 阶段B结束的epoch，此前训练深度解码器，之后训练RGB解码器
+
 # GPU配置
 gpu:
   use_gpu: true  # 是否使用GPU

@@ -37,44 +37,45 @@ class MultiTaskDecoder(nn.Module):
         logger.info(f"MultiTaskDecoder initialized with {levels} decoder levels, {self.num_encoder_feature_levels} expected encoder feature levels (for depth fusion weights).")
 
         # Deblur Branch
-        self.deblur_ups = nn.ModuleList()
-        self.deblur_blocks = nn.ModuleList() # Initialize as empty list first
-        self.deblur_skips = nn.ModuleList()
-        self.deblur_fuse_convs = nn.ModuleList() # Moved initialization up
+        self.deblur_ups = nn.ModuleList()#上采样模块
+        self.deblur_blocks = nn.ModuleList() # Initialize as empty list first，transformerblock finally
+        self.deblur_skips = nn.ModuleList() #跳跃连接
+        self.deblur_fuse_convs = nn.ModuleList() # Moved initialization up#融合卷积
 
         current_channels_deblur = input_channels_bottleneck
         for i in range(levels):
+            # 计算当前层输出通道数
             out_c_deblur = self.base_channels * (2**(levels - 1 - i)) if levels > 1 else self.base_channels
-            # Upsampling for deblur branch (example from a more complete version)
+            # Upsampling for deblur branch ，1*1卷积从当前通道数到4倍，然后pixelshuffle上采样
             self.deblur_ups.append(
                 nn.Sequential(
                     nn.Conv2d(current_channels_deblur, out_c_deblur * 4, kernel_size=1, bias=False),
                     nn.PixelShuffle(2)
                 )
             )
-            # Skip connection conv for deblur branch
+            # Skip connection conv for deblur branch，将编码器和解码器对应层特征与上采样特征concatenate后再用1*1卷积
             encoder_skip_channels_deblur = self.base_channels * (2**(self.num_encoder_feature_levels - 1 - i)) if self.num_encoder_feature_levels > 1 else self.base_channels
             self.deblur_skips.append(
                  nn.Conv2d(encoder_skip_channels_deblur + out_c_deblur, out_c_deblur, kernel_size=1, bias=True)
             )
-            # Fuse conv for deblur branch
+            # Fuse conv for deblur branch，将跳跃连接和上采样特征concatenate后再用1*1卷积，再降回 out_c_deblur
             self.deblur_fuse_convs.append(
                  nn.Conv2d(out_c_deblur * 2, out_c_deblur, kernel_size=1, bias=False) # Assuming skip and upsample result in out_c_deblur each
             )
-            # RestormerBlock for deblur branch
+            # RestormerBlock for deblur branch，输入通道数为out_c_deblur，输出通道数为out_c_deblur，head数为8，窗口大小为decoder_block_window_size
             self.deblur_blocks.append(RestormerBlock(out_c_deblur, heads=8, window_size=decoder_block_window_size)) # Corrected call
-            current_channels_deblur = out_c_deblur
+            current_channels_deblur = out_c_deblur#更新当前通道数
         
-        self.deblur_recon = nn.Conv2d(current_channels_deblur, 3, kernel_size=3, padding=1)
+        self.deblur_recon = nn.Conv2d(current_channels_deblur, 3, kernel_size=3, padding=1)#最后用1*3卷积输出3通道，将顶层特征映射到3通道RGB残差
 
         # Adaptive Depth Fusion Components (ensure these are correctly placed and initialized)
         self.scale_mlp = nn.Sequential(
-            nn.Conv2d(base_channels * self.num_encoder_feature_levels, base_channels, kernel_size=1, bias=False),
-            nn.GELU(),
-            nn.Conv2d(base_channels, self.num_encoder_feature_levels, kernel_size=1)
+            nn.Conv2d(base_channels * self.num_encoder_feature_levels, base_channels, kernel_size=1, bias=False),#将编码器特征通道数*num_encoder_feature_levels，然后1*1卷积到base_channels
+            nn.GELU(),#激活函数
+            nn.Conv2d(base_channels, self.num_encoder_feature_levels, kernel_size=1)#将base_channels卷积到num_encoder_feature_levels
         )
-        self.gate_conv = nn.Conv2d(base_channels, 1, kernel_size=1, bias=False)
-        
+        self.gate_conv = nn.Conv2d(base_channels, 1, kernel_size=1, bias=False)#将base_channels卷积到1通道，用于深度融合权重
+        #相当于对每个像素点产生一个长度为 num_encoder_feature_levels 的向量，代表“对不同尺度深度特征”的加权系数（score）。后续会对这组 score 做 softmax，得到权重分布。#全连接
         # 为颜色分支添加深度加权组件
         self.scale_mlp_color = nn.Sequential(
             nn.Conv2d(base_channels * self.num_encoder_feature_levels, base_channels, kernel_size=1, bias=False),
@@ -114,13 +115,13 @@ class MultiTaskDecoder(nn.Module):
             self.color_fuse_convs.append(
                  nn.Conv2d(out_c_color * 2, out_c_color, kernel_size=1, bias=False) # Assuming skip and upsample result in out_c_color each
             )
-            # RestormerBlock for color branch
+            # RestormerBlock for color branch，无dac时才使用这个
             self.color_blocks.append(RestormerBlock(out_c_color, heads=8, window_size=decoder_block_window_size)) # Corrected call
             current_channels_color = out_c_color
             
         self.color_recon = nn.Conv2d(current_channels_color, 3, kernel_size=3, padding=1) # Recon for color branch
-
-        # Global components for color correction (if needed, from a different design pattern)
+###
+        # Global components for color correction (if needed, from a different design pattern)，全局颜色校正辅助，投影字典初始化
         # self.color_gate = DepthGate(base_channels)
         self.global_pool = nn.AdaptiveAvgPool2d(1)
         self.mlp = nn.Sequential(
@@ -135,10 +136,10 @@ class MultiTaskDecoder(nn.Module):
         self.depth_channel_projections = nn.ModuleDict()
         logger.info(f"Initialized MultiTaskDecoder. Projection layers for skip/depth will be lazily created.")
         self.last_fusion_weights = None
-
+###
     def _get_projection_layer(self, proj_dict: nn.ModuleDict, in_channels: int, out_channels: int, device: torch.device):
-        """Helper to get or create a LazyConv2d projection layer."""
-        layer_key = f"{in_channels}_to_{out_channels}" # Key based on in_channels and out_channels
+        """Helper to get or create a LazyConv2d projection layer."""#跳连时深度通道与解码器预期不一致，需要1*1卷积投影
+        layer_key = f"{in_channels}_to_{out_channels}" # Key based on in_channels and out_channels，无需指定输入通道数，知道第一次传入真实tensor时次啊根据输入通道完成权重初始化
         if layer_key not in proj_dict:
             # We specify out_channels, kernel_size, and bias.
             lazy_layer = nn.LazyConv2d(out_channels, kernel_size=1, bias=False)
@@ -149,11 +150,11 @@ class MultiTaskDecoder(nn.Module):
         return proj_dict[layer_key]
 
     def forward(self, fused_feat, skip_feats, depth_feats, raw):
-        B, C_bottleneck, H_bottleneck, W_bottleneck = fused_feat.shape
+        B, C_bottleneck, H_bottleneck, W_bottleneck = fused_feat.shape #最小分辨率瓶颈特征
         current_device = fused_feat.device
 
         # --- Project depth_feats to self.base_channels if necessary (using LazyConv2d) ---
-        processed_depth_feats = []
+        processed_depth_feats = []#深度特征预处理
         if depth_feats is not None:
             # Pad/truncate if adaptive depth fusion relies on exact number.
             # The scale_mlp expects input from self.num_encoder_feature_levels features.
@@ -171,9 +172,9 @@ class MultiTaskDecoder(nn.Module):
                         while len(depth_feats_for_processing) < self.num_encoder_feature_levels:
                             depth_feats_for_processing.append(None)
             else:
-                depth_feats_for_processing = depth_feats
+                depth_feats_for_processing = depth_feats#对深度特征进行尺寸裁剪
 
-            for df_idx, df in enumerate(depth_feats_for_processing):
+            for df_idx, df in enumerate(depth_feats_for_processing):#将深度特征投影
                 if df is None:
                     processed_depth_feats.append(None)
                     # logger.warning(f"Encountered None in depth_feats at index {df_idx} during projection.")
@@ -201,10 +202,10 @@ class MultiTaskDecoder(nn.Module):
         all_weights_for_logging = []
         
         for i in range(self.levels):
-            x = self.deblur_ups[i](x)
+            x = self.deblur_ups[i](x)#上采
             gated_skips = []
             
-            num_skips_to_use_at_level_i = i + 1
+            num_skips_to_use_at_level_i = i + 1#跳连个数
             for k_skip_idx in range(num_skips_to_use_at_level_i):
                 if k_skip_idx >= len(skip_feats):
                     logger.warning(f"Attempting to access skip_feat index {k_skip_idx} but only {len(skip_feats)} available at decoder level {i}.")
@@ -214,6 +215,7 @@ class MultiTaskDecoder(nn.Module):
                 if skip_raw is None:
                     logger.warning(f"Encountered None skip_feat at index {k_skip_idx} for decoder level {i}.")
                     continue
+                #跳跃特征插值
 
                 skip_up = F.interpolate(skip_raw, size=x.shape[-2:], mode='bilinear', align_corners=False)
                 projected_skip = skip_up
@@ -226,6 +228,7 @@ class MultiTaskDecoder(nn.Module):
                 
                 # Adaptive Depth Fusion
                 # Use processed_depth_feats which should now have self.num_encoder_feature_levels elements (some might be None)
+                #将所有尺度的depth_feats都插值到当前大小，再cat送入sacle_mlp生成weights
                 up_depths_for_fusion_step = []
                 valid_depth_count_for_fusion_step = 0
                 for df_processed in processed_depth_feats:
@@ -241,10 +244,10 @@ class MultiTaskDecoder(nn.Module):
                     # Ensure up_depths_for_fusion_step has self.num_encoder_feature_levels items for cat
                     # This should be guaranteed by the initial padding/truncation of depth_feats_for_processing
                     # and the subsequent padding of Nones with zeros here.
-                    if len(up_depths_for_fusion_step) == self.num_encoder_feature_levels:
-                        depth_cat_for_mlp = torch.cat(up_depths_for_fusion_step, dim=1)
-                        scores = self.scale_mlp(depth_cat_for_mlp)
-                        weights = torch.softmax(scores, dim=1)
+                    if len(up_depths_for_fusion_step) == self.num_encoder_feature_levels:#如果所有udffs列表长度等于nefl即可拼接
+                        depth_cat_for_mlp = torch.cat(up_depths_for_fusion_step, dim=1)#拼接channel维度cat->[B, base_channels * L, H, W]
+                        scores = self.scale_mlp(depth_cat_for_mlp)#MLP 得到分数： [B, num_encoder_feature_levels, H, W]
+                        weights = torch.softmax(scores, dim=1)#weights = torch.softmax(scores, dim=1)
                         if k_skip_idx == 0: all_weights_for_logging.append(weights)
                         
                         depth_fusion_sum = sum(weights[:,j:j+1] * up_depths_for_fusion_step[j] for j in range(self.num_encoder_feature_levels))
