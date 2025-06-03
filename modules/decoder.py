@@ -263,7 +263,7 @@ class MultiTaskDecoder(nn.Module):
                 gated_skips.append(gated)
                 
             fused = torch.cat([x] + gated_skips, dim=1)
-            
+            #进行通道拼接
             if fused.shape[1] != self.deblur_fuse_convs[i].in_channels:
                 logger.warning(
                     f"Decoder level {i}: Channel mismatch for deblur_fuse_convs. Fused: {fused.shape[1]}, Expected: {self.deblur_fuse_convs[i].in_channels}. "
@@ -281,8 +281,8 @@ class MultiTaskDecoder(nn.Module):
                     logger.error(f"Error in emergency projection of fused features at level {i}: {e}. Passing as is.")
             
             logger.debug(f"Decoder level {i}: About to call deblur_fuse_convs[{i}] (expected in: {self.deblur_fuse_convs[i].in_channels if hasattr(self.deblur_fuse_convs[i], 'in_channels') else 'N/A'}) with fused shape {fused.shape}")
-            fused = self.deblur_fuse_convs[i](fused)
-            x = self.deblur_blocks[i](fused)
+            fused = self.deblur_fuse_convs[i](fused)#降通道
+            x = self.deblur_blocks[i](fused)#restormer
             
         res_d = self.deblur_recon(x)
         
