@@ -247,17 +247,17 @@ class MultiTaskDecoder(nn.Module):
                     if len(up_depths_for_fusion_step) == self.num_encoder_feature_levels:#如果所有udffs列表长度等于nefl即可拼接
                         depth_cat_for_mlp = torch.cat(up_depths_for_fusion_step, dim=1)#拼接channel维度cat->[B, base_channels * L, H, W]
                         scores = self.scale_mlp(depth_cat_for_mlp)#MLP 得到分数： [B, num_encoder_feature_levels, H, W]
-                        weights = torch.softmax(scores, dim=1)#weights = torch.softmax(scores, dim=1)
+                        weights = torch.softmax(scores, dim=1)#weights = torch.softmax(scores, dim=1)# 记录第一层 (k_skip_idx == 0) 的 weights 用于可视化
                         if k_skip_idx == 0: all_weights_for_logging.append(weights)
                         
-                        depth_fusion_sum = sum(weights[:,j:j+1] * up_depths_for_fusion_step[j] for j in range(self.num_encoder_feature_levels))
-                        gate_map = torch.sigmoid(self.gate_conv(depth_fusion_sum))
-                        gated = projected_skip * gate_map
+                        depth_fusion_sum = sum(weights[:,j:j+1] * up_depths_for_fusion_step[j] for j in range(self.num_encoder_feature_levels))#计算加权和对每个尺度
+                        gate_map = torch.sigmoid(self.gate_conv(depth_fusion_sum))#生成gatemap，对加权特征和做1*1卷积再sigmoid
+                        gated = projected_skip * gate_map#最终gated跳跃特征
                     else:
                         logger.error(f"Decoder level {i}, skip {k_skip_idx}: Mismatch in depth features for MLP after processing. Expected {self.num_encoder_feature_levels}, got {len(up_depths_for_fusion_step)}. Using skip directly.")
                         gated = projected_skip
                 else:
-                    gated = projected_skip 
+                    gated = projected_skip #对不齐就不用深度门控，没有深度也不深度门控
                     if k_skip_idx == 0 and i == 0 : logger.info("MultiTaskDecoder: No valid depth features provided for fusion for first skip.")
 
                 gated_skips.append(gated)
