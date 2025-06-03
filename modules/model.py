@@ -292,7 +292,7 @@ class UnderwaterEnhanceNet(nn.Module):
             #    depth_feats 现在是一个长度为 self.levels 的列表，
             #    每个 Tensor 尺寸分别为 [B, rgb_ch_i, h_i, w_i]
 
-            # 1.5) 用第 0 级深度特征做门控图（pred_gate），计算深度置信度 depth_conf_map
+            # 1.5) 用第 0 级深度特征做门控图（pred_gate），计算深度置信度 depth_conf_map（损失）
             pred_gate = self.depth_head(depth_feats[0])                                                         
             if hasattr(depth_gt, '_depth_processed'):
                 depth_conf_map = torch.ones_like(pred_gate)
