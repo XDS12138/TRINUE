@@ -5,10 +5,9 @@ import torch.nn.functional as F
 
 class DACBlock(nn.Module):
     """
-    Depth-Adaptive Color Block for color branch.
+    Modified Color Block without depth gating.
     输入:
       - x: Tensor[B,C,H,W]
-      - gate_map: Tensor[B,1,H,W]
     """
     def __init__(self, C):
         super().__init__()
@@ -26,30 +25,20 @@ class DACBlock(nn.Module):
         self.point_pw = nn.Conv2d(C, C, kernel_size=1)
         self.act = nn.GELU()
 
-    def forward(self, x, gate_map):
+    def forward(self, x, gate_map=None):
         # 1) 深度 DW + 膨胀
         y = self.depth_dw(x)
         # 2) 通道注意力
         ca = self.channel_attn(y)
         
-        # 修复gate_map的通道维度
-        # 确保gate_map的通道数与ca匹配
-        if gate_map.shape[1] != ca.shape[1]:
-            # 如果gate_map是单通道的，扩展它以匹配ca通道数
-            if gate_map.shape[1] == 1:
-                gate_map = gate_map.expand(-1, ca.shape[1], -1, -1)
-            else:
-                # 否则，应用通道投影
-                gate_map = torch.mean(gate_map, dim=1, keepdim=True).expand(-1, ca.shape[1], -1, -1)
-        
-        # 应用通道注意力和gate_map
-        y = y * ca * gate_map
+        # 不再使用gate_map进行深度门控
+        y = y * ca
         
         # 3) 逐点卷积 + 激活
         y = self.point_pw(y)
         y = self.act(y)
         # 4) 残差融合
-        return y + x 
+        return y + x
 
 class MDTA(nn.Module):
     """

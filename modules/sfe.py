@@ -27,6 +27,11 @@ class ShallowFeatureExtractor(nn.Module):
         self.act2 = nn.GELU()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # 确保输入和权重的数据类型匹配，解决混合精度训练问题
+        weight_dtype = self.conv1.weight.dtype
+        if x.dtype != weight_dtype:
+            x = x.to(dtype=weight_dtype)
+            
         # 第一层：Conv3x3 -> GN -> GELU
         x = self.conv1(x)
         x = self.norm1(x)

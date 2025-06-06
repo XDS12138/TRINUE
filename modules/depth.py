@@ -410,6 +410,11 @@ class MonoDepthHead(nn.Module):
         self.momentum = 0.9  # 运行统计更新动量
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # 确保输入和权重的数据类型匹配，解决混合精度训练问题
+        encoder_dtype = next(self.encoder.parameters()).dtype
+        if x.dtype != encoder_dtype:
+            x = x.to(dtype=encoder_dtype)
+            
         # 下采阶段，获取粗粒度深度特征
         x = self.encoder(x)
         # 上采阶段，回复至原分辨率

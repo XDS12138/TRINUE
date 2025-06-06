@@ -24,6 +24,7 @@ class DepthDecoder(nn.Module):
         ch = [base_c * 2**i for i in range(levels)][::-1]   # H/16→H
         self.ups = nn.ModuleList()
         self.skip_proj = nn.ModuleList()
+        self.fusion_proj = nn.ModuleList()  # 新增：特征融合后的通道投影层
         self.blocks = nn.ModuleList()
 
         in_c = ch[0]
@@ -36,6 +37,8 @@ class DepthDecoder(nn.Module):
                 )
             )
             self.skip_proj.append(nn.Conv2d(out_c, out_c, 1, bias=False))
+            # 新增：融合投影层，将拼接后的2*out_c通道降为out_c通道
+            self.fusion_proj.append(nn.Conv2d(out_c * 2, out_c, 1, bias=False))
             self.blocks.append(RestormerBlock(out_c, heads=8, window_size=window))
             in_c = out_c
 
@@ -53,6 +56,17 @@ class DepthDecoder(nn.Module):
             else:
                 # 过多则截断
                 skip_feats = skip_feats[:self.levels]
+        
+        # 确保输入和权重的数据类型匹配，解决混合精度训练问题
+        if len(self.ups) > 0:
+            ups_dtype = next(self.ups[0].parameters()).dtype
+            if bottleneck.dtype != ups_dtype:
+                bottleneck = bottleneck.to(dtype=ups_dtype)
+            
+            # 同样检查skip_feats的数据类型
+            for i in range(len(skip_feats)):
+                if skip_feats[i].dtype != ups_dtype:
+                    skip_feats[i] = skip_feats[i].to(dtype=ups_dtype)
         
         x = bottleneck
         depth_feats = []
@@ -73,6 +87,10 @@ class DepthDecoder(nn.Module):
             
             x = torch.cat([x, projected_skip], dim=1)
             logger.debug(f"DepthDecoder after concat[{i}]: shape={x.shape}")
+            
+            # 使用融合投影层将通道数从2*out_c降到out_c
+            x = self.fusion_proj[i](x)
+            logger.debug(f"DepthDecoder after fusion projection[{i}]: shape={x.shape}")
             
             # 通过块处理
             x = self.blocks[i](x)

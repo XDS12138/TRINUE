@@ -73,6 +73,7 @@ class CrossAttention(nn.Module):
     def enable_attention_saving(self, enable=True):
         """启用或禁用注意力图保存功能"""
         self.save_attention = enable
+        print(f"[CrossAttention] 设置 save_attention = {enable}, dim={self.dim}, heads={self.heads}")
         
     def get_last_attn(self):
         """获取最近一次计算的注意力图"""
@@ -113,8 +114,10 @@ class CrossAttention(nn.Module):
                 # 这里实现窗口注意力的合并比较复杂，简化为仅保存第一个窗口的注意力
                 # 在实际实现中可能需要更复杂的合并逻辑
                 self.last_attn = attn[:B, :, :, :].detach()
+                print(f"[CrossAttention] 保存窗口注意力图: shape={self.last_attn.shape}")
             else:
                 self.last_attn = attn.detach()
+                print(f"[CrossAttention] 保存全局注意力图: shape={self.last_attn.shape}")
         
         # 加权 v: attn @ vᵀ → [B, heads, N, d_k]
         out = torch.einsum('bhNM,bhcM->bhcN', attn, v)

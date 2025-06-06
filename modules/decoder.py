@@ -4,6 +4,7 @@ import torch.nn.functional as F
 from .depth import DepthGate
 from .blocks import RestormerBlock, DACBlock
 import logging
+import kornia.filters as K  # 用于高斯卷积
 
 logger = logging.getLogger(__name__)
 
@@ -75,7 +76,7 @@ class MultiTaskDecoder(nn.Module):
             nn.Conv2d(base_channels, self.num_encoder_feature_levels, kernel_size=1)#将base_channels卷积到num_encoder_feature_levels
         )
         self.gate_conv = nn.Conv2d(base_channels, 1, kernel_size=1, bias=False)#将base_channels卷积到1通道，用于深度融合权重
-        #相当于对每个像素点产生一个长度为 num_encoder_feature_levels 的向量，代表“对不同尺度深度特征”的加权系数（score）。后续会对这组 score 做 softmax，得到权重分布。#全连接
+        #相当于对每个像素点产生一个长度为 num_encoder_feature_levels 的向量，代表"对不同尺度深度特征"的加权系数（score）。后续会对这组 score 做 softmax，得到权重分布。#全连接
         # 为颜色分支添加深度加权组件
         self.scale_mlp_color = nn.Sequential(
             nn.Conv2d(base_channels * self.num_encoder_feature_levels, base_channels, kernel_size=1, bias=False),
@@ -120,23 +121,23 @@ class MultiTaskDecoder(nn.Module):
             current_channels_color = out_c_color
             
         self.color_recon = nn.Conv2d(current_channels_color, 3, kernel_size=3, padding=1) # Recon for color branch
-###
+        
+        # 添加融合模块：将J_D和I_A融合为最终输出
+        self.fuse_conv = nn.Conv2d(6, 3, kernel_size=1)  # 1x1卷积融合两个分支的结果
+        
         # Global components for color correction (if needed, from a different design pattern)，全局颜色校正辅助，投影字典初始化
-        # self.color_gate = DepthGate(base_channels)
         self.global_pool = nn.AdaptiveAvgPool2d(1)
         self.mlp = nn.Sequential(
             nn.Linear(self.base_channels, self.base_channels),
             nn.ReLU(inplace=True),
             nn.Linear(self.base_channels, self.base_channels * 2)
         )
-        # self.color_proj = nn.Conv2d(self.input_channels_bottleneck, self.base_channels, kernel_size=1, bias=False)
         self.color_proj_bottleneck = nn.Conv2d(self.input_channels_bottleneck, self.base_channels, kernel_size=1, bias=False) # Define color_proj_bottleneck
         
         self.skip_feature_projections = nn.ModuleDict()
         self.depth_channel_projections = nn.ModuleDict()
         logger.info(f"Initialized MultiTaskDecoder. Projection layers for skip/depth will be lazily created.")
         self.last_fusion_weights = None
-###
     def _get_projection_layer(self, proj_dict: nn.ModuleDict, in_channels: int, out_channels: int, device: torch.device):
         """Helper to get or create a LazyConv2d projection layer."""#跳连时深度通道与解码器预期不一致，需要1*1卷积投影
         layer_key = f"{in_channels}_to_{out_channels}" # Key based on in_channels and out_channels，无需指定输入通道数，知道第一次传入真实tensor时次啊根据输入通道完成权重初始化
@@ -149,7 +150,24 @@ class MultiTaskDecoder(nn.Module):
             logger.info(f"Created lazy projection layer for {in_channels} -> {out_channels} channels (key: {layer_key}) in {proj_dict._get_name()}")
         return proj_dict[layer_key]
 
-    def forward(self, fused_feat, skip_feats, depth_feats, raw):
+    def forward(self, fused_feat, skip_feats, depth_feats, raw, depth_pred=None, beta_c=None, B_c=None, blur_scale=None):
+        """
+        MultiTaskDecoder forward with A/D physical models
+        
+        Args:
+            fused_feat: Tensor[B, C_bottleneck, H_bottleneck, W_bottleneck] (Joint Bottleneck output)
+            skip_feats: list of RGB encoder features [F0_raw, F1_raw, ..., Fn_raw]
+            depth_feats: list of Depth features [F0_dep, F1_dep, ..., Fn_dep]
+            raw: Tensor[B, 3, H, W] (Original image) 
+            depth_pred: Tensor[B, 1, H, W] (Predicted depth map)
+            beta_c: Parameter for Beer-Lambert attenuation coefficient [1, 3, 1, 1]
+            B_c: Global background light [1, 3, 1, 1]
+            blur_scale: Scalar for depth PSF
+        
+        Returns:
+            res_d: Tensor[B, 3, H, W] (Deblur residual)
+            res_c: Tensor[B, 3, H, W] (Color correction residual)
+        """
         B, C_bottleneck, H_bottleneck, W_bottleneck = fused_feat.shape #最小分辨率瓶颈特征
         current_device = fused_feat.device
 
@@ -250,9 +268,10 @@ class MultiTaskDecoder(nn.Module):
                         weights = torch.softmax(scores, dim=1)#weights = torch.softmax(scores, dim=1)# 记录第一层 (k_skip_idx == 0) 的 weights 用于可视化
                         if k_skip_idx == 0: all_weights_for_logging.append(weights)
                         
-                        depth_fusion_sum = sum(weights[:,j:j+1] * up_depths_for_fusion_step[j] for j in range(self.num_encoder_feature_levels))#计算加权和对每个尺度
-                        gate_map = torch.sigmoid(self.gate_conv(depth_fusion_sum))#生成gatemap，对加权特征和做1*1卷积再sigmoid
-                        gated = projected_skip * gate_map#最终gated跳跃特征
+                        # 已禁用深度门控，不再计算深度特征权重和gate_map
+                        # depth_fusion_sum = sum(weights[:,j:j+1] * up_depths_for_fusion_step[j] for j in range(self.num_encoder_feature_levels))
+                        # gate_map = torch.sigmoid(self.gate_conv(depth_fusion_sum))
+                        gated = projected_skip  # 直接使用原始skip特征，不应用gate_map
                     else:
                         logger.error(f"Decoder level {i}, skip {k_skip_idx}: Mismatch in depth features for MLP after processing. Expected {self.num_encoder_feature_levels}, got {len(up_depths_for_fusion_step)}. Using skip directly.")
                         gated = projected_skip
@@ -333,23 +352,10 @@ class MultiTaskDecoder(nn.Module):
                         weights = torch.softmax(scores, dim=1)
                         if k_skip_idx == 0: all_weights_for_logging_color.append(weights)
                         
-                        depth_fusion_sum = sum(weights[:,j:j+1] * up_depths_for_fusion_step[j] for j in range(self.num_encoder_feature_levels))
-                        gate_map = torch.sigmoid(self.gate_conv_color(depth_fusion_sum))
-                        
-                        # 亮度/曝光掩码保护颜色
-                        if 'raw' in locals():
-                            # 计算亮度
-                            luma = raw.mean(1, keepdim=True)
-                            # 创建亮度掩码
-                            bright_mask = (luma > 0.98) | (luma < 0.02)
-                            # 确保bright_mask尺寸与gate_map一致
-                            if bright_mask.shape[-2:] != gate_map.shape[-2:]:
-                                bright_mask = F.interpolate(bright_mask.float(), size=gate_map.shape[-2:], mode='nearest')
-                                bright_mask = bright_mask.bool()  # 转回布尔类型
-                            # 应用掩码
-                            gate_map = gate_map.masked_fill(bright_mask, 1.0)
-                            
-                        gated = projected_skip * gate_map
+                        # 已禁用深度门控，不再计算深度特征权重和gate_map
+                        # depth_fusion_sum = sum(weights[:,j:j+1] * up_depths_for_fusion_step[j] for j in range(self.num_encoder_feature_levels))
+                        # gate_map = torch.sigmoid(self.gate_conv_color(depth_fusion_sum))
+                        gated = projected_skip  # 直接使用原始skip特征，不应用gate_map
                     else:
                         logger.error(f"颜色分支: 解码层 {i}, skip {k_skip_idx}: MLP处理后深度特征不匹配。预期 {self.num_encoder_feature_levels}, 得到 {len(up_depths_for_fusion_step)}。直接使用skip。")
                         gated = projected_skip
@@ -381,30 +387,10 @@ class MultiTaskDecoder(nn.Module):
             logger.debug(f"颜色分支: 解码层 {i}: 调用color_fuse_convs[{i}] (预期输入: {self.color_fuse_convs[i].in_channels if hasattr(self.color_fuse_convs[i], 'in_channels') else 'N/A'}) 融合特征形状 {fused.shape}")
             fused = self.color_fuse_convs[i](fused)
             
-            # 通过DACBlock并应用深度加权
+            # 通过DACBlock，不再应用深度加权
             if i < len(self.dac_blocks):
-                # 提取当前级别的深度权重
-                if processed_depth_feats and any(df is not None for df in processed_depth_feats):
-                    # 选择一个有效的深度特征用于权重计算
-                    valid_depth = next((df for df in processed_depth_feats if df is not None), None)
-                    if valid_depth is not None:
-                        # 计算深度权重
-                        depth_w = F.interpolate(valid_depth, size=fused.shape[2:], mode='bilinear', align_corners=False)
-                        # 获取深度置信度 (最后一个元素可能是置信度图)
-                        conf = depth_w.mean() if len(processed_depth_feats) < self.num_encoder_feature_levels + 1 else processed_depth_feats[-1]
-                        
-                        # 如果置信度过低则不使用深度加权
-                        if isinstance(conf, torch.Tensor) and conf.mean() < 0.1:
-                            w = torch.ones_like(depth_w)
-                            logger.debug(f"颜色分支: 解码层 {i}: 深度置信度过低 ({conf.mean().item():.3f})，使用统一权重")
-                        else:
-                            w = depth_w
-                    else:
-                        w = torch.ones_like(fused)
-                else:
-                    w = torch.ones_like(fused)
-                
-                x_color = self.dac_blocks[i](fused, w)
+                # 不再需要深度权重计算
+                x_color = self.dac_blocks[i](fused)
             else:
                 # 如果没有对应的DACBlock，则使用RestormerBlock
                 x_color = self.color_blocks[i](fused)
@@ -435,7 +421,59 @@ class MultiTaskDecoder(nn.Module):
         else:
             self.last_fusion_weights = None
             
-        return res_d, res_c
+        # 如果提供了深度图和物理模型参数，应用A/D物理模型公式
+        if depth_pred is not None and beta_c is not None and B_c is not None and blur_scale is not None:
+            # --- 3.3 深度条件 PSF 卷积 (D 式) ---
+            # 3.3.1 线性拼接得到"清晰图"
+            j_clear = raw + res_d                  # [B,3,H,W]
+            # 3.3.2 计算 σ(x)
+            # 确保 depth_pred 归一到 [0,1]
+            depth_norm = torch.clamp(depth_pred, min=0.0, max=1.0)  # [B,1,H,W]
+            sigma = blur_scale * depth_norm    # [B,1,H,W]
+
+            # 3.3.3 调用 Kornia Gaussian blur
+            kernel_size = 5  # 高斯核大小，可微调
+            # 将 sigma 复制到 3 通道
+            sigma_3ch = sigma.repeat(1, 3, 1, 1)    # [B,3,H,W]
+
+            # 确保 j_clear 在 [0,1] 范围内，避免模糊失真
+            j_clear_clamped = torch.clamp(j_clear, 0.0, 1.0)
+
+            # 执行 Gaussian blur
+            J_D = K.gaussian_blur2d(j_clear_clamped,
+                                 (kernel_size, kernel_size),
+                                 sigma=sigma_3ch,
+                                 border_type='reflect')  # [B,3,H,W]
+
+            # --- 3.4 Beer–Lambert (A 式) ---
+            j_color = raw + res_c              # [B,3,H,W]
+            j_color_clamped = torch.clamp(j_color, 0.0, 1.0)
+
+            # 3.4.1 归一化深度
+            depth_norm = torch.clamp(depth_pred, min=0.0, max=1.0)  # [B,1,H,W]
+            # 3.4.2 计算 t_c(x)：先把 depth 复制成 3 通道
+            depth_3ch = depth_norm.repeat(1, 3, 1, 1)              # [B,3,H,W]
+            t = torch.exp(- beta_c * depth_3ch)                   # [B,3,H,W]
+
+            # 3.4.3 Beer–Lambert 合成
+            I_A = j_color_clamped * t + B_c * (1.0 - t)           # [B,3,H,W]
+            I_A = torch.clamp(I_A, 0.0, 1.0)
+
+            # 更新 res_d 和 res_c 以反映物理模型处理
+            # 从 J_D 和 I_A 中恢复残差
+            res_d = J_D - raw
+            res_c = I_A - raw
+            
+            # 双支路融合
+            merged = torch.cat([J_D, I_A], dim=1)   # [B,6,H,W]
+            merged = self.fuse_conv(merged)         # [B,3,H,W]
+            final_out = torch.sigmoid(merged)       # 保证在 [0,1]
+            
+            # 返回融合输出以及两个分支的结果，便于计算物理一致性损失
+            return final_out, J_D, I_A
+        else:
+            # 如果没有物理模型参数，返回原始的残差
+            return res_d, None, None
 
 @torch.no_grad()
 def test_decoder(decoder, batch_size=1, channels=48, debug=False):
@@ -477,7 +515,21 @@ def test_decoder(decoder, batch_size=1, channels=48, debug=False):
                 print(f"深度特征 {i}: {feat.shape}")
         
         # 执行前向传播
-        res_d, res_c = decoder(fused_feat, skip_feats, depth_feats, raw)
+        depth_pred = torch.rand(batch_size, 1, 128, 128).to(device)  # 模拟深度预测
+        beta_c = torch.ones(1, 3, 1, 1).to(device) * 0.7  # 模拟Beer-Lambert系数
+        B_c = torch.zeros(1, 3, 1, 1).to(device)  # 模拟背景光
+        blur_scale = torch.tensor(0.005).to(device)  # 模拟模糊比例参数
+        
+        res_d, res_c = decoder(
+            fused_feat, 
+            skip_feats, 
+            depth_feats, 
+            raw, 
+            depth_pred=depth_pred,
+            beta_c=beta_c,
+            B_c=B_c,
+            blur_scale=blur_scale
+        )
         
         if debug:
             print(f"解码器测试成功！输出形状: {res_d.shape}")

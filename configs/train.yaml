@@ -13,10 +13,9 @@ model:
   levels: 4
   heads: 8
   bottleneck_blocks: 4
-  encoder_window_size: 8  # 增加窗口大小，避免内存爆炸
-  bottleneck_window_size: 8  # 启用瓶颈窗口
-  decoder_block_window_size: 8  # 增加窗口大小，避免内存爆炸
-  double_forward: true  # 是否使用双次前向推理模式（Pass-1生成深度，Pass-2增强RGB）
+  encoder_window_size: 8 
+  bottleneck_window_size: 16  # 启用瓶颈窗口
+  decoder_block_window_size: 16  
   depth_processor_config:
     double_channels: False
     use_cross_attn: true
@@ -97,15 +96,17 @@ loss:
   sigma_init:                      # 不确定性权重初始值
     rgb: 0.2                       # RGB损失初始权重
     depth: 0.2                     # 深度损失初始权重
-  lambda_img: 1.0    # L1 像素损失
-  lambda_ssim: 0.5   # 结构相似度损失
-  lambda_perc: 0.1   # 感知损失
-  lambda_fft: 0.05   # 频域损失
+  lambda_img: 10.0    # L1 像素损失
+  lambda_ssim: 1.0   # 结构相似度损失
+  lambda_perc: 1.0   # 感知损失
+  lambda_fft: 0.1   # 频域损失
   lambda_grad: 0.1   # 梯度损失
-  lambda_depth: 1.0  # 深度预测损失
+  lambda_depth: 0.1  # 深度预测损失
   lambda_smooth: 0.01  # 深度平滑损失
   lambda_decl: 0.1  # 深度边缘颜色损失权重
-  lambda_cons: 0.1  # 交叉注意力一致性损失权重
+  lambda_cons: 0.05  # 交叉注意力一致性损失权重
+  lambda_phy_A: 0.1  # 物理一致性A损失权重（Beer-Lambert模型）
+  lambda_phy_D: 0.1  # 物理一致性D损失权重（深度条件PSF模型）
   depth_weight: 1.0  # 深度回归损失权重（用于连续深度预测）
   depth_processing:
     use_log_transform: true  # 是否使用对数变换
@@ -144,9 +145,9 @@ visualization:
     max_samples: 8  # 最多保存多少个验证样本
     save_comparison: true  # 是否保存对比图(输入/输出/GT)
     save_metrics: true  # 是否在图像上标注指标
-  save_model_graph: true  # 是否保存模型结构图
+  save_model_graph: false  # 是否保存模型结构图
   plot_lr: true  # 是否绘制学习率曲线 
-  save_attention_maps: false  # 是否保存注意力图
+  save_attention_maps: true  # 是否保存注意力图（启用以计算注意力一致性损失）
 
 
 logging:

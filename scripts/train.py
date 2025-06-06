@@ -1,5 +1,10 @@
 import os
 import sys
+
+# 先添加项目根目录到Python路径，确保可以导入自定义模块
+root_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+sys.path.insert(0, root_path)
+
 import argparse
 import yaml
 import torch
@@ -15,29 +20,26 @@ from tqdm import tqdm
 import random
 from datetime import datetime
 import torch.multiprocessing as mp
+import traceback  # 添加traceback模块导入
 
 import warnings 
 import logging 
 import io
 from PIL import Image
 import torchvision
-import os
-import sys
 import logging
 import warnings
 
 os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
-
 
 for logger_name in ['PIL.PngImagePlugin', 'PIL.Image', 'PIL.TiffImagePlugin']:
     pil_logger = logging.getLogger(logger_name)
     pil_logger.setLevel(logging.CRITICAL)  # 只保留严重级别的日志
     pil_logger.propagate = False            # 避免将日志向上冒泡到根记录器
 
-
 from torchvision.utils import make_grid, save_image
 from torch.utils.tensorboard import SummaryWriter
-
+from utils.multi_logger import MultiFileLogger, create_multi_logger
 def custom_showwarning(message, category, filename, lineno, file=None, line=None):
     """自定义的警告处理函数，将 Python 警告转为 logger 日志输出。"""
     # 格式化警告信息，生成类似 “'filename:lineno: category: message'" 的字符串
@@ -49,13 +51,9 @@ def custom_showwarning(message, category, filename, lineno, file=None, line=None
 warnings.showwarning = custom_showwarning
 
 # ------------------------------------------------------------
-# 将项目根目录添加到 sys.path 中，以便后续可以直接 import 自定义模块
-
-root_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
-sys.path.insert(0, root_path)
+# 设置基本日志配置
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] [%(name)s] %(message)s')
 logger = logging.getLogger(__name__) # Main logger for this script
-
 # Early debug logs after main logger is available
 logger.debug(f"Calculated project root path: {root_path}")
 logger.debug(f"sys.path before 'from modules.depth_utils': {sys.path}")
@@ -69,7 +67,6 @@ from utils.lr_scheduler import get_scheduler
 from utils.metrics import calculate_psnr as compute_psnr, calculate_ssim as compute_ssim
 from utils import metrics as metrics_module  # 如果需要使用所有指标
 from utils.logger import setup_logger, MetricLogger
-
 class MetricLogger:
     def __init__(self, logger_instance, tb_writer=None, csv_path=None):
         self.logger = logger_instance
@@ -441,7 +438,12 @@ def setup_training(args, config, local_rank):
         lambda_grad=config['loss']['lambda_grad'],
         lambda_depth=config['loss']['lambda_depth'],
         lambda_smooth=config['loss']['lambda_smooth'],
-        lambda_decl=config['loss'].get('lambda_decl', 0.1),  # 新增深度边缘颜色损失权重
+        lambda_decl=config['loss'].get('lambda_decl', 0.1),  # 深度边缘颜色损失权重
+        lambda_cons=config['loss'].get('lambda_cons', 0.1),  # 注意力一致性损失权重
+        lambda_phy_A=config['loss'].get('lambda_phy_A', 0.1),   # 物理一致性A损失权重
+        lambda_phy_D=config['loss'].get('lambda_phy_D', 0.1),   # 物理一致性D损失权重
+        beta_c=model.beta_c if hasattr(model, 'beta_c') else None,  # 从模型获取Beer-Lambert衰减系数
+        B_c=model.B_c if hasattr(model, 'B_c') else None,           # 从模型获取全局背景光
         use_uncertainty_weighting=config['loss'].get('use_uncertainty_weighting', True)  # 从配置中读取是否使用自动调参
     )
     criterion = criterion.to(device)
@@ -537,6 +539,8 @@ def setup_training(args, config, local_rank):
         try:
             from torch.amp import GradScaler
             scaler = GradScaler()
+            logger.info("启用混合精度训练")
+            # 注意：不要将整个模型转换为半精度，让autocast自动处理
         except ImportError:
             print("警告：混合精度训练需要PyTorch 1.6+，已禁用混合精度训练。")
             mixed_precision = False
@@ -573,11 +577,35 @@ def setup_training(args, config, local_rank):
     file_log_level_str = logging_config.get('file_level', 'DEBUG')
     file_log_level = getattr(logging, file_log_level_str, logging.DEBUG)
     
-    logger_instance, tb_writer, csv_path, debug_logger_instance = setup_actual_logger(
-        exp_dir, 
-        console_log_level=console_log_level,
-        file_log_level=file_log_level # 使用配置中的文件日志级别
-    )
+    # 使用多文件日志系统
+    multi_logger = create_multi_logger(config, exp_dir)
+    
+    # 获取主日志记录器和调试日志记录器
+    logger_instance = multi_logger.get_logger('train')
+    debug_logger_instance = multi_logger.get_logger('debug')
+    
+    # 设置TensorBoard
+    tb_log_dir = os.path.join(exp_dir, 'tensorboard', datetime.now().strftime("%Y%m%d-%H%M%S"))
+    os.makedirs(tb_log_dir, exist_ok=True)
+    try:
+        from torch.utils.tensorboard import SummaryWriter
+        tb_writer = SummaryWriter(log_dir=tb_log_dir)
+        # 测试写入以确保目录可写
+        tb_writer.add_scalar('setup/tensorboard_test', 1, 0)
+        tb_writer.flush()
+        logger_instance.info(f"TensorBoard日志将写入目录: {tb_log_dir}")
+        logger_instance.info("TensorBoard初始化测试写入成功")
+    except ImportError:
+        logger_instance.warning("TensorBoard未安装，部分可视化功能将不可用。请运行 `pip install tensorboard` 安装。")
+        tb_writer = None
+    except Exception as e:
+        logger_instance.error(f"TensorBoard初始化失败: {str(e)}. 请检查路径权限和磁盘空间。")
+        tb_writer = None
+    
+    # 设置CSV路径
+    csv_path = os.path.join(exp_dir, 'metrics.csv')
+    
+    # 使用旧的MetricLogger类，但传入我们的多文件日志系统的logger
     metric_logger_instance = MetricLogger(logger_instance, tb_writer, csv_path)
     
     # 11. 记录训练配置
@@ -615,7 +643,8 @@ def setup_training(args, config, local_rank):
         'local_world_size': local_world_size,
         'distributed': distributed,
         'local_rank': local_rank,
-        'debug_logger': debug_logger_instance
+        'debug_logger': debug_logger_instance,
+        'multi_logger': multi_logger
     }
 
 
@@ -808,7 +837,7 @@ def extract_visualization_data(model_outputs, depth_feats, batch_size=4):
 
 
 def train_epoch(train_loader, model, criterion, optimizer, device, metric_logger, 
-               epoch, config, scaler=None, mixed_precision=False):
+               epoch, config, scaler=None, mixed_precision=False, multi_logger=None):
     """
     训练一个epoch的函数
     使用统一的多输入处理逻辑，同时支持单输入和多输入场景
@@ -889,7 +918,11 @@ def train_epoch(train_loader, model, criterion, optimizer, device, metric_logger
                             depth_gt_b,
                             student_feats[n_loop_idx], 
                             attention_maps,  # 传递注意力图
-                            depth_pred[n_loop_idx:n_loop_idx+1]  # 传递 depth_pred 给 criterion
+                            depth_pred[n_loop_idx:n_loop_idx+1],  # 传递 depth_pred 给 criterion
+                            depth_conf_map,  # 传递depth_conf_map给criterion
+                            outputs.J_D[n_loop_idx:n_loop_idx+1] if hasattr(outputs, 'J_D') and outputs.J_D is not None else None,  # 传递J_D用于物理损失
+                            outputs.I_A[n_loop_idx:n_loop_idx+1] if hasattr(outputs, 'I_A') and outputs.I_A is not None else None,  # 传递I_A用于物理损失
+                            raw_batch_b[n_loop_idx:n_loop_idx+1]  # 传递raw用于物理损失
                         )
                         
                         # 添加DECL损失
@@ -899,7 +932,10 @@ def train_epoch(train_loader, model, criterion, optimizer, device, metric_logger
                                 gt_b,
                                 depth_conf_map
                             )
-                            loss_n += lambda_decl * loss_decl_val
+                            if isinstance(loss_decl_val, dict):
+                                loss_n += lambda_decl * loss_decl_val["total"]
+                            else:
+                                loss_n += lambda_decl * loss_decl_val
                             
                         all_losses.append(loss_n)
                 
@@ -934,17 +970,36 @@ def train_epoch(train_loader, model, criterion, optimizer, device, metric_logger
                         depth_gt_b,
                         student_feats[n_loop_idx], 
                         attention_maps,  # 传递注意力图
-                        depth_pred[n_loop_idx:n_loop_idx+1]  # 传递 depth_pred 给 criterion
+                        depth_pred[n_loop_idx:n_loop_idx+1],  # 传递 depth_pred 给 criterion
+                        depth_conf_map,  # 传递depth_conf_map给criterion
+                        outputs.J_D[n_loop_idx:n_loop_idx+1] if hasattr(outputs, 'J_D') and outputs.J_D is not None else None,  # 传递J_D用于物理损失
+                        outputs.I_A[n_loop_idx:n_loop_idx+1] if hasattr(outputs, 'I_A') and outputs.I_A is not None else None,  # 传递I_A用于物理损失
+                        raw_batch_b[n_loop_idx:n_loop_idx+1]  # 传递raw用于物理损失
                     )
                     
                     # 添加DECL损失
                     if depth_conf_map is not None and gt_b is not None:
+                        # 检查depth_conf_map的值域
+                        conf_min = depth_conf_map.min().item()
+                        conf_max = depth_conf_map.max().item()
+                        conf_mean = depth_conf_map.mean().item()
+                        
+                        # 如果depth_conf_map值域异常，记录警告
+                        if conf_max - conf_min < 1e-6:  # 基本没有变化
+                            logger.warning(f"训练step {current_step}: depth_conf_map值域过小 ({conf_min:.6f}-{conf_max:.6f})，可能导致DECL损失无效")
+                        
                         loss_decl_val = loss_decl(
                             enhanced[n_loop_idx:n_loop_idx+1],
                             gt_b, 
                             depth_conf_map
                         )
-                        loss_n += lambda_decl * loss_decl_val
+                        if isinstance(loss_decl_val, dict):
+                            loss_n += lambda_decl * loss_decl_val["total"]
+                            # 记录详细的DECL损失组件
+                            if current_step % 50 == 0:  # 每50步记录一次详细信息
+                                logger.debug(f"训练step {current_step} DECL损失 - total:{loss_decl_val['total']:.6f}, color:{loss_decl_val.get('color', 0.0):.6f}, edge:{loss_decl_val.get('edge', 0.0):.6f}")
+                        else:
+                            loss_n += lambda_decl * loss_decl_val
                         
                     all_losses.append(loss_n)
             
@@ -969,15 +1024,27 @@ def train_epoch(train_loader, model, criterion, optimizer, device, metric_logger
                         metrics[loss_name] = loss_value
             if 'depth_total_loss' in loss_components:
                 progress_bar.set_postfix({
-                    "Loss": f"{current_loss:.4f}", 
-                    "Depth": f"{loss_components['depth_total_loss']:.4f}"
+                    "Loss": f"{current_loss:.4f}",
+                    "Depth Loss": f"{loss_components['depth_total_loss']:.4f}"
                 })
         
         # 记录DECL损失
         if depth_conf_map is not None and gt_b is not None:
-            metrics['loss_decl'] = lambda_decl * loss_decl_val.item()
+            if isinstance(loss_decl_val, dict):
+                metrics["loss_decl"] = lambda_decl * loss_decl_val["total"].item()
+                # 记录详细组件
+                if "color" in loss_decl_val:
+                    metrics["loss_decl_color"] = lambda_decl * loss_decl_val["color"].item()
+                if "edge" in loss_decl_val:
+                    metrics["loss_decl_edge"] = lambda_decl * loss_decl_val["edge"].item()
+            else:
+                metrics["loss_decl"] = lambda_decl * loss_decl_val.item()
         
         metric_logger.log_metrics(metrics, prefix="train", step=current_step) # Added step to log_metrics
+        
+        # 使用多文件日志系统记录损失
+        if multi_logger:
+            multi_logger.log_loss(metrics, current_step, prefix="train")
         
         # 记录不确定性权重（如果使用自动加权）
         if hasattr(criterion, 'use_uncertainty_weighting') and criterion.use_uncertainty_weighting:
@@ -1255,7 +1322,7 @@ def train_epoch(train_loader, model, criterion, optimizer, device, metric_logger
     return epoch_loss
 
 
-def validate(val_loader, model, criterion, device, metric_logger, epoch, config, mixed_precision=False):
+def validate(val_loader, model, criterion, device, metric_logger, epoch, config, mixed_precision=False, multi_logger=None):
     model.eval()
     progress_bar = tqdm(val_loader, desc=f"Validation [{epoch+1}]")
     
@@ -1346,11 +1413,44 @@ def validate(val_loader, model, criterion, device, metric_logger, epoch, config,
                             current_enhanced_item, gt_for_model, current_pred_gate_item, depth_gt_for_model,
                             current_student_feats, 
                             attention_maps_for_b_item,  # 传递注意力图
-                            current_continuous_depth_pred  # 传递连续深度预测
+                            current_continuous_depth_pred,  # 传递连续深度预测
+                            depth_conf_map_for_b_item,  # 传递depth_conf_map
+                            model_outputs_dict.J_D[n_idx_in_degradations:n_idx_in_degradations+1] if hasattr(model_outputs_dict, 'J_D') and model_outputs_dict.J_D is not None else None,  # 传递J_D用于物理损失
+                            model_outputs_dict.I_A[n_idx_in_degradations:n_idx_in_degradations+1] if hasattr(model_outputs_dict, 'I_A') and model_outputs_dict.I_A is not None else None,  # 传递I_A用于物理损失
+                            raw_n_degradations[n_idx_in_degradations:n_idx_in_degradations+1]  # 传递raw用于物理损失
                         )
                         if depth_conf_map_for_b_item is not None: # Assuming DECL loss uses the batch-item specific conf map
+                            # 添加调试信息，检查depth_conf_map的值域
+                            conf_min = depth_conf_map_for_b_item.min().item()
+                            conf_max = depth_conf_map_for_b_item.max().item()
+                            conf_mean = depth_conf_map_for_b_item.mean().item()
+                            
+                            # 如果depth_conf_map值域异常，生成合理的置信图
+                            if conf_max - conf_min < 1e-6:  # 基本没有变化
+                                metric_logger.logger.warning(f"验证：depth_conf_map值域过小 ({conf_min:.6f}-{conf_max:.6f})，生成合理的置信图")
+                                # 生成基于深度梯度的置信图（与训练时一致）
+                                if depth_gt_for_model is not None:
+                                    depth_dx, depth_dy = torch.gradient(depth_gt_for_model, dim=(-2, -1))
+                                    depth_grad_mag = torch.sqrt(depth_dx**2 + depth_dy**2)
+                                    depth_conf_map_for_b_item = torch.exp(-depth_grad_mag / 0.1)
+                                else:
+                                    # 如果没有深度GT，使用默认的均匀置信图
+                                    depth_conf_map_for_b_item = torch.ones_like(current_pred_gate_item) * 0.5
+                            
                             decl_loss_value = loss_decl(current_enhanced_item, gt_for_model, depth_conf_map_for_b_item)
-                            loss_value += lambda_decl * decl_loss_value
+                            # 处理DECL损失返回字典的情况
+                            if isinstance(decl_loss_value, dict):
+                                decl_total = decl_loss_value.get("total", decl_loss_value.get("loss", 0.0))
+                                loss_value += lambda_decl * decl_total
+                                # 记录DECL损失组件（用于调试）
+                                if hasattr(metric_logger, 'logger'):
+                                    metric_logger.logger.debug(f"验证DECL损失 - total:{decl_total:.6f}, color:{decl_loss_value.get('color', 0.0):.6f}, edge:{decl_loss_value.get('edge', 0.0):.6f}")
+                            else:
+                                loss_value += lambda_decl * decl_loss_value
+                        else:
+                            # 如果depth_conf_map为None，跳过DECL损失
+                            if hasattr(metric_logger, 'logger'):
+                                metric_logger.logger.debug(f"验证：depth_conf_map为None，跳过DECL损失")
                         epoch_total_batch_losses.append(loss_value.item())
 
                     # Collect samples for detailed metric calculation and disk saving (only from first b_item for simplicity)
@@ -1659,6 +1759,19 @@ def validate(val_loader, model, criterion, device, metric_logger, epoch, config,
     primary_metric_for_scheduler = final_metrics_summary.get('psnr', 0.0) 
     if not metrics_config_from_yaml.get('psnr', True) and epoch_total_batch_losses: 
         primary_metric_for_scheduler = -avg_epoch_loss 
+    
+    # 使用多文件日志系统记录验证指标
+    if multi_logger:
+        metrics_dict = {
+            'val_loss': avg_epoch_loss,
+            'val_psnr': primary_metric_for_scheduler
+        }
+        # 添加其他指标
+        for k, v in final_metrics_summary.items():
+            if k != 'psnr':  # 已经添加过了
+                metrics_dict[f'val_{k}'] = v
+        
+        multi_logger.log_metrics(metrics_dict, epoch, prefix="val")
         
     return avg_epoch_loss, primary_metric_for_scheduler
 
@@ -1815,6 +1928,10 @@ def resume_from_checkpoint(checkpoint_dir: str,
 
 def main_worker(config, args):
     """单进程/DDP训练主函数"""
+    # 导入torch以避免UnboundLocalError
+    import torch
+    import torch.nn as nn
+    
     # ----- 初始化 -----
     # 本地排名 (用于分布式训练)
     local_rank = args.local_rank
@@ -1855,6 +1972,10 @@ def main_worker(config, args):
         logger.info(f"使用GPU: {torch.cuda.get_device_name(0)}")
     if mixed_precision:
         logger.info("启用混合精度训练")
+        
+    # 使用多文件日志系统记录训练开始信息
+    multi_logger = training_setup['multi_logger']
+    multi_logger.log_training_start(config)
     
     # 日志记录模型架构
     if config['visualization'].get('save_model_graph', False):
@@ -1872,15 +1993,86 @@ def main_worker(config, args):
                     
                 def forward(self, x):
                     # 简化的前向传播，只处理图像输入，返回增强图像
-                    # 避免使用 Tuple 和 None 等不可跟踪的类型
-                    return self.base_model(x)[0]  # 只返回增强后的图像
+                    # ModelOutput对象通过属性访问而不是下标访问
+                    outputs = self.base_model(x)
+                    # 如果是ModelOutput对象，访问enhanced属性
+                    if hasattr(outputs, 'enhanced'):
+                        return outputs.enhanced
+                    # 兼容旧格式，如果是元组/列表则返回第一个元素
+                    elif isinstance(outputs, (tuple, list)) and len(outputs) > 0:
+                        return outputs[0]
+                    # 如果是字典类型，尝试获取'enhanced'键
+                    elif isinstance(outputs, dict) and 'enhanced' in outputs:
+                        return outputs['enhanced']
+                    # 如果都不是，直接返回输出（可能会失败，但至少尝试）
+                    return outputs
 
             # 创建包装的模型用于图保存
             traced_model = TracedModelWrapper(model)
-            metric_logger.log_model_graph(traced_model, dummy_input)
-            logger.info("模型架构已保存到TensorBoard")
-        except Exception as e_graph: # Renamed exception variable
-            logger.warning(f"记录模型图结构失败: {str(e_graph)}")
+            # 确保模型处于评估模式
+            traced_model.eval()
+            
+            # 添加更详细的调试信息
+            logger.info(f"尝试记录模型图到TensorBoard，输入形状：{dummy_input.shape}")
+            
+            try:
+                # 先尝试使用跟踪功能
+                with torch.no_grad():
+                    # 直接尝试log_model_graph
+                    metric_logger.log_model_graph(traced_model, dummy_input)
+                    logger.info("模型架构已成功保存到TensorBoard")
+            except Exception as e_graph:
+                logger.warning(f"记录模型图结构失败: {str(e_graph)}")
+                # 添加更多诊断信息
+                logger.debug("尝试使用备用方法记录模型图...")
+                
+                try:
+                    # 备用方法：尝试使用trace_module
+                    import torch.jit
+                    with torch.no_grad():
+                        # 确保输入是设备匹配的
+                        dummy_input_on_device = dummy_input.to(next(traced_model.parameters()).device)
+                        # 尝试获取一个前向传播输出
+                        sample_output = traced_model(dummy_input_on_device)
+                        logger.debug(f"模型前向传播测试成功，输出类型: {type(sample_output)}")
+                        
+                        # 使用JIT跟踪模型
+                        logger.debug("尝试使用torch.jit.trace追踪模型...")
+                        traced = torch.jit.trace(traced_model, dummy_input_on_device)
+                        logger.debug("模型追踪成功，将其传递给TensorBoard")
+                        
+                        # 记录追踪后的模型
+                        metric_logger.tb_writer.add_graph(traced, dummy_input_on_device)
+                        logger.info("使用备用方法成功记录模型图到TensorBoard")
+                except Exception as e_trace:
+                    logger.error(f"备用方法记录模型图也失败: {str(e_trace)}")
+                    logger.debug(f"详细错误信息: {traceback.format_exc()}")
+                    logger.info("跳过模型图记录，继续训练过程")
+
+            # 替换为简化版本：
+            # 简化的模型图记录 - 避免设备不匹配问题
+            logger.info(f"尝试记录模型图到TensorBoard，输入形状：{dummy_input.shape}")
+            
+            try:
+                # 将模型和输入都移到CPU进行追踪，避免设备不匹配
+                with torch.no_grad():
+                    dummy_input_cpu = torch.zeros(1, 3, 64, 64)  # 直接在CPU上创建
+                    traced_model_cpu = TracedModelWrapper(model.cpu())  # 临时移到CPU
+                    traced_model_cpu.eval()
+                    
+                    # 使用CPU进行模型图追踪
+                    metric_logger.tb_writer.add_graph(traced_model_cpu, dummy_input_cpu)
+                    logger.info("模型架构已成功保存到TensorBoard (CPU模式)")
+                    
+                    # 将模型移回原设备
+                    model.to(device)
+                    
+            except Exception as e_graph:
+                logger.warning(f"记录模型图失败: {str(e_graph)}")
+                logger.info("跳过模型图记录，继续训练过程")
+        except Exception as e_outer:
+            logger.error(f"记录模型图过程中发生未捕获的错误: {str(e_outer)}")
+            logger.debug(f"外层错误详细信息: {traceback.format_exc()}")
     
     # ----- 断点续训处理 -----
     checkpoint_dir = os.path.join(exp_dir, 'checkpoints')
@@ -1935,11 +2127,15 @@ def main_worker(config, args):
         # 分布式采样器的 epoch 设定
         if train_sampler is not None and hasattr(train_sampler, 'set_epoch'):
             train_sampler.set_epoch(epoch)
+            
+        # 记录epoch开始
+        multi_logger.log_epoch_start(epoch, epochs)
 
         # 训练一个 epoch
         train_loss = train_epoch(
             train_loader, model, criterion, optimizer, device,
-            metric_logger, epoch, config, scaler, mixed_precision
+            metric_logger, epoch, config, scaler, mixed_precision,
+            multi_logger=multi_logger
         )
 
         # 验证
@@ -1947,7 +2143,8 @@ def main_worker(config, args):
         if val_loader and (epoch + 1) % val_interval == 0:
             current_val_loss, current_val_psnr = validate(
                 val_loader, model, criterion, device,
-                metric_logger, epoch, config, mixed_precision
+                metric_logger, epoch, config, mixed_precision,
+                multi_logger=multi_logger
             )
             val_psnr_for_scheduler = current_val_psnr
             logger.info(
@@ -1976,6 +2173,15 @@ def main_worker(config, args):
         current_lr = optimizer.param_groups[0]['lr']
         metric_logger.log_metrics({'lr': current_lr}, prefix='train', step=epoch)
 
+        # 使用多文件日志系统记录epoch结束信息
+        metrics_summary = {
+            'train_loss': train_loss,
+            'val_loss': current_val_loss if 'current_val_loss' in locals() else None,
+            'val_psnr': current_val_psnr if 'current_val_psnr' in locals() else None,
+            'lr': current_lr
+        }
+        multi_logger.log_epoch_end(epoch, metrics_summary)
+        
         # 保存检查点（仅主进程）
         if local_rank <= 0:
             if ((epoch + 1) % save_interval == 0) or (is_best and save_best):
@@ -2065,3 +2271,5 @@ def main():
 
 if __name__ == '__main__':
     main()
+
+
