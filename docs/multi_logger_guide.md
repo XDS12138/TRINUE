@@ -11,21 +11,35 @@
 ```
 experiments/train/your_experiment/
 ├── logs/
-│   ├── train.log       # 训练进度和里程碑事件
-│   ├── loss.log        # 所有损失值和组件
-│   ├── metrics.log     # 验证指标和评估结果
-│   ├── model.log       # 模型架构、参数更新、梯度信息
-│   ├── data.log        # 数据加载和预处理日志
-│   ├── error.log       # 错误和警告信息
-│   ├── debug.log       # 详细的调试信息
-│   └── general.log     # 未分类的日志信息
+│   ├── train/
+│   │   ├── epoch_1.log
+│   │   └── epoch_2.log
+│   ├── loss/
+│   │   ├── epoch_1.log
+│   │   └── epoch_2.log
+│   ├── metrics/
+│   │   └── epoch_1.log
+│   ├── model/
+│   │   └── epoch_1.log
+│   ├── data/
+│   │   └── epoch_1.log
+│   ├── optimizer/
+│   │   └── epoch_1.log
+│   ├── checkpoint/
+│   │   └── epoch_1.log
+│   ├── error/
+│   │   └── epoch_1.log
+│   ├── debug/
+│   │   └── epoch_1.log
+│   └── general/
+│       └── epoch_1.log
 ├── tensorboard/        # TensorBoard日志
 └── checkpoints/        # 模型检查点
 ```
 
 ## 日志文件说明
 
-### 1. train.log
+### 1. train/epoch_N.log
 - **内容**：训练进度、epoch开始/结束、主要里程碑
 - **级别**：INFO及以上
 - **示例内容**：
@@ -37,7 +51,7 @@ experiments/train/your_experiment/
   2024-12-23 10:00:00 [INFO] [TRINUE.train] Batch size: 4
   ```
 
-### 2. loss.log
+### 2. loss/epoch_N.log
 - **内容**：详细的损失值记录，包括总损失和各个组件
 - **级别**：INFO用于总损失，DEBUG用于组件
 - **示例内容**：
@@ -46,7 +60,7 @@ experiments/train/your_experiment/
   2024-12-23 10:00:05 [DEBUG] [TRINUE.loss] [train] Step 0: Components - loss_l1=0.234567, loss_ssim=0.345678, loss_depth=0.123456
   ```
 
-### 3. metrics.log
+### 3. metrics/epoch_N.log
 - **内容**：验证指标（PSNR、SSIM等）
 - **级别**：INFO
 - **示例内容**：
@@ -55,7 +69,7 @@ experiments/train/your_experiment/
   2024-12-23 10:05:00 [INFO] [TRINUE.metrics] Epoch 1 Validation Summary: PSNR=28.35, SSIM=0.8912
   ```
 
-### 4. model.log
+### 4. model/epoch_N.log
 - **内容**：模型架构信息、参数更新、梯度统计
 - **级别**：INFO和DEBUG
 - **示例内容**：
@@ -65,7 +79,7 @@ experiments/train/your_experiment/
   2024-12-23 10:00:00 [INFO] [TRINUE.model] 编码器层级数: 4
   ```
 
-### 5. data.log
+### 5. data/epoch_N.log
 - **内容**：数据加载信息、批次统计、增强操作
 - **级别**：INFO和DEBUG
 - **示例内容**：
@@ -75,7 +89,24 @@ experiments/train/your_experiment/
   2024-12-23 10:00:00 [INFO] [TRINUE.data] 批次大小: 4
   ```
 
-### 6. error.log
+### 6. optimizer/epoch_N.log
+- **内容**：优化器设置、学习率、参数分组
+- **级别**：INFO
+- **示例内容**：
+  ```
+  2024-12-23 10:00:00 [INFO] [TRINUE.optimizer] 使用差异化学习率: 主干 0.0002, 注意力模块 0.00002
+  2024-12-23 10:00:00 [INFO] [TRINUE.optimizer] 总参数数量: 34,512,987
+  ```
+
+### 7. checkpoint/epoch_N.log
+- **内容**：检查点保存与加载
+- **级别**：INFO
+- **示例内容**：
+  ```
+  2024-12-23 10:12:00 [INFO] [TRINUE.checkpoint] Checkpoint saved at epoch 5 (best=True)
+  ```
+
+### 8. error/epoch_N.log
 - **内容**：错误信息、警告、异常堆栈
 - **级别**：WARNING和ERROR
 - **示例内容**：
@@ -84,7 +115,7 @@ experiments/train/your_experiment/
   2024-12-23 10:02:31 [ERROR] [TRINUE.error] DECL loss computation failed: RuntimeError: ...
   ```
 
-### 7. debug.log
+### 9. debug/epoch_N.log
 - **内容**：详细的调试信息、张量形状、中间值
 - **级别**：DEBUG
 - **示例内容**：
@@ -114,6 +145,8 @@ multi_logger = create_multi_logger(config, exp_dir)
 # 获取特定类型的logger
 train_logger = multi_logger.get_logger('train')
 loss_logger = multi_logger.get_logger('loss')
+optimizer_logger = multi_logger.get_logger('optimizer')
+checkpoint_logger = multi_logger.get_logger('checkpoint')
 
 # 使用便捷方法记录
 multi_logger.log_training_start(config)
@@ -121,6 +154,8 @@ multi_logger.log_epoch_start(epoch, total_epochs)
 multi_logger.log_loss(losses_dict, step, 'train')
 multi_logger.log_metrics(metrics_dict, step, 'val')
 multi_logger.log_epoch_end(epoch, summary_dict)
+optimizer_logger.info("Optimizer configured")
+checkpoint_logger.info("Checkpoint saved")
 
 # 记录错误和警告
 multi_logger.log_error("Something went wrong", exc_info=True)
@@ -148,37 +183,37 @@ logging:
 ### 1. 实时查看训练进度
 ```bash
 # 查看主要训练进度
-tail -f experiments/train/your_experiment/logs/train.log
+tail -f experiments/train/your_experiment/logs/train/epoch_1.log
 
 # 查看损失变化
-tail -f experiments/train/your_experiment/logs/loss.log | grep "Total Loss"
+tail -f experiments/train/your_experiment/logs/loss/epoch_1.log | grep "Total Loss"
 
 # 查看验证指标
-tail -f experiments/train/your_experiment/logs/metrics.log
+tail -f experiments/train/your_experiment/logs/metrics/epoch_1.log
 ```
 
 ### 2. 查看错误和警告
 ```bash
 # 查看所有错误
-grep ERROR experiments/train/your_experiment/logs/error.log
+grep ERROR experiments/train/your_experiment/logs/error/epoch_1.log
 
 # 查看最近的警告
-tail -n 50 experiments/train/your_experiment/logs/error.log | grep WARNING
+tail -n 50 experiments/train/your_experiment/logs/error/epoch_1.log | grep WARNING
 ```
 
 ### 3. 搜索特定信息
 ```bash
 # 搜索特定epoch的信息
-grep "Epoch 14" experiments/train/your_experiment/logs/*.log
+grep "Epoch 14" experiments/train/your_experiment/logs/*/epoch_*.log
 
 # 搜索深度预测相关的问题
-grep -i "depth.*collapse" experiments/train/your_experiment/logs/*.log
+grep -i "depth.*collapse" experiments/train/your_experiment/logs/*/epoch_*.log
 ```
 
 ### 4. 合并查看多个日志
 ```bash
 # 按时间顺序查看所有日志
-sort -k1,2 experiments/train/your_experiment/logs/*.log | less
+sort -k1,2 experiments/train/your_experiment/logs/*/epoch_*.log | less
 ```
 
 ## 日志文件大小管理
@@ -209,7 +244,7 @@ find experiments/train/your_experiment/logs -name "*.log.*" -mtime +60 -exec mv 
 ### 问题：某些日志类型为空
 - 检查对应功能是否启用（如验证）
 - 确认日志级别设置正确
-- 查看 `general.log` 是否有相关信息
+- 查看 `general/epoch_N.log` 是否有相关信息
 
 ### 问题：日志输出过多/过少
 - 调整 `console_level` 和 `file_level`
