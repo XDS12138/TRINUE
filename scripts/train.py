@@ -461,7 +461,12 @@ def setup_training(args, config, local_rank):
     
     # 获取注意力模块学习率缩放因子
     attn_lr_scale = config['optimizer'].get('attn_lr_scale', 0.1)
-    logger.info(f"使用差异化学习率: 主干 {config['optimizer']['lr']}, 注意力模块 {config['optimizer']['lr'] * attn_lr_scale}")
+    msg = (
+        f"使用差异化学习率: 主干 {config['optimizer']['lr']}, "
+        f"注意力模块 {config['optimizer']['lr'] * attn_lr_scale}"
+    )
+    logger.info(msg)
+    optimizer_logger.info(msg)
     
     # 添加损失函数中的不确定性权重参数到优化器中
     uncertainty_params = []
@@ -472,10 +477,13 @@ def setup_training(args, config, local_rank):
                 uncertainty_params.append(p)
         
         if uncertainty_params:
-            logger.info(f"将 {len(uncertainty_params)} 个不确定性权重参数添加到优化器中")
+            msg = f"将 {len(uncertainty_params)} 个不确定性权重参数添加到优化器中"
+            logger.info(msg)
+            optimizer_logger.info(msg)
             # 输出每个不确定性权重参数的名称
             param_names = [name for name, p in criterion.named_parameters() if 'log_var' in name]
             logger.info(f"不确定性权重参数列表: {param_names}")
+            optimizer_logger.info(f"不确定性权重参数列表: {param_names}")
     
     param_groups = [
         {'params': base_params, 'lr': config['optimizer']['lr']},
@@ -492,11 +500,20 @@ def setup_training(args, config, local_rank):
         uncertainty_param_count = sum(p.numel() for p in uncertainty_params)
         total_param_count = base_param_count + attn_param_count + uncertainty_param_count
         
-        logger.info(f"优化器参数统计:")
-        logger.info(f"  主干参数: {base_param_count:,} ({base_param_count/total_param_count*100:.2f}%)")
-        logger.info(f"  注意力参数: {attn_param_count:,} ({attn_param_count/total_param_count*100:.2f}%)")
-        logger.info(f"  不确定性权重参数: {uncertainty_param_count:,} ({uncertainty_param_count/total_param_count*100:.2f}%)")
-        logger.info(f"  总参数数量: {total_param_count:,}")
+        logger.info("优化器参数统计:")
+        optimizer_logger.info("优化器参数统计:")
+        msg_main = f"  主干参数: {base_param_count:,} ({base_param_count/total_param_count*100:.2f}%)"
+        logger.info(msg_main)
+        optimizer_logger.info(msg_main)
+        msg_attn = f"  注意力参数: {attn_param_count:,} ({attn_param_count/total_param_count*100:.2f}%)"
+        logger.info(msg_attn)
+        optimizer_logger.info(msg_attn)
+        msg_unc = f"  不确定性权重参数: {uncertainty_param_count:,} ({uncertainty_param_count/total_param_count*100:.2f}%)"
+        logger.info(msg_unc)
+        optimizer_logger.info(msg_unc)
+        msg_total = f"  总参数数量: {total_param_count:,}"
+        logger.info(msg_total)
+        optimizer_logger.info(msg_total)
     
     if optimizer_name == 'adam':
         optimizer = optim.Adam(
@@ -583,6 +600,8 @@ def setup_training(args, config, local_rank):
     # 获取主日志记录器和调试日志记录器
     logger_instance = multi_logger.get_logger('train')
     debug_logger_instance = multi_logger.get_logger('debug')
+    optimizer_logger = multi_logger.get_logger('optimizer')
+    checkpoint_logger = multi_logger.get_logger('checkpoint')
     
     # 设置TensorBoard
     tb_log_dir = os.path.join(exp_dir, 'tensorboard', datetime.now().strftime("%Y%m%d-%H%M%S"))
@@ -1976,6 +1995,12 @@ def main_worker(config, args):
     # 使用多文件日志系统记录训练开始信息
     multi_logger = training_setup['multi_logger']
     multi_logger.log_training_start(config)
+
+    # 记录数据集相关信息
+    data_logger = multi_logger.get_logger('data')
+    data_logger.info(f"训练数据根目录: {config['data'].get('train_root')}")
+    data_logger.info(f"验证数据根目录: {config['data'].get('val_root')}")
+    data_logger.info(f"退化类型: {config['data'].get('degradation_folders', ['raw'])}")
     
     # 日志记录模型架构
     if config['visualization'].get('save_model_graph', False):
@@ -2199,6 +2224,9 @@ def main_worker(config, args):
                     checkpoint_data['scaler'] = scaler.state_dict()
 
                 save_checkpoint(checkpoint_data, is_best, checkpoint_save_dir, epoch=(epoch+1))
+                checkpoint_logger.info(
+                    f"Checkpoint saved at epoch {epoch+1} (best={is_best})"
+                )
 
                 if is_best and save_best:
                     model_to_save = model.module if hasattr(model, 'module') else model
@@ -2216,7 +2244,9 @@ def main_worker(config, args):
             model_to_save_final.state_dict(),
             os.path.join(final_model_dir, 'final_model_weights.pth')
         )
-        logger.info(f"最终模型已保存到 {os.path.join(final_model_dir, 'final_model_weights.pth')}")
+        final_path = os.path.join(final_model_dir, 'final_model_weights.pth')
+        logger.info(f"最终模型已保存到 {final_path}")
+        checkpoint_logger.info(f"Final model saved to {final_path}")
 
     if metric_logger is not None:
         metric_logger.close()
