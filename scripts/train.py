@@ -95,7 +95,7 @@ def setup_logging_system(exp_dir, config):
     except Exception as e:
         main_logger.error(f"TensorBoard初始化失败: {str(e)}. 请检查路径权限和磁盘空间。")
         tb_writer = None
-    
+
     # 创建MetricLogger实例（使用真正的功能完整版本）
     csv_path = os.path.join(exp_dir, 'metrics.csv')
     metric_logger = MetricLogger(main_logger, tb_writer, csv_path)
@@ -958,7 +958,7 @@ def train_epoch(train_loader, model, criterion, optimizer, device, metric_logger
         if multi_logger:
             # 基本损失记录
             multi_logger.log_loss(metrics, current_step, prefix="train")
-            
+        
             # 将损失按类别分组记录
             if hasattr(criterion, 'get_latest_losses'):
                 loss_components = criterion.get_latest_losses()
@@ -1783,7 +1783,7 @@ def validate(val_loader, model, criterion, device, metric_logger, epoch, config,
 
 def distributed_worker(rank, world_size, config, args):
     """分布式训练的工作进程"""
-    # 设置当前进程的排名
+        # 设置当前进程的排名
     args.local_rank = rank
     
     # 设置进程组
@@ -1809,7 +1809,7 @@ def resume_from_checkpoint(checkpoint_dir: str,
                          scaler = None) -> tuple:
     """
     从检查点目录中找到最新的检查点并恢复模型、优化器、调度器状态
-
+    
     Args:
         checkpoint_dir: 包含检查点文件的目录
         model: 模型实例
@@ -1817,7 +1817,7 @@ def resume_from_checkpoint(checkpoint_dir: str,
         scheduler: 学习率调度器实例
         device: 模型应该加载到的设备
         scaler: GradScaler实例（用于混合精度训练）
-
+        
     Returns:
         A tuple containing:
         - model: The loaded model
@@ -1996,11 +1996,14 @@ def main_worker(config, args):
         )
         
         # 验证
-        val_metric = validate(
+        val_results = validate(
             val_loader, model, criterion, device, metric_logger,
             epoch, config, mixed_precision, multi_logger
         )
         
+        # 从验证结果中提取损失和主要指标
+        val_loss, val_metric = val_results
+
         # 更新学习率
         if scheduler:
             if isinstance(scheduler, optim.lr_scheduler.ReduceLROnPlateau):
@@ -2036,7 +2039,7 @@ def main_worker(config, args):
 def main():
     # 解析命令行参数
     args = parse_args()
-
+    
     # 加载配置文件
     with open(args.config, 'r') as f:
         config = yaml.safe_load(f)
