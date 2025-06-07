@@ -14,7 +14,9 @@ from dataclasses import dataclass
 from typing import Optional, List, Dict, Any, Union, Tuple
 
 # Get a logger instance for this module
-logger = logging.getLogger(__name__)
+# 使用 __name__ 可以让日志记录器自动获取模块名 "modules.model"
+# 在 train.py 中可以通过 logging.getLogger('modules.model') 控制其日志级别
+model_logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -78,6 +80,18 @@ class UnderwaterEnhanceNet(nn.Module):
                  save_attention_maps: bool = False,
                  double_forward: bool = True):
         super().__init__()
+        
+        # 使用 self.logger 以便在整个类中使用
+        self.logger = model_logger
+        self.arch_logger = logging.getLogger('architecture') # 获取架构专用的logger
+        self.attn_logger = logging.getLogger('attention')   # 获取注意力专用的logger
+
+        self.arch_logger.info("--- Initializing UnderwaterEnhanceNet ---")
+        self.arch_logger.info(f"  - Base Channels: {base_channels}, Levels: {levels}, Heads: {heads}")
+        self.arch_logger.info(f"  - Bottleneck Blocks: {bottleneck_blocks}")
+        self.arch_logger.info(f"  - Window Sizes | Encoder: {encoder_window_size}, Bottleneck: {bottleneck_window_size}, Decoder: {decoder_block_window_size}")
+        self.arch_logger.info(f"  - Save Attention Maps: {save_attention_maps}, Double Forward: {double_forward}")
+
         self.depth_params = depth_processor_config or {}
         self.raw_depth_processor_config = depth_processor_config if depth_processor_config else {}
         # Use get_depth_config_params to get typed parameters for depth processing
@@ -102,7 +116,7 @@ class UnderwaterEnhanceNet(nn.Module):
 
         # 预计算编码器通道数，确保与解码器匹配
         self.encoder_channels = [base_channels * (2**i) for i in range(levels)]
-        logger.info(f"Encoder channels: {self.encoder_channels}")
+        self.arch_logger.info(f"  - Calculated Encoder Channels: {self.encoder_channels}")
 
         # 2. 深度支路：训练期真深度多尺度提取
         self.depth_extractor = DepthFeatureExtractor(
@@ -162,7 +176,6 @@ class UnderwaterEnhanceNet(nn.Module):
         
         self.depth_fusion_weights = None
         
-        # 添加投影层，用于在forward中确保深度特征通道与编码器通道匹配
         # 计算每级深度特征的预期通道数 - 修复通道数计算
         expected_depth_channels = []
         for i in range(levels):
@@ -179,49 +192,48 @@ class UnderwaterEnhanceNet(nn.Module):
                     expected_depth_channels.append(base_channels)
 
         # 打印调试信息
-        logger.info(f"Initializing depth projection layers with expected channels: {expected_depth_channels}")
-        logger.info(f"Encoder channels: {self.encoder_channels}")
+        self.arch_logger.info(f"  - Initializing depth projection layers with expected channels: {expected_depth_channels}")
 
         self.depth_projection_layers = nn.ModuleList([
             nn.Conv2d(expected_depth_channels[i], self.encoder_channels[i], kernel_size=1, bias=False)
             for i in range(levels)
         ])
-
-        logger.info(f"[MODEL-INIT] UnderwaterEnhanceNet initialized. Encoder window: {encoder_window_size}, Bottleneck window: {bottleneck_window_size}, Decoder window: {decoder_block_window_size}")
-        logger.info(f"[MODEL-INIT] Depth processor config being passed to Encoder/Decoder: {depth_processor_config}")
-        logger.info(f"[MODEL-INIT] Added explicit depth projection layers: Input channels: {[layer.in_channels for layer in self.depth_projection_layers]}, Output channels: {[layer.out_channels for layer in self.depth_projection_layers]}")
+        
+        self.arch_logger.info(f"  - Depth Projection Layers: Input channels: {[layer.in_channels for layer in self.depth_projection_layers]}, Output channels: {[layer.out_channels for layer in self.depth_projection_layers]}")
+        self.arch_logger.info(f"--- UnderwaterEnhanceNet Initialized ---")
         
         # 启用注意力图保存，若配置了保存
         if save_attention_maps:
-            print(f"[MODEL-INIT] 启用注意力图保存功能")
+            self.attn_logger.info("启用注意力图保存功能")
             self.enable_attention_saving()
         else:
-            print(f"[MODEL-INIT] 未启用注意力图保存功能")
+            self.attn_logger.info("未启用注意力图保存功能")
 
         # 标记推理方式
         self.double_forward = double_forward
+        self._forward_count = 0 # 内部计数器，用于控制日志频率
 
     def enable_attention_saving(self, enable=True):
         """启用或禁用注意力图保存"""
         self.save_attention_maps = enable
-        print(f"[MODEL] 设置 save_attention_maps = {enable}")
+        self.attn_logger.info(f"设置 save_attention_maps = {enable}")
         
         # 遍历编码器中的所有交叉注意力模块，启用注意力图保存
         if hasattr(self.encoder, 'depth2rgb_attn_blocks'):
-            print(f"[MODEL] 为 {len(self.encoder.depth2rgb_attn_blocks)} 个 depth2rgb_attn_blocks 启用注意力图保存")
+            self.attn_logger.debug(f"为 {len(self.encoder.depth2rgb_attn_blocks)} 个 depth2rgb_attn_blocks 启用注意力图保存")
             for i, attn in enumerate(self.encoder.depth2rgb_attn_blocks):
                 attn.enable_attention_saving(enable)
-                print(f"[MODEL] depth2rgb_attn_block[{i}].save_attention = {attn.save_attention}")
+                self.attn_logger.debug(f"  - depth2rgb_attn_block[{i}].save_attention = {attn.save_attention}")
         else:
-            print(f"[MODEL] 编码器没有 depth2rgb_attn_blocks 属性")
+            self.logger.warning("编码器没有 depth2rgb_attn_blocks 属性")
             
         if hasattr(self.encoder, 'rgb2depth_attn_blocks'):
-            print(f"[MODEL] 为 {len(self.encoder.rgb2depth_attn_blocks)} 个 rgb2depth_attn_blocks 启用注意力图保存")
+            self.attn_logger.debug(f"为 {len(self.encoder.rgb2depth_attn_blocks)} 个 rgb2depth_attn_blocks 启用注意力图保存")
             for i, attn in enumerate(self.encoder.rgb2depth_attn_blocks):
                 attn.enable_attention_saving(enable)
-                print(f"[MODEL] rgb2depth_attn_block[{i}].save_attention = {attn.save_attention}")
+                self.attn_logger.debug(f"  - rgb2depth_attn_block[{i}].save_attention = {attn.save_attention}")
         else:
-            print(f"[MODEL] 编码器没有 rgb2depth_attn_blocks 属性")
+            self.logger.warning("编码器没有 rgb2depth_attn_blocks 属性")
 
     def _encode(self, raw, depth_feats=None, gt=None):
         """编码阶段的辅助函数，支持使用外部深度特征
@@ -264,34 +276,43 @@ class UnderwaterEnhanceNet(nn.Module):
         rgb2depth_attn = None
         
         if hasattr(self.encoder, 'depth2rgb_attn_blocks'):
-            print(f"[Model] 检查 depth2rgb_attn_blocks 中的注意力图...")
+            self.attn_logger.debug(f"检查 depth2rgb_attn_blocks 中的注意力图...")
             for i, attn_block in enumerate(self.encoder.depth2rgb_attn_blocks):
                 has_attr = hasattr(attn_block, 'last_attn')
                 is_not_none = has_attr and attn_block.last_attn is not None
-                print(f"[Model] depth2rgb_attn_block[{i}]: has_attr={has_attr}, is_not_none={is_not_none}")
+                self.attn_logger.debug(f"  - depth2rgb_attn_block[{i}]: has_attr={has_attr}, is_not_none={is_not_none}")
                 if is_not_none:
                     depth2rgb_attn = attn_block.last_attn
-                    print(f"[Model] 获取到 depth2rgb 注意力图: shape={depth2rgb_attn.shape}")
+                    self.attn_logger.debug(f"  - 获取到 depth2rgb 注意力图: shape={depth2rgb_attn.shape}")
                     break
                     
         if hasattr(self.encoder, 'rgb2depth_attn_blocks'):
-            print(f"[Model] 检查 rgb2depth_attn_blocks 中的注意力图...")
+            self.attn_logger.debug(f"检查 rgb2depth_attn_blocks 中的注意力图...")
             for i, attn_block in enumerate(self.encoder.rgb2depth_attn_blocks):
                 has_attr = hasattr(attn_block, 'last_attn')
                 is_not_none = has_attr and attn_block.last_attn is not None
-                print(f"[Model] rgb2depth_attn_block[{i}]: has_attr={has_attr}, is_not_none={is_not_none}")
+                self.attn_logger.debug(f"  - rgb2depth_attn_block[{i}]: has_attr={has_attr}, is_not_none={is_not_none}")
                 if is_not_none:
                     rgb2depth_attn = attn_block.last_attn
-                    print(f"[Model] 获取到 rgb2depth 注意力图: shape={rgb2depth_attn.shape}")
+                    self.attn_logger.debug(f"  - 获取到 rgb2depth 注意力图: shape={rgb2depth_attn.shape}")
                     break
             
-        print(f"[Model] 返回注意力图: d2r={depth2rgb_attn is not None}, r2d={rgb2depth_attn is not None}")
+        self.attn_logger.debug(f"返回注意力图: d2r={depth2rgb_attn is not None}, r2d={rgb2depth_attn is not None}")
         return depth2rgb_attn, rgb2depth_attn
 
     def forward(self,
                 raw: torch.Tensor,
                 depth_gt: torch.Tensor = None,
                 gt: torch.Tensor = None) -> Union[ModelOutput, Dict[str, Any]]:
+        
+        self._forward_count += 1
+        # 只在每个epoch的第一个batch记录详细日志
+        log_this_step = self._forward_count == 1 
+
+        if log_this_step:
+            self.logger.info(f"--- [Forward Pass Start] ---")
+            self.logger.info(f"Input shapes: raw={raw.shape}, depth_gt={depth_gt.shape if depth_gt is not None else 'None'}, gt={gt.shape if gt is not None else 'None'}")
+
         # 混合精度训练兼容性：确保输入数据类型一致
         if depth_gt is not None and raw.dtype != depth_gt.dtype:
             depth_gt = depth_gt.to(dtype=raw.dtype)
@@ -300,28 +321,34 @@ class UnderwaterEnhanceNet(nn.Module):
             
         # 添加调试信息，跟踪深度图属性
         if depth_gt is not None:
-            logger.debug(f"[MODEL] 深度GT形状:{depth_gt.shape}, 范围:[{depth_gt.min().item():.4f}, {depth_gt.max().item():.4f}]")
+            self.logger.debug(f"深度GT形状:{depth_gt.shape}, 范围:[{depth_gt.min().item():.4f}, {depth_gt.max().item():.4f}]")
             if hasattr(depth_gt, '_depth_processed'):
-                logger.debug(f"[MODEL] 深度GT已被标记为处理过")
+                self.logger.debug(f"深度GT已被标记为处理过")
         
         # 判断当前处于训练或推理模式
         training_mode = self.training or depth_gt is not None
+        if log_this_step:
+            self.logger.info(f"Mode: {'Training' if training_mode else 'Inference'}")
 
         if training_mode:
             # ===== 训练时："三输入 + 双次前向" =====
+            if log_this_step: self.logger.info("--- Pass-1: Depth Prediction ---")
 
             # ——— Pass-1: 仅用 raw 预测深度（DepthDecoder） ———
             # 1.1) 浅层特征提取
             # SFE 内部已处理数据类型不匹配问题
             x = self.sfe(raw)  # [B, C1, H, W]
+            if log_this_step: self.logger.info(f"  - SFE output shape: {x.shape}")
 
             # 1.2) RGB 编码器第一遍：raw 只进 RGB 编码器，depth_feats 传 None  
             student_feats_pass1, bottleneck_pass1 = self._encode(raw, depth_feats=None, gt=None)
-            #    student_feats_pass1: list of Tensor, length == self.levels
-            #    bottleneck_pass1: Tensor, [B, bottleneck_ch, h, w]
+            if log_this_step: 
+                self.logger.info(f"  - Encoder Pass-1 output shapes: student_feats={[f.shape for f in student_feats_pass1]}, bottleneck={bottleneck_pass1.shape}")
 
             # 1.3) DepthDecoder：用 bottleneck_pass1 + student_feats_pass1 预测连续深度 & 深度多尺度特征
             depth_pred, depth_feats = self.depth_decoder(bottleneck_pass1, student_feats_pass1)
+            if log_this_step:
+                self.logger.info(f"  - DepthDecoder output shapes: depth_pred={depth_pred.shape}, depth_feats={[f.shape for f in depth_feats]}")
             #    depth_pred:  [B,1,H,W]         （Pass-1 的连续深度预测，用于与 depth_gt 做回归损失）
             #    depth_feats: list of Tensor, 多尺度深度特征，length ≥ self.levels
 
@@ -333,7 +360,7 @@ class UnderwaterEnhanceNet(nn.Module):
                 if i < len(self.depth_projection_layers):
                     # 检查通道数不匹配的情况
                     if feat.shape[1] != self.depth_projection_layers[i].in_channels:
-                        logger.warning(f"[MODEL] 通道不匹配：深度特征 {i} 有 {feat.shape[1]} 通道，但投影层期望 {self.depth_projection_layers[i].in_channels} 通道")
+                        self.logger.warning(f"通道不匹配：深度特征 {i} 有 {feat.shape[1]} 通道，但投影层期望 {self.depth_projection_layers[i].in_channels} 通道")
                         # 对于任何深度级别，创建适配层处理通道数不匹配
                         temp_adapter = nn.Conv2d(
                             feat.shape[1], 
@@ -345,7 +372,7 @@ class UnderwaterEnhanceNet(nn.Module):
                         nn.init.ones_(temp_adapter.weight[:, :min(feat.shape[1], self.depth_projection_layers[i].in_channels), :, :])
                         # 应用适配层
                         feat = temp_adapter(feat)
-                        logger.info(f"[MODEL] 已将深度特征 {i} 的通道从 {feat.shape[1]} 适配到 {self.depth_projection_layers[i].in_channels}")
+                        self.logger.info(f"已将深度特征 {i} 的通道从 {feat.shape[1]} 适配到 {self.depth_projection_layers[i].in_channels}")
                     
                     # 投影：1x1 卷积将深度特征通道数转换成与 RGB 编码器第 i 级相同
                     projected_feat = self.depth_projection_layers[i](feat)
@@ -353,17 +380,22 @@ class UnderwaterEnhanceNet(nn.Module):
                 else:
                     projected_depth_feats.append(feat)
             depth_feats = projected_depth_feats[:self.levels]
+            if log_this_step: self.logger.info(f"  - Projected depth_feats shapes: {[f.shape for f in depth_feats]}")
             #    depth_feats 现在是一个长度为 self.levels 的列表，
             #    每个 Tensor 尺寸分别为 [B, rgb_ch_i, h_i, w_i]
 
             # 1.5) 用第 0 级深度特征做门控图（pred_gate），计算深度置信度 depth_conf_map（损失）
             pred_gate = self.depth_head(depth_feats[0])                                                         
+            if log_this_step: self.logger.info(f"  - pred_gate shape: {pred_gate.shape}")
+
             if depth_gt is None:
                 # 推理模式下，使用pred_gate作为置信度图（已经是0-1范围）
                 depth_conf_map = pred_gate.detach()
+                if log_this_step: self.logger.info(f"  - Generated depth_conf_map from pred_gate (Inference mode logic)")
             elif hasattr(depth_gt, '_depth_processed'):
                 # 如果深度已处理，使用pred_gate作为置信度
                 depth_conf_map = pred_gate.detach()
+                if log_this_step: self.logger.info(f"  - Generated depth_conf_map from pred_gate (depth already processed)")
             else:
                 # 基于深度梯度和pred_gate的组合生成置信度图
                 depth_dx, depth_dy = torch.gradient(depth_gt, dim=(-2, -1))
@@ -374,24 +406,30 @@ class UnderwaterEnhanceNet(nn.Module):
                 edge_conf = 1.0 - grad_normalized
                 # 结合pred_gate和边缘置信度
                 depth_conf_map = 0.5 * pred_gate.detach() + 0.5 * edge_conf
+                if log_this_step: self.logger.info(f"  - Generated depth_conf_map from gradient and pred_gate")
+            if log_this_step: self.logger.info(f"  - depth_conf_map shape: {depth_conf_map.shape}")
 
             # ——— Pass-2: 用预测的 depth_feats + raw + gt 做 RGB 分支（与推理时第二次前向一致） ———
+            if log_this_step: self.logger.info("--- Pass-2: RGB Enhancement ---")
+            
             # 2.1) 编码器：把 raw + depth_feats + gt 一起输入 RawEncoder
-            student_feats, bottleneck = self.encoder(x, depth_feats=depth_feats, gt=gt)
+            student_feats, _ = self.encoder(x, depth_feats=depth_feats, gt=gt)
+            if log_this_step: 
+                self.logger.info(f"  - Encoder Pass-2 output shapes: student_feats={[f.shape for f in student_feats]}")
             #    student_feats: list of Tensor, length == self.levels
-            #    bottleneck: Tensor, [B, bottleneck_ch, h_level, w_level]
 
             # 2.2) 确保 student_feats 长度正确
             if len(student_feats) != self.levels:
-                warnings.warn(f"Expected {self.levels} student features, but got {len(student_feats)}!")
+                self.logger.warning(f"Expected {self.levels} student features, but got {len(student_feats)}!")
                 if len(student_feats) > self.levels:
                     student_feats = student_feats[:self.levels]
                 else:
                     while len(student_feats) < self.levels:
                         student_feats.append(student_feats[-1])
 
-            # 2.3) 瓶颈 + 解码器：生成残差特征
+            # 2.3) 瓶颈：处理最后一层的student特征
             bottleneck = self.bottleneck(student_feats[-1])
+            if log_this_step: self.logger.info(f"  - Bottleneck output shape: {bottleneck.shape}")
             final_out, J_D, I_A = self.decoder(
                 bottleneck, 
                 student_feats[:-1], 
@@ -402,26 +440,39 @@ class UnderwaterEnhanceNet(nn.Module):
                 B_c=self.B_c,
                 blur_scale=self.blur_scale
             )
+            if log_this_step:
+                self.logger.info(f"  - Decoder output shapes: final_out={final_out.shape}, J_D={J_D.shape if J_D is not None else 'None'}, I_A={I_A.shape if I_A is not None else 'None'}")
 
             # 2.4) 如果物理模型已融合，直接使用融合结果；否则使用ReconHead
             if J_D is not None and I_A is not None:
                 # 使用融合后的物理模型结果，跳过ReconHead
                 out = final_out
                 depth_pred_refine = depth_pred  # 保持原来的深度预测
+                if log_this_step: self.logger.info(f"  - Using physical model output directly (J_D and I_A are not None)")
             else:
                 # 传统方式：使用ReconHead合成
                 final_feat = student_feats[0]
+                # 假设res_c也是由decoder返回的，或者在这里计算
+                # 这里假设res_c是final_out的一部分或可以通过其他方式获得
+                # 如果ReconHead的API改变了，需要调整这里
+                res_c = torch.zeros_like(final_out) # Placeholder if res_c is not available
                 out, depth_pred_refine = self.recon(raw, final_out, res_c, final_feat)
+                if log_this_step: self.logger.info(f"  - Using ReconHead. Output shape: {out.shape}, Refined depth shape: {depth_pred_refine.shape}")
 
         else:
             # ===== 推理时：仅输入 raw，走"双次前向" =====
+            if log_this_step: self.logger.info("--- Inference Path ---")
+            if log_this_step: self.logger.info("--- Pass-1: Depth Prediction ---")
 
             # 1) 浅层特征提取（与训练时 Pass-1 相同）
             x = self.sfe(raw)
+            if log_this_step: self.logger.info(f"  - SFE output shape: {x.shape}")
 
             # 2) Pass-1：RGB 编码器+DepthDecoder → 预测深度
             student_feats_pass1, bottleneck_pass1 = self._encode(raw, depth_feats=None, gt=None)
+            if log_this_step: self.logger.info(f"  - Encoder Pass-1 shapes: bottleneck={bottleneck_pass1.shape}")
             depth_pred, depth_feats = self.depth_decoder(bottleneck_pass1, student_feats_pass1)
+            if log_this_step: self.logger.info(f"  - DepthDecoder shapes: depth_pred={depth_pred.shape}")
 
             # 3) 投影深度特征到 RGB 分支对应通道
             projected_depth_feats = []
@@ -429,7 +480,7 @@ class UnderwaterEnhanceNet(nn.Module):
                 if i < len(self.depth_projection_layers):
                     # 检查通道数不匹配的情况
                     if feat.shape[1] != self.depth_projection_layers[i].in_channels:
-                        logger.warning(f"[MODEL] 通道不匹配：深度特征 {i} 有 {feat.shape[1]} 通道，但投影层期望 {self.depth_projection_layers[i].in_channels} 通道")
+                        self.logger.warning(f"通道不匹配：深度特征 {i} 有 {feat.shape[1]} 通道，但投影层期望 {self.depth_projection_layers[i].in_channels} 通道")
                         # 对于任何深度级别，创建适配层处理通道数不匹配
                         temp_adapter = nn.Conv2d(
                             feat.shape[1], 
@@ -441,21 +492,25 @@ class UnderwaterEnhanceNet(nn.Module):
                         nn.init.ones_(temp_adapter.weight[:, :min(feat.shape[1], self.depth_projection_layers[i].in_channels), :, :])
                         # 应用适配层
                         feat = temp_adapter(feat)
-                        logger.info(f"[MODEL] 已将深度特征 {i} 的通道从 {feat.shape[1]} 适配到 {self.depth_projection_layers[i].in_channels}")
+                        self.logger.info(f"已将深度特征 {i} 的通道从 {feat.shape[1]} 适配到 {self.depth_projection_layers[i].in_channels}")
                     
                     projected_feat = self.depth_projection_layers[i](feat)
                     projected_depth_feats.append(projected_feat)
                 else:
                     projected_depth_feats.append(feat)
             depth_feats = projected_depth_feats[:self.levels]
+            if log_this_step: self.logger.info(f"  - Projected depth_feats shapes: {[f.shape for f in depth_feats]}")
 
             # 4) 用第 0 级深度特征生成门控图 pred_gate；推理时使用pred_gate作为置信度
             pred_gate = self.depth_head(depth_feats[0])
             depth_conf_map = pred_gate.detach()  # 使用预测的门控图作为置信度
+            if log_this_step: self.logger.info(f"  - pred_gate shape: {pred_gate.shape}")
 
             # 5) Pass-2：将 raw + depth_feats → RGB 编码器 → 解码 → ReconHead → 输出增强图
+            if log_this_step: self.logger.info("--- Pass-2: RGB Enhancement ---")
             student_feats, bottleneck = self._encode(raw, depth_feats=depth_feats, gt=None)
-            bottleneck = self.bottleneck(student_feats[-1])
+            if log_this_step: self.logger.info(f"  - Encoder Pass-2 shapes: bottleneck={bottleneck.shape}")
+            if log_this_step: self.logger.info(f"  - Bottleneck output shape: {bottleneck.shape}")
             final_out, J_D, I_A = self.decoder(
                 bottleneck, 
                 student_feats[:-1], 
@@ -466,16 +521,24 @@ class UnderwaterEnhanceNet(nn.Module):
                 B_c=self.B_c,
                 blur_scale=self.blur_scale
             )
+            if log_this_step: self.logger.info(f"  - Decoder output shapes: final_out={final_out.shape}, J_D={J_D.shape if J_D is not None else 'None'}, I_A={I_A.shape if I_A is not None else 'None'}")
 
             # 2.4) 如果物理模型已融合，直接使用融合结果；否则使用ReconHead
             if J_D is not None and I_A is not None:
                 # 使用融合后的物理模型结果，跳过ReconHead
                 out = final_out
                 depth_pred_refine = depth_pred  # 保持原来的深度预测
+                if log_this_step: self.logger.info(f"  - Using physical model output directly")
             else:
                 # 传统方式：使用ReconHead合成
                 final_feat = student_feats[0]
+                res_c = torch.zeros_like(final_out) # Placeholder
                 out, depth_pred_refine = self.recon(raw, final_out, res_c, final_feat)
+                if log_this_step: self.logger.info(f"  - Using ReconHead. Output shape: {out.shape}, Refined depth shape: {depth_pred_refine.shape}")
+        
+        if log_this_step:
+            self.logger.info(f"--- [Forward Pass End] ---")
+            self.logger.info(f"Final output shapes: enhanced={out.shape}, pred_gate={pred_gate.shape}, depth_pred={depth_pred.shape}")
 
         # ===== 最终输出统一封装 =====
         return ModelOutput(
@@ -524,6 +587,10 @@ class UnderwaterEnhanceNet(nn.Module):
         all_depth_conf_maps = []
         all_attn_maps = []
         
+        # 收集J_D和I_A输出
+        all_J_D = []
+        all_I_A = []
+        
         # 逐个处理每个样本
         for b in range(B):
             raw_n = raw_batch[b:b+1]
@@ -554,11 +621,18 @@ class UnderwaterEnhanceNet(nn.Module):
                     
                 if output_dict.attention_maps is not None:
                     all_attn_maps.append(output_dict.attention_maps)
+                
+                # 收集物理模型输出
+                if output_dict.J_D is not None:
+                    all_J_D.append(output_dict.J_D)
+                
+                if output_dict.I_A is not None:
+                    all_I_A.append(output_dict.I_A)
             except Exception as e:
-                logger.error(f"[MODEL] 样本 {b} 处理错误: {str(e)}")
+                self.logger.error(f"[MODEL] 样本 {b} 处理错误: {str(e)}")
                 # 记录更详细的错误信息
                 import traceback
-                logger.error(traceback.format_exc())
+                self.logger.error(traceback.format_exc())
                 # 如果这是第一个样本而且出错，则重新抛出异常
                 if b == 0:
                     raise
@@ -591,6 +665,10 @@ class UnderwaterEnhanceNet(nn.Module):
                 rgb2depth_batch = torch.cat(rgb2depth_maps, dim=0) if rgb2depth_maps[0] is not None else None
                 attention_maps = (depth2rgb_batch, rgb2depth_batch)
         
+        # 整合J_D和I_A (如果有)
+        J_D_batch = torch.cat(all_J_D, dim=0) if all_J_D else None
+        I_A_batch = torch.cat(all_I_A, dim=0) if all_I_A else None
+        
         # 返回输出
         output = ModelOutput(
             enhanced=enhanced,
@@ -599,8 +677,8 @@ class UnderwaterEnhanceNet(nn.Module):
             student_feats=student_feats,
             depth_conf_map=depth_conf_map,
             attention_maps=attention_maps,
-            J_D=J_D,
-            I_A=I_A
+            J_D=J_D_batch,
+            I_A=I_A_batch
         )
         
         return output

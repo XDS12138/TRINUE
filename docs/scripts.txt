@@ -8,6 +8,8 @@ git remote add origin git@github.com:XDS12138/TRINUE.git
 git remote remove origin
 git remote add origin git@github.com:XDS12138/TRINUE.git
 git push -u origin main
+git pull origin main
+
 置信度引导损失
 
 

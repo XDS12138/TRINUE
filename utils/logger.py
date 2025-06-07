@@ -228,24 +228,27 @@ class MetricLogger:
         self.global_step = 0  # 全局步数计数器，不会被reset重置
         self.csv_header_written = False
         
-        # 记录TensorBoard日志目录位置
-        self.logger.info(f"TensorBoard日志将写入目录: {self.tb_writer.log_dir}")
-        
-        # 确保TensorBoard目录存在并有写入权限
-        if not os.path.exists(self.tb_writer.log_dir):
+        # 记录TensorBoard日志目录位置（如果有TensorBoard writer）
+        if self.tb_writer is not None:
+            self.logger.info(f"TensorBoard日志将写入目录: {self.tb_writer.log_dir}")
+            
+            # 确保TensorBoard目录存在并有写入权限
+            if not os.path.exists(self.tb_writer.log_dir):
+                try:
+                    os.makedirs(self.tb_writer.log_dir, exist_ok=True)
+                    self.logger.info(f"已创建TensorBoard目录: {self.tb_writer.log_dir}")
+                except Exception as e:
+                    self.logger.error(f"创建TensorBoard目录失败: {str(e)}")
+            
+            # 尝试写入一个测试事件
             try:
-                os.makedirs(self.tb_writer.log_dir, exist_ok=True)
-                self.logger.info(f"已创建TensorBoard目录: {self.tb_writer.log_dir}")
+                self.tb_writer.add_text("setup", "MetricLogger初始化成功", 0)
+                self.tb_writer.flush()
+                self.logger.info("TensorBoard初始化测试写入成功")
             except Exception as e:
-                self.logger.error(f"创建TensorBoard目录失败: {str(e)}")
-        
-        # 尝试写入一个测试事件
-        try:
-            self.tb_writer.add_text("setup", "MetricLogger初始化成功", 0)
-            self.tb_writer.flush()
-            self.logger.info("TensorBoard初始化测试写入成功")
-        except Exception as e:
-            self.logger.error(f"TensorBoard写入测试失败: {str(e)}")
+                self.logger.error(f"TensorBoard写入测试失败: {str(e)}")
+        else:
+            self.logger.info("MetricLogger初始化成功（无TensorBoard）")
 
     def reset(self):
         """Reset internal step counter (e.g., at epoch￼￼
@@ -253,43 +256,48 @@ art)."""
         self.step = 0
         # 全局步数计数器不重置，确保TensorBoard图表持续向右绘制
 
-    def log_metrics(self, metrics: dict, prefix: str = "train"):
+    def log_metrics(self, metrics: dict, prefix: str = "train", step: int = None):
         """
         Log a dict of scalar metrics.
 
         Args:
             metrics (dict): {metric_name: value}
             prefix (str): Tag prefix, e.g. 'train', 'val'.
+            step (int): Optional step number for tensorboard logging.
         """
+        # 使用传入的step或默认的global_step
+        current_step = step if step is not None else self.global_step
+        
         # 1) Console/file
-        msg = f"[{prefix}] Step {self.step}: " + ", ".join(f"{k}={v:.4f}" for k, v in metrics.items())
+        msg = f"[{prefix}] Step {current_step}: " + ", ".join(f"{k}={v:.4f}" for k, v in metrics.items())
         self.logger.info(msg)
 
-        # 2) TensorBoard scalars and histograms
-        for k, v in metrics.items():
-            # 根据指标名称分类，确保不同类型的损失分开绘制
-            if k.startswith('loss_') or k.endswith('_loss'):
-                # 损失组件放在单独的图表组中
-                tag = f"{prefix}/losses/{k}"
-            elif k == 'loss':
-                # 总损失单独一个图表
-                tag = f"{prefix}/{k}"
-            elif k in ['psnr', 'ssim']:
-                # 质量评估指标放在一组
-                tag = f"{prefix}/metrics/{k}"
-            elif k == 'lr':
-                # 学习率单独一个图表
-                tag = f"{prefix}/{k}"
-            else:
-                # 其他指标
-                tag = f"{prefix}/other/{k}"
+        # 2) TensorBoard scalars and histograms (如果有TensorBoard writer)
+        if self.tb_writer is not None:
+            for k, v in metrics.items():
+                # 根据指标名称分类，确保不同类型的损失分开绘制
+                if k.startswith('loss_') or k.endswith('_loss'):
+                    # 损失组件放在单独的图表组中
+                    tag = f"{prefix}/losses/{k}"
+                elif k == 'loss':
+                    # 总损失单独一个图表
+                    tag = f"{prefix}/{k}"
+                elif k in ['psnr', 'ssim']:
+                    # 质量评估指标放在一组
+                    tag = f"{prefix}/metrics/{k}"
+                elif k == 'lr':
+                    # 学习率单独一个图表
+                    tag = f"{prefix}/{k}"
+                else:
+                    # 其他指标
+                    tag = f"{prefix}/other/{k}"
+                    
+                # 使用指定的步数记录
+                self.tb_writer.add_scalar(tag, v, current_step)
                 
-            # 使用全局步数记录，确保图表持续向右绘制
-            self.tb_writer.add_scalar(tag, v, self.global_step)
-            
-            # optional histogram if tensor-like
-            if isinstance(v, torch.Tensor) and v.numel() > 1:
-                self.tb_writer.add_histogram(f"{prefix}/{k}_hist", v, self.global_step)
+                # optional histogram if tensor-like
+                if isinstance(v, torch.Tensor) and v.numel() > 1:
+                    self.tb_writer.add_histogram(f"{prefix}/{k}_hist", v, current_step)
 
         # 3) Append to CSV
         fieldnames = ['step', 'global_step', 'prefix'] + list(metrics.keys())
@@ -299,7 +307,7 @@ art)."""
                 writer.writeheader()
             self.csv_header_written = True
 
-        row = {'step': self.step, 'global_step': self.global_step, 'prefix': prefix, **{k: float(v) for k, v in metrics.items()}}
+        row = {'step': current_step, 'global_step': self.global_step, 'prefix': prefix, **{k: float(v) for k, v in metrics.items()}}
         with open(self.csv_path, mode='a', newline='') as f:
             writer = csv.DictWriter(f, fieldnames=fieldnames)
             writer.writerow(row)
@@ -309,11 +317,14 @@ art)."""
 
     def flush(self):
         """强制刷新TensorBoard写入器，确保所有数据都写入磁盘"""
-        try:
-            self.tb_writer.flush()
-            self.logger.info("TensorBoard数据已刷新到磁盘")
-        except Exception as e:
-            self.logger.error(f"刷新TensorBoard数据时出错: {str(e)}")
+        if self.tb_writer is not None:
+            try:
+                self.tb_writer.flush()
+                self.logger.info("TensorBoard数据已刷新到磁盘")
+            except Exception as e:
+                self.logger.error(f"刷新TensorBoard数据时出错: {str(e)}")
+        else:
+            self.logger.debug("跳过TensorBoard刷新（无TensorBoard writer）")
 
     def log_image(self, tag: str, image: torch.Tensor, step: int = None):
         """
@@ -324,6 +335,9 @@ art)."""
             image (Tensor): shape (C,H,W) or (B,C,H,W)
             step (int): step for TB; defaults to current internal global_step.
         """
+        if self.tb_writer is None:
+            self.logger.debug(f"跳过图像记录 '{tag}'（无TensorBoard writer）")
+            return
         if len(image.shape) == 3:
             image = image.unsqueeze(0)  # (C,H,W) -> (1,C,H,W)
         

@@ -433,16 +433,20 @@ class MultiTaskDecoder(nn.Module):
 
             # 3.3.3 调用 Kornia Gaussian blur
             kernel_size = 5  # 高斯核大小，可微调
-            # 将 sigma 复制到 3 通道
-            sigma_3ch = sigma.repeat(1, 3, 1, 1)    # [B,3,H,W]
-
+            
+            # 计算每个样本的平均sigma值作为高斯模糊的标准差
+            batch_size = sigma.shape[0]
+            # 为每个样本创建一个[2]形状的sigma值 (x和y方向相同)
+            sigma_mean = sigma.view(batch_size, -1).mean(dim=1)  # [B]
+            sigma_for_blur = torch.stack([sigma_mean, sigma_mean], dim=1)  # [B,2]
+            
             # 确保 j_clear 在 [0,1] 范围内，避免模糊失真
             j_clear_clamped = torch.clamp(j_clear, 0.0, 1.0)
 
             # 执行 Gaussian blur
             J_D = K.gaussian_blur2d(j_clear_clamped,
                                  (kernel_size, kernel_size),
-                                 sigma=sigma_3ch,
+                                 sigma=sigma_for_blur,
                                  border_type='reflect')  # [B,3,H,W]
 
             # --- 3.4 Beer–Lambert (A 式) ---

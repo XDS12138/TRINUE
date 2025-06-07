@@ -40,6 +40,8 @@ for logger_name in ['PIL.PngImagePlugin', 'PIL.Image', 'PIL.TiffImagePlugin']:
 from torchvision.utils import make_grid, save_image
 from torch.utils.tensorboard import SummaryWriter
 from utils.multi_logger import MultiFileLogger, create_multi_logger
+from utils.logger import setup_logger, MetricLogger
+
 def custom_showwarning(message, category, filename, lineno, file=None, line=None):
     """自定义的警告处理函数，将 Python 警告转为 logger 日志输出。"""
     # 格式化警告信息，生成类似 “'filename:lineno: category: message'" 的字符串
@@ -66,181 +68,23 @@ from utils.checkpoint import save_checkpoint
 from utils.lr_scheduler import get_scheduler
 from utils.metrics import calculate_psnr as compute_psnr, calculate_ssim as compute_ssim
 from utils import metrics as metrics_module  # 如果需要使用所有指标
-from utils.logger import setup_logger, MetricLogger
-class MetricLogger:
-    def __init__(self, logger_instance, tb_writer=None, csv_path=None):
-        self.logger = logger_instance
-        self.tb_writer = tb_writer
-        self.csv_path = csv_path # Simplified
-        self.metrics = defaultdict(float)
-        self.counts = defaultdict(int)
 
-    def reset(self):
-        self.metrics = defaultdict(float)
-        self.counts = defaultdict(int)
-
-    def log_metrics(self, metrics_dict, prefix="", step=None):
-        for k, v in metrics_dict.items():
-            name = f"{prefix}/{k}" if prefix else k
-            self.metrics[name] += v
-            self.counts[name] += 1
-            if self.tb_writer and step is not None:
-                self.tb_writer.add_scalar(name, v, step)
-        self.logger.info(f"Step {step if step is not None else 'N/A'} [{prefix}]: {metrics_dict}")
-
-    def log_text(self, tag, text_string, step=None):
-        if self.tb_writer and step is not None:
-            self.tb_writer.add_text(tag, text_string, step)
-        self.logger.info(f"Text for {tag}: {text_string[:200]}...") # Log snippet
-
-    def log_model_graph(self, model, inputs):
-        if self.tb_writer:
-            try:
-                # 确保模型图正确跟踪
-                # 1. 记录日志，帮助调试
-                self.logger.info(f"正在尝试记录模型图，输入形状: {inputs.shape if isinstance(inputs, torch.Tensor) else [i.shape if isinstance(i, torch.Tensor) else type(i) for i in inputs]}")
-                
-                # 2. 使用模型的 .trace() 方法而不是 add_graph
-                with torch.no_grad():
-                    traced_model = torch.jit.trace(model, inputs)
-                    # 保存到临时文件
-                    import tempfile
-                    with tempfile.NamedTemporaryFile(suffix='.pt') as f:
-                        torch.jit.save(traced_model, f.name)
-                        self.tb_writer.add_graph(model, inputs)
-                
-                self.logger.info("成功记录模型图到TensorBoard")
-            except Exception as e:
-                self.logger.error(f"Failed to log model graph: {e}")
-                # 记录更详细的错误信息
-                import traceback
-                self.logger.debug(f"Model graph trace error details:\n{traceback.format_exc()}")
-                # 但不抛出异常，不阻止训练继续
+def setup_logging_system(exp_dir, config):
+    """设置完整的多文件日志系统，包括TensorBoard"""
     
-    def log_image(self, tag, image_tensor, step=None):
-        if self.tb_writer and image_tensor is not None:
-             # Basic check to ensure it's a tensor and detach
-            if isinstance(image_tensor, torch.Tensor):
-                img_to_log = image_tensor.detach().cpu()
-                if img_to_log.ndim == 3: # C, H, W
-                    img_to_log = img_to_log.unsqueeze(0) # B, C, H, W
-                if img_to_log.ndim == 2: # H,W
-                    img_to_log = img_to_log.unsqueeze(0).unsqueeze(0) # B, 1, H, W
-                
-                # 确保图像值在正确的范围内（0-1）
-                min_val = img_to_log.min().item()
-                max_val = img_to_log.max().item()
-                
-                # 如果值域不在[0,1]范围内，进行规范化
-                if min_val < 0.0 or max_val > 1.0:
-                    self.logger.debug(f"图像值域超出[0,1]范围: [{min_val:.4f}, {max_val:.4f}]，将进行规范化")
-                    if min_val < 0.0 and min_val >= -1.0 and max_val <= 1.0 and max_val > 0.0:
-                        # 似乎是[-1,1]范围，转换到[0,1]
-                        img_to_log = (img_to_log + 1.0) / 2.0
-                    else:
-                        # 任意范围，归一化到[0,1]
-                        img_to_log = (img_to_log - img_to_log.min()) / (img_to_log.max() - img_to_log.min() + 1e-6)
-                                
-                # 记录详细信息，便于诊断
-                try:
-                    self.tb_writer.add_images(tag, img_to_log, step, dataformats='NCHW')
-                    self.tb_writer.flush() # 立即写入磁盘
-                    self.logger.info(f"成功记录图像 '{tag}'，形状: {img_to_log.shape}, 范围: [{img_to_log.min():.2f}, {img_to_log.max():.2f}]")
-                except Exception as e:
-                    self.logger.error(f"记录图像 '{tag}' 失败: {str(e)}，尝试记录更多信息")
-                    try:
-                        # 如果记录图像失败，尝试记录图像的数值摘要
-                        self.tb_writer.add_histogram(f"{tag}_histogram", img_to_log, step)
-                        self.tb_writer.add_scalar(f"{tag}_min", img_to_log.min().item(), step)
-                        self.tb_writer.add_scalar(f"{tag}_max", img_to_log.max().item(), step)
-                        self.tb_writer.add_scalar(f"{tag}_mean", img_to_log.mean().item(), step)
-                        self.tb_writer.flush()
-                        self.logger.info(f"已记录图像'{tag}'的统计信息")
-                    except Exception as e2:
-                        self.logger.error(f"记录图像'{tag}'的统计信息也失败: {str(e2)}")
-            else:
-                self.logger.warning(f"尝试记录图像'{tag}'，但输入不是张量: {type(image_tensor)}")
-        elif self.tb_writer is None:
-            self.logger.warning(f"无法记录图像'{tag}'，TensorBoard writer未初始化")
-        elif image_tensor is None:
-            self.logger.warning(f"无法记录图像'{tag}'，图像张量为None")
-
-    def log_depth_comparison(self, tag, depth_gt, depth_pred, step=None):
-        if self.tb_writer and depth_gt is not None and depth_pred is not None:
-            # Assuming depth_gt and depth_pred are already normalized [0,1] and B,1,H,W
-            # For visualization, ensure they are suitable (e.g., no unexpected large values)
-            depth_gt_vis = depth_gt.detach().cpu().clamp(0,1)
-            depth_pred_vis = depth_pred.detach().cpu().clamp(0,1)
-            if depth_gt_vis.ndim == 3: depth_gt_vis = depth_gt_vis.unsqueeze(0)
-            if depth_pred_vis.ndim == 3: depth_pred_vis = depth_pred_vis.unsqueeze(0)
-
-            comparison = torch.cat([depth_gt_vis, depth_pred_vis, torch.abs(depth_gt_vis - depth_pred_vis)], dim=-1) # Concatenate horizontally
-            self.tb_writer.add_images(tag, comparison, step, dataformats='NCHW')
-            self.logger.info(f"Logged depth comparison for {tag} at step {step}.")
-
-    def log_model_parameters(self, model, step):
-        for name, param in model.named_parameters():
-            if param.grad is not None and param.requires_grad:
-                if param.grad.data.numel() > 0:
-                    try:
-                        self.tb_writer.add_histogram(f"grads/{name}", param.grad.data, step)
-                        self.tb_writer.add_histogram(f"weights/{name}", param.data, step)
-                    except ValueError as e:
-                        if "The histogram is empty" in str(e):
-                            self.logger.warning(f"Skipping histogram for {name} at step {step} due to empty gradient data: {e}")
-                        else:
-                            self.logger.error(f"ValueError when logging histogram for {name} at step {step}: {e}")
-                            # Optionally re-raise if it's an unexpected ValueError
-                            # raise e 
-                else:
-                    self.logger.warning(f"Gradient for {name} has no elements (numel=0) at step {step}. Skipping histogram.")
-            elif param.grad is None and param.requires_grad:
-                self.logger.warning(f"Gradient for {name} is None but requires_grad is True at step {step}")
-    def close(self):
-        if self.tb_writer:
-            self.tb_writer.close()
-
-def setup_actual_logger(exp_dir, log_file="train.log", metrics_file="metrics.csv", debug_log_file="debug.log", console_log_level=logging.INFO, file_log_level=logging.DEBUG):
-    """Sets up the main logger, a debug logger, and TensorBoard writer."""
-    # Main logger (console and file)
-    main_logger = logging.getLogger() # Root logger or a specific one like logging.getLogger('TRINUE')
-    main_logger.setLevel(min(console_log_level, file_log_level)) # Set to the more verbose level
-
-    # Clear existing handlers to avoid duplicates
-    main_logger.handlers = []
-
-    # Console handler - only add if console_log_level is not CRITICAL or higher
-    if console_log_level < logging.CRITICAL:
-        console_handler = logging.StreamHandler(sys.stdout)
-        console_handler.setLevel(console_log_level)
-        console_formatter = logging.Formatter('%(asctime)s [%(levelname)s] [%(name)s] %(message)s')
-        console_handler.setFormatter(console_formatter)
-        main_logger.addHandler(console_handler)
-
-    # File handler for main log
-    main_log_path = os.path.join(exp_dir, log_file)
-    file_handler = logging.FileHandler(main_log_path, mode='a')
-    file_handler.setLevel(file_log_level)
-    file_formatter = logging.Formatter('%(asctime)s [%(levelname)s] [%(name)s] %(lineno)d: %(message)s')
-    file_handler.setFormatter(file_formatter)
-    main_logger.addHandler(file_handler)
+    # 创建多文件日志记录器
+    multi_logger = create_multi_logger(config, exp_dir)
     
-    # Debug logger (writes to a separate file)
-    debug_logger_instance = logging.getLogger('debug_logger')
-    debug_logger_instance.setLevel(logging.DEBUG)
-    debug_logger_instance.handlers = []  # Clear existing handlers
-    debug_log_path = os.path.join(exp_dir, debug_log_file)
-    debug_file_handler = logging.FileHandler(debug_log_path, mode='a')
-    debug_file_handler.setFormatter(file_formatter) # Can use the same detailed formatter
-    debug_logger_instance.addHandler(debug_file_handler)
-    debug_logger_instance.propagate = False # Don't propagate to main logger
-
-    # TensorBoard writer
+    # 获取主要的日志记录器
+    main_logger = multi_logger.get_logger('train')
+    
+    # 设置TensorBoard
     tb_log_dir = os.path.join(exp_dir, 'tensorboard', datetime.now().strftime("%Y%m%d-%H%M%S"))
     os.makedirs(tb_log_dir, exist_ok=True)
+    
     try:
         tb_writer = SummaryWriter(log_dir=tb_log_dir)
-        # Test write to ensure directory is writable
+        # 测试写入确保目录可写
         tb_writer.add_scalar('setup/tensorboard_test', 1, 0)
         tb_writer.flush()
         main_logger.info(f"TensorBoard日志将写入目录: {tb_log_dir}")
@@ -251,15 +95,12 @@ def setup_actual_logger(exp_dir, log_file="train.log", metrics_file="metrics.csv
     except Exception as e:
         main_logger.error(f"TensorBoard初始化失败: {str(e)}. 请检查路径权限和磁盘空间。")
         tb_writer = None
-
-    # Metrics CSV path
-    csv_path = os.path.join(exp_dir, metrics_file)
     
-    # Set specific module log levels if desired (example)
-    # logging.getLogger('modules.model').setLevel(logging.DEBUG)
-    # logging.getLogger('utils.depth_utils').setLevel(logging.DEBUG)
-
-    return main_logger, tb_writer, csv_path, debug_logger_instance
+    # 创建MetricLogger实例（使用真正的功能完整版本）
+    csv_path = os.path.join(exp_dir, 'metrics.csv')
+    metric_logger = MetricLogger(main_logger, tb_writer, csv_path)
+    
+    return multi_logger, metric_logger, tb_writer
 
 # --- End Logger Setup ---
 
@@ -451,132 +292,6 @@ def setup_training(args, config, local_rank):
     # 5. 优化器
     optimizer_name = config['optimizer'].get('name', 'adamw').lower()
     
-    # 参数分组，将交叉注意力参数和其他参数分开，应用不同的学习率
-    base_params, attn_params = [], []
-    for name, p in model.named_parameters():
-        if 'depth2rgb_attn' in name or 'rgb2depth_attn' in name:
-            attn_params.append(p)
-        else:
-            base_params.append(p)
-    
-    # 获取注意力模块学习率缩放因子
-    attn_lr_scale = config['optimizer'].get('attn_lr_scale', 0.1)
-    msg = (
-        f"使用差异化学习率: 主干 {config['optimizer']['lr']}, "
-        f"注意力模块 {config['optimizer']['lr'] * attn_lr_scale}"
-    )
-    logger.info(msg)
-    optimizer_logger.info(msg)
-    
-    # 添加损失函数中的不确定性权重参数到优化器中
-    uncertainty_params = []
-    if hasattr(criterion, 'use_uncertainty_weighting') and criterion.use_uncertainty_weighting:
-        # 收集所有不确定性权重参数
-        for name, p in criterion.named_parameters():
-            if 'log_var' in name:
-                uncertainty_params.append(p)
-        
-        if uncertainty_params:
-            msg = f"将 {len(uncertainty_params)} 个不确定性权重参数添加到优化器中"
-            logger.info(msg)
-            optimizer_logger.info(msg)
-            # 输出每个不确定性权重参数的名称
-            param_names = [name for name, p in criterion.named_parameters() if 'log_var' in name]
-            logger.info(f"不确定性权重参数列表: {param_names}")
-            optimizer_logger.info(f"不确定性权重参数列表: {param_names}")
-    
-    param_groups = [
-        {'params': base_params, 'lr': config['optimizer']['lr']},
-        {'params': attn_params, 'lr': config['optimizer']['lr'] * attn_lr_scale}
-    ]
-    
-    # 添加不确定性权重参数组（如果有）
-    if uncertainty_params:
-        param_groups.append({'params': uncertainty_params, 'lr': config['optimizer']['lr']})
-        
-        # 统计优化器中不同参数组的参数数量
-        base_param_count = sum(p.numel() for p in base_params)
-        attn_param_count = sum(p.numel() for p in attn_params)
-        uncertainty_param_count = sum(p.numel() for p in uncertainty_params)
-        total_param_count = base_param_count + attn_param_count + uncertainty_param_count
-        
-        logger.info("优化器参数统计:")
-        optimizer_logger.info("优化器参数统计:")
-        msg_main = f"  主干参数: {base_param_count:,} ({base_param_count/total_param_count*100:.2f}%)"
-        logger.info(msg_main)
-        optimizer_logger.info(msg_main)
-        msg_attn = f"  注意力参数: {attn_param_count:,} ({attn_param_count/total_param_count*100:.2f}%)"
-        logger.info(msg_attn)
-        optimizer_logger.info(msg_attn)
-        msg_unc = f"  不确定性权重参数: {uncertainty_param_count:,} ({uncertainty_param_count/total_param_count*100:.2f}%)"
-        logger.info(msg_unc)
-        optimizer_logger.info(msg_unc)
-        msg_total = f"  总参数数量: {total_param_count:,}"
-        logger.info(msg_total)
-        optimizer_logger.info(msg_total)
-    
-    if optimizer_name == 'adam':
-        optimizer = optim.Adam(
-            param_groups,
-            betas=(config['optimizer'].get('beta1', 0.9), config['optimizer'].get('beta2', 0.999)),
-            weight_decay=config['optimizer'].get('weight_decay', 0)
-        )
-    elif optimizer_name == 'adamw':
-        optimizer = optim.AdamW(
-            param_groups,
-            weight_decay=config['optimizer'].get('weight_decay', 0.01),
-            betas=(config['optimizer'].get('beta1', 0.9), config['optimizer'].get('beta2', 0.999))
-        )
-    elif optimizer_name == 'sgd':
-        optimizer = optim.SGD(
-            param_groups,
-            momentum=config['optimizer'].get('momentum', 0.9),
-            weight_decay=config['optimizer'].get('weight_decay', 0.0001),
-            nesterov=config['optimizer'].get('nesterov', False)
-        )
-    else:
-        raise ValueError(f"不支持的优化器: {optimizer_name}")
-    
-    # 6. 学习率调度器
-    scheduler = get_scheduler(
-        config['scheduler']['name'],
-        optimizer=optimizer,
-        num_epochs=config['train']['epochs'],
-        warmup_epochs=config['scheduler'].get('warmup_epochs', 0),
-        min_lr=config['scheduler'].get('min_lr', 0),
-        milestones=config['scheduler'].get('milestones', []),
-        gamma=config['scheduler'].get('gamma', 0.1),
-        patience=config['scheduler'].get('patience', 5),
-        factor=config['scheduler'].get('factor', 0.5)
-    )
-    
-    # 7. 混合精度设置
-    scaler = None
-    if mixed_precision:
-        try:
-            from torch.amp import GradScaler
-            scaler = GradScaler()
-            logger.info("启用混合精度训练")
-            # 注意：不要将整个模型转换为半精度，让autocast自动处理
-        except ImportError:
-            print("警告：混合精度训练需要PyTorch 1.6+，已禁用混合精度训练。")
-            mixed_precision = False
-    
-    # 8. 分布式封装
-    if distributed and (local_rank != -1 or world_size > 1):
-        # 使用DDP包装模型
-        model = DDP(
-            model, 
-            device_ids=[local_rank if local_rank != -1 else 0],
-            output_device=local_rank if local_rank != -1 else 0,
-            find_unused_parameters=find_unused_parameters
-        )
-    elif use_gpu and torch.cuda.device_count() > 1 and not distributed:
-        # 如果无法使用DDP但有多个GPU，使用DataParallel (不推荐)
-        print("警告: 使用DataParallel进行多GPU训练，这比DDP效率低。建议使用 --distributed 参数启用DDP。")
-        device_ids = gpu_config.get('device_ids', None)
-        model = nn.DataParallel(model, device_ids=device_ids)
-    
     # 9. 创建实验目录
     exp_dir = setup_experiment_dir(config)
     
@@ -595,13 +310,156 @@ def setup_training(args, config, local_rank):
     file_log_level = getattr(logging, file_log_level_str, logging.DEBUG)
     
     # 使用多文件日志系统
-    multi_logger = create_multi_logger(config, exp_dir)
+    multi_logger, metric_logger, tb_writer = setup_logging_system(exp_dir, config)
     
-    # 获取主日志记录器和调试日志记录器
-    logger_instance = multi_logger.get_logger('train')
-    debug_logger_instance = multi_logger.get_logger('debug')
-    optimizer_logger = multi_logger.get_logger('optimizer')
-    checkpoint_logger = multi_logger.get_logger('checkpoint')
+    # 获取不同分类的日志记录器
+    logger_instance = multi_logger.get_logger('train')  # 主训练日志
+    debug_logger_instance = multi_logger.get_logger('debug')  # 调试日志
+    model_logger = multi_logger.get_logger('model')  # 模型相关日志
+    arch_logger = multi_logger.get_logger('architecture')  # 模型架构日志
+    data_logger = multi_logger.get_logger('data')  # 数据相关日志
+    metrics_logger = multi_logger.get_logger('metrics')  # 性能指标日志
+    optimizer_logger = multi_logger.get_logger('optimizer')  # 优化器日志
+    scheduler_logger = multi_logger.get_logger('scheduler')  # 学习率调度器日志
+    checkpoint_logger = multi_logger.get_logger('checkpoint')  # 检查点日志
+    experiment_logger = multi_logger.get_logger('experiment')  # 实验配置日志
+    gpu_logger = multi_logger.get_logger('gpu')  # GPU使用日志
+    
+    # 参数分组，将交叉注意力参数和其他参数分开，应用不同的学习率
+    base_params, attn_params = [], []
+    for name, p in model.named_parameters():
+        if 'depth2rgb_attn' in name or 'rgb2depth_attn' in name:
+            attn_params.append(p)
+        else:
+            base_params.append(p)
+    
+    # 获取注意力模块学习率缩放因子
+    attn_lr_scale = config['optimizer'].get('attn_lr_scale', 0.1)
+    msg = (
+        f"使用差异化学习率: 主干 {config['optimizer']['lr']}, "
+        f"注意力模块 {config['optimizer']['lr'] * attn_lr_scale}"
+    )
+    optimizer_logger.info(msg)
+    
+    # 添加损失函数中的不确定性权重参数到优化器中
+    uncertainty_params = []
+    if hasattr(criterion, 'use_uncertainty_weighting') and criterion.use_uncertainty_weighting:
+        # 收集所有不确定性权重参数
+        for name, p in criterion.named_parameters():
+            if 'log_var' in name:
+                uncertainty_params.append(p)
+        
+        if uncertainty_params:
+            msg = f"将 {len(uncertainty_params)} 个不确定性权重参数添加到优化器中"
+            optimizer_logger.info(msg)
+            # 输出每个不确定性权重参数的名称
+            param_names = [name for name, p in criterion.named_parameters() if 'log_var' in name]
+            optimizer_logger.info(f"不确定性权重参数列表: {param_names}")
+    
+    param_groups = [
+        {'params': base_params, 'lr': config['optimizer']['lr']},
+        {'params': attn_params, 'lr': config['optimizer']['lr'] * attn_lr_scale}
+    ]
+    
+    # 添加不确定性权重参数组（如果有）
+    if uncertainty_params:
+        param_groups.append({'params': uncertainty_params, 'lr': config['optimizer']['lr']})
+        
+        # 统计优化器中不同参数组的参数数量
+        base_param_count = sum(p.numel() for p in base_params)
+        attn_param_count = sum(p.numel() for p in attn_params)
+        uncertainty_param_count = sum(p.numel() for p in uncertainty_params)
+        total_param_count = base_param_count + attn_param_count + uncertainty_param_count
+        
+        optimizer_logger.info("优化器参数统计:")
+        msg_main = f"  主干参数: {base_param_count:,} ({base_param_count/total_param_count*100:.2f}%)"
+        optimizer_logger.info(msg_main)
+        msg_attn = f"  注意力参数: {attn_param_count:,} ({attn_param_count/total_param_count*100:.2f}%)"
+        optimizer_logger.info(msg_attn)
+        msg_unc = f"  不确定性权重参数: {uncertainty_param_count:,} ({uncertainty_param_count/total_param_count*100:.2f}%)"
+        optimizer_logger.info(msg_unc)
+        msg_total = f"  总参数数量: {total_param_count:,}"
+        optimizer_logger.info(msg_total)
+    
+    # 记录模型架构信息
+    arch_logger.info(f"模型类型: {type(model).__name__}")
+    if hasattr(model, 'encoder') and hasattr(model.encoder, 'channels'):
+        arch_logger.info(f"编码器通道数: {model.encoder.channels}")
+    
+    if optimizer_name == 'adam':
+        optimizer = optim.Adam(
+            param_groups,
+            betas=(config['optimizer'].get('beta1', 0.9), config['optimizer'].get('beta2', 0.999)),
+            weight_decay=config['optimizer'].get('weight_decay', 0)
+        )
+        optimizer_logger.info(f"使用Adam优化器，权重衰减: {config['optimizer'].get('weight_decay', 0)}")
+    elif optimizer_name == 'adamw':
+        optimizer = optim.AdamW(
+            param_groups,
+            weight_decay=config['optimizer'].get('weight_decay', 0.01),
+            betas=(config['optimizer'].get('beta1', 0.9), config['optimizer'].get('beta2', 0.999))
+        )
+        optimizer_logger.info(f"使用AdamW优化器，权重衰减: {config['optimizer'].get('weight_decay', 0.01)}")
+    elif optimizer_name == 'sgd':
+        optimizer = optim.SGD(
+            param_groups,
+            momentum=config['optimizer'].get('momentum', 0.9),
+            weight_decay=config['optimizer'].get('weight_decay', 0.0001),
+            nesterov=config['optimizer'].get('nesterov', False)
+        )
+        optimizer_logger.info(f"使用SGD优化器，动量: {config['optimizer'].get('momentum', 0.9)}, "
+                             f"权重衰减: {config['optimizer'].get('weight_decay', 0.0001)}, "
+                             f"Nesterov: {config['optimizer'].get('nesterov', False)}")
+    else:
+        raise ValueError(f"不支持的优化器: {optimizer_name}")
+    
+    # 6. 学习率调度器
+    scheduler = get_scheduler(
+        config['scheduler']['name'],
+        optimizer=optimizer,
+        num_epochs=config['train']['epochs'],
+        warmup_epochs=config['scheduler'].get('warmup_epochs', 0),
+        min_lr=config['scheduler'].get('min_lr', 0),
+        milestones=config['scheduler'].get('milestones', []),
+        gamma=config['scheduler'].get('gamma', 0.1),
+        patience=config['scheduler'].get('patience', 5),
+        factor=config['scheduler'].get('factor', 0.5)
+    )
+    
+    scheduler_logger.info(f"使用学习率调度器: {config['scheduler']['name']}")
+    scheduler_logger.info(f"  总训练轮次: {config['train']['epochs']}")
+    if config['scheduler'].get('warmup_epochs', 0) > 0:
+        scheduler_logger.info(f"  预热轮次: {config['scheduler'].get('warmup_epochs', 0)}")
+    scheduler_logger.info(f"  最小学习率: {config['scheduler'].get('min_lr', 0)}")
+    
+    # 7. 混合精度设置
+    scaler = None
+    if mixed_precision:
+        try:
+            from torch.amp import GradScaler
+            scaler = GradScaler()
+            experiment_logger.info("启用混合精度训练")
+            # 注意：不要将整个模型转换为半精度，让autocast自动处理
+        except ImportError:
+            multi_logger.log_warning("混合精度训练需要PyTorch 1.6+，已禁用混合精度训练。")
+            mixed_precision = False
+    
+    # 8. 分布式封装
+    if distributed and (local_rank != -1 or world_size > 1):
+        # 使用DDP包装模型
+        model = DDP(
+            model, 
+            device_ids=[local_rank if local_rank != -1 else 0],
+            output_device=local_rank if local_rank != -1 else 0,
+            find_unused_parameters=find_unused_parameters
+        )
+        experiment_logger.info(f"使用DistributedDataParallel进行分布式训练, local_rank={local_rank}, world_size={world_size}")
+    elif use_gpu and torch.cuda.device_count() > 1 and not distributed:
+        # 如果无法使用DDP但有多个GPU，使用DataParallel (不推荐)
+        multi_logger.log_warning("使用DataParallel进行多GPU训练，这比DDP效率低。建议使用 --distributed 参数启用DDP。")
+        device_ids = gpu_config.get('device_ids', None)
+        model = nn.DataParallel(model, device_ids=device_ids)
+        experiment_logger.info(f"使用DataParallel进行多GPU训练, device_ids={device_ids}")
     
     # 设置TensorBoard
     tb_log_dir = os.path.join(exp_dir, 'tensorboard', datetime.now().strftime("%Y%m%d-%H%M%S"))
@@ -612,40 +470,36 @@ def setup_training(args, config, local_rank):
         # 测试写入以确保目录可写
         tb_writer.add_scalar('setup/tensorboard_test', 1, 0)
         tb_writer.flush()
-        logger_instance.info(f"TensorBoard日志将写入目录: {tb_log_dir}")
-        logger_instance.info("TensorBoard初始化测试写入成功")
+        experiment_logger.info(f"TensorBoard日志将写入目录: {tb_log_dir}")
+        experiment_logger.info("TensorBoard初始化测试写入成功")
     except ImportError:
-        logger_instance.warning("TensorBoard未安装，部分可视化功能将不可用。请运行 `pip install tensorboard` 安装。")
+        multi_logger.log_warning("TensorBoard未安装，部分可视化功能将不可用。请运行 `pip install tensorboard` 安装。")
         tb_writer = None
     except Exception as e:
-        logger_instance.error(f"TensorBoard初始化失败: {str(e)}. 请检查路径权限和磁盘空间。")
+        multi_logger.log_error(f"TensorBoard初始化失败: {str(e)}. 请检查路径权限和磁盘空间。", exc_info=True)
         tb_writer = None
     
-    # 设置CSV路径
-    csv_path = os.path.join(exp_dir, 'metrics.csv')
+    # metric_logger已经在setup_logging_system中创建了，无需重复创建
     
-    # 使用旧的MetricLogger类，但传入我们的多文件日志系统的logger
-    metric_logger_instance = MetricLogger(logger_instance, tb_writer, csv_path)
-    
-    # 11. 记录训练配置
+    # 记录训练配置
     config_text = yaml.dump(config, default_flow_style=False)
-    metric_logger_instance.log_text('config', config_text, step=0)
+    metric_logger.log_text('config', config_text, step=0)
     
     # 记录GPU信息
     if use_gpu:
         gpu_info = [f"GPU {i}: {torch.cuda.get_device_name(i)}" for i in range(torch.cuda.device_count())]
-        metric_logger_instance.log_text('gpu_info', "\n".join(gpu_info), step=0)
-        logger_instance.info(f"使用GPU: {', '.join(gpu_info)}")
+        metric_logger.log_text('gpu_info', "\n".join(gpu_info), step=0)
+        gpu_logger.info(f"使用GPU: {', '.join(gpu_info)}")
         
         if distributed:
-            logger_instance.info(f"分布式训练已启用，使用 {backend} 后端, 世界大小: {world_size}")
+            experiment_logger.info(f"分布式训练已启用，使用 {backend} 后端, 世界大小: {world_size}")
             if gpu_config.get('sync_bn', False):
-                logger_instance.info("SyncBatchNorm 已启用")
+                model_logger.info("SyncBatchNorm 已启用")
     else:
-        logger_instance.info("使用CPU进行训练")
+        experiment_logger.info("使用CPU进行训练")
     
     if mixed_precision:
-        logger_instance.info("启用混合精度训练")
+        experiment_logger.info("启用混合精度训练")
     
     return {
         'model': model,
@@ -655,7 +509,7 @@ def setup_training(args, config, local_rank):
         'device': device,
         'exp_dir': exp_dir,
         'logger': logger_instance,
-        'metric_logger': metric_logger_instance,
+        'metric_logger': metric_logger,
         'scaler': scaler,
         'mixed_precision': mixed_precision,
         'world_size': world_size,
@@ -882,19 +736,74 @@ def train_epoch(train_loader, model, criterion, optimizer, device, metric_logger
     vis_interval = config['train'].get('vis_interval', 100)
     param_vis_interval = config['train'].get('param_vis_interval', 500)
     
-    # 新增DECL损失
-    lambda_decl = config['train'].get('lambda_decl', 0.1)
-    if hasattr(criterion, 'decl'):
-        loss_decl = criterion.decl
+    # 获取常用的logger实例，避免重复调用
+    if multi_logger:
+        train_logger = multi_logger.get_logger('train')
+        vis_logger = multi_logger.get_logger('visualization')
+        warning_logger = multi_logger.get_logger('warning')
+        error_logger = multi_logger.get_logger('error')
+        depth_logger = multi_logger.get_logger('depth')
+        metrics_logger = multi_logger.get_logger('metrics')
+        physics_logger = multi_logger.get_logger('physics')
+        attention_logger = multi_logger.get_logger('attention')
+        optimizer_logger = multi_logger.get_logger('optimizer')
+        data_logger = multi_logger.get_logger('data') # 新增data logger
+        gpu_logger = multi_logger.get_logger('gpu') # 新增gpu logger
     else:
-        from modules.loss_fn import DepthEdgeColorLoss
-        # 从配置中获取权重
-        decl_config = config['loss'].get('depth_edge_color', {})
-        w_edge = decl_config.get('w_edge', 1.0)
-        w_depth = decl_config.get('w_depth', 0.5)
-        loss_decl = DepthEdgeColorLoss(w_edge=w_edge, w_depth=w_depth).to(device)
+        # 如果没有multi_logger，则回退到默认logger
+        train_logger = vis_logger = warning_logger = error_logger = depth_logger = metrics_logger = physics_logger = attention_logger = optimizer_logger = data_logger = gpu_logger = metric_logger.logger
+    
+    # 在训练前检查并记录关键配置
+    train_logger.info(f"======== [Epoch {epoch+1}/{config['train']['epochs']}] 开始 ========")
+    
+    # 记录DECL损失的状态
+    lambda_decl = config.get('loss', {}).get('lambda_decl', 0)
+    if lambda_decl > 0:
+        warning_logger.warning(f"Epoch {epoch+1}: 配置文件中DECL损失权重 (lambda_decl) 为 {lambda_decl}，但代码已禁用此损失。将忽略此权重。")
+
+    # 定义性能记录器
+    epoch_loss = 0.0
+    step_count = 0
+    
+    # 可视化设置
+    vis_interval = config.get('visualization', {}).get('interval', 100)
     
     for i, batch in enumerate(progress_bar):
+        # ===== 数据输入检查与记录 =====
+        def log_input_data(tensor, name, current_step):
+            if tensor is None:
+                data_logger.debug(f"Step {current_step}: 输入张量 '{name}' 为 None。")
+                return
+            
+            # 使用.detach()避免记录计算图
+            tensor_data = tensor.detach()
+            
+            stats = {
+                'min': tensor_data.min().item(),
+                'max': tensor_data.max().item(),
+                'mean': tensor_data.mean().item(),
+                'std': tensor_data.std().item(),
+                'has_nan': torch.isnan(tensor_data).any().item(),
+                'has_inf': torch.isinf(tensor_data).any().item(),
+                'shape': list(tensor_data.shape),
+                'dtype': str(tensor_data.dtype)
+            }
+            
+            log_msg = f"Step {current_step} [数据输入] | {name:<10} | 形状: {stats['shape']} | 类型: {stats['dtype']} | 范围: [{stats['min']:.4f}, {stats['max']:.4f}] | 均值: {stats['mean']:.4f} | 标准差: {stats['std']:.4f}"
+            
+            if stats['has_nan'] or stats['has_inf']:
+                error_logger.error(f"{log_msg} | 包含异常值!")
+                # 如果有异常，记录更详细的信息用于调试
+                if stats['has_nan']:
+                    nan_indices = torch.nonzero(torch.isnan(tensor_data))
+                    error_logger.error(f"  - {name} 的NaN位置 (前5个): {nan_indices[:5].tolist()}")
+            else:
+                # 只在每个epoch的第一个batch或定期记录常规信息，避免日志泛滥
+                if i == 0 or i % 100 == 0:
+                    data_logger.info(log_msg)
+
+        current_step = epoch * len(train_loader) + i
+        
         if isinstance(batch, dict):
             raw_imgs = batch['raw_imgs'].to(device)
             depth_gt = batch['depth'].to(device) if 'depth' in batch else None
@@ -908,8 +817,17 @@ def train_epoch(train_loader, model, criterion, optimizer, device, metric_logger
             gt = gt_tuple.to(device) if gt_tuple is not None else None
             B, N = raw_imgs.shape[:2]
         
+        # 记录输入数据
+        log_input_data(raw_imgs, "raw_imgs", current_step)
+        log_input_data(depth_gt, "depth_gt", current_step)  
+        log_input_data(gt, "gt_imgs", current_step)
+        
         optimizer.zero_grad()
-        current_step = epoch * len(train_loader) + i
+        
+        # 记录学习率
+        current_lr = optimizer.param_groups[0]['lr']
+        optimizer_logger.info(f"Step {current_step}: 当前学习率: {current_lr:.6f}")
+        metric_logger.log_metrics({"lr": current_lr}, prefix="optimizer", step=current_step)
         
         if mixed_precision and scaler is not None:
             with torch.amp.autocast(device_type='cuda'):
@@ -944,23 +862,22 @@ def train_epoch(train_loader, model, criterion, optimizer, device, metric_logger
                             raw_batch_b[n_loop_idx:n_loop_idx+1]  # 传递raw用于物理损失
                         )
                         
-                        # 添加DECL损失
-                        if depth_conf_map is not None and gt_b is not None:
-                            loss_decl_val = loss_decl(
-                                enhanced[n_loop_idx:n_loop_idx+1],
-                                gt_b,
-                                depth_conf_map
-                            )
-                            if isinstance(loss_decl_val, dict):
-                                loss_n += lambda_decl * loss_decl_val["total"]
-                            else:
-                                loss_n += lambda_decl * loss_decl_val
+                        # 注意：DECL损失已禁用（深度边缘颜色损失）
                             
                         all_losses.append(loss_n)
                 
                 loss = torch.stack(all_losses).mean()
             
             scaler.scale(loss).backward()
+            
+            # 梯度裁剪 (如果配置)
+            if config['optimizer'].get('clip_grad_norm', 0) > 0:
+                # 在 unscale 之前裁剪
+                scaler.unscale_(optimizer)
+                clip_norm_val = torch.nn.utils.clip_grad_norm_(model.parameters(), config['optimizer']['clip_grad_norm'])
+                gpu_logger.info(f"Step {current_step}: 梯度范数 (裁剪前): {clip_norm_val:.4f}")
+                metric_logger.log_metrics({"grad_norm": clip_norm_val.item()}, prefix="gpu", step=current_step)
+
             scaler.step(optimizer)
             scaler.update()
         else:
@@ -996,34 +913,19 @@ def train_epoch(train_loader, model, criterion, optimizer, device, metric_logger
                         raw_batch_b[n_loop_idx:n_loop_idx+1]  # 传递raw用于物理损失
                     )
                     
-                    # 添加DECL损失
-                    if depth_conf_map is not None and gt_b is not None:
-                        # 检查depth_conf_map的值域
-                        conf_min = depth_conf_map.min().item()
-                        conf_max = depth_conf_map.max().item()
-                        conf_mean = depth_conf_map.mean().item()
-                        
-                        # 如果depth_conf_map值域异常，记录警告
-                        if conf_max - conf_min < 1e-6:  # 基本没有变化
-                            logger.warning(f"训练step {current_step}: depth_conf_map值域过小 ({conf_min:.6f}-{conf_max:.6f})，可能导致DECL损失无效")
-                        
-                        loss_decl_val = loss_decl(
-                            enhanced[n_loop_idx:n_loop_idx+1],
-                            gt_b, 
-                            depth_conf_map
-                        )
-                        if isinstance(loss_decl_val, dict):
-                            loss_n += lambda_decl * loss_decl_val["total"]
-                            # 记录详细的DECL损失组件
-                            if current_step % 50 == 0:  # 每50步记录一次详细信息
-                                logger.debug(f"训练step {current_step} DECL损失 - total:{loss_decl_val['total']:.6f}, color:{loss_decl_val.get('color', 0.0):.6f}, edge:{loss_decl_val.get('edge', 0.0):.6f}")
-                        else:
-                            loss_n += lambda_decl * loss_decl_val
+                    # 注意：DECL损失已禁用（深度边缘颜色损失）
                         
                     all_losses.append(loss_n)
             
             loss = torch.stack(all_losses).mean()
             loss.backward()
+
+            # 梯度裁剪 (如果配置)
+            if config['optimizer'].get('clip_grad_norm', 0) > 0:
+                clip_norm_val = torch.nn.utils.clip_grad_norm_(model.parameters(), config['optimizer']['clip_grad_norm'])
+                gpu_logger.info(f"Step {current_step}: 梯度范数 (裁剪前): {clip_norm_val:.4f}")
+                metric_logger.log_metrics({"grad_norm": clip_norm_val.item()}, prefix="gpu", step=current_step)
+
             optimizer.step()
         
         current_loss = loss.item()
@@ -1044,52 +946,83 @@ def train_epoch(train_loader, model, criterion, optimizer, device, metric_logger
             if 'depth_total_loss' in loss_components:
                 progress_bar.set_postfix({
                     "Loss": f"{current_loss:.4f}",
-                    "Depth Loss": f"{loss_components['depth_total_loss']:.4f}"
+                    "Depth Loss": f"{loss_components['depth_total_loss']:.4f}",
+                    "LR": f"{current_lr:.6f}"
                 })
         
-        # 记录DECL损失
-        if depth_conf_map is not None and gt_b is not None:
-            if isinstance(loss_decl_val, dict):
-                metrics["loss_decl"] = lambda_decl * loss_decl_val["total"].item()
-                # 记录详细组件
-                if "color" in loss_decl_val:
-                    metrics["loss_decl_color"] = lambda_decl * loss_decl_val["color"].item()
-                if "edge" in loss_decl_val:
-                    metrics["loss_decl_edge"] = lambda_decl * loss_decl_val["edge"].item()
-            else:
-                metrics["loss_decl"] = lambda_decl * loss_decl_val.item()
+        # 注意：DECL损失已禁用
         
         metric_logger.log_metrics(metrics, prefix="train", step=current_step) # Added step to log_metrics
         
-        # 使用多文件日志系统记录损失
+        # 使用多文件日志系统记录详细分类的损失信息
         if multi_logger:
+            # 基本损失记录
             multi_logger.log_loss(metrics, current_step, prefix="train")
-        
-        # 记录不确定性权重（如果使用自动加权）
-        if hasattr(criterion, 'use_uncertainty_weighting') and criterion.use_uncertainty_weighting:
-            uncertainty_metrics = {}
-            for key, value in metrics.items():
-                if key.startswith('uncertainty_'):
-                    uncertainty_metrics[key] = value
             
-            # 手动记录各子损失的不确定性权重
-            latest_losses = criterion.get_latest_losses()
-            for key, value in latest_losses.items():
-                if key.startswith('uncertainty_'):
-                    uncertainty_metrics[key] = value
-            
-            if uncertainty_metrics:
-                metric_logger.log_metrics(uncertainty_metrics, prefix="uncertainty", step=current_step)
+            # 将损失按类别分组记录
+            if hasattr(criterion, 'get_latest_losses'):
+                loss_components = criterion.get_latest_losses()
+                
+                # 图像质量相关损失
+                image_metrics = {}
+                for k in ['l1_loss', 'ssim_loss', 'perc_loss', 'fft_loss', 'grad_loss', 'img_total_loss']:
+                    if k in loss_components:
+                        image_metrics[k] = loss_components[k]
+                if image_metrics:
+                    metrics_logger.info(f"[训练] Step {current_step} 图像质量损失: " + 
+                                      ", ".join([f"{k}={v:.6f}" for k, v in image_metrics.items()]))
+                
+                # 深度相关损失
+                depth_metrics = {}
+                for k in ['depth_pred_loss', 'depth_smooth_loss', 'depth_decoder_loss', 'depth_rec_loss', 'depth_total_loss']:
+                    if k in loss_components:
+                        depth_metrics[k] = loss_components[k]
+                if depth_metrics:
+                    depth_logger.info(f"[训练] Step {current_step} 深度损失: " + 
+                                    ", ".join([f"{k}={v:.6f}" for k, v in depth_metrics.items()]))
+                
+                # 物理模型相关损失
+                physics_metrics = {}
+                for k in ['phy_A_L1', 'phy_A_SSIM', 'L_phy_A', 'phy_D_L1', 'phy_D_SSIM', 'L_phy_D']:
+                    if k in loss_components:
+                        physics_metrics[k] = loss_components[k]
+                if physics_metrics:
+                    physics_logger.info(f"[训练] Step {current_step} 物理模型损失: " + 
+                                      ", ".join([f"{k}={v:.6f}" for k, v in physics_metrics.items()]))
+                
+                # 注意力相关损失
+                attention_metrics = {}
+                for k in ['attn_cons_loss']:
+                    if k in loss_components:
+                        attention_metrics[k] = loss_components[k]
+                if attention_metrics:
+                    attention_logger.info(f"[训练] Step {current_step} 注意力损失: " + 
+                                        ", ".join([f"{k}={v:.6f}" for k, v in attention_metrics.items()]))
+                
+                # 不确定性权重
+                if hasattr(criterion, 'use_uncertainty_weighting') and criterion.use_uncertainty_weighting:
+                    uncertainty_metrics = {}
+                    for key, value in loss_components.items():
+                        if key.startswith('uncertainty_'):
+                            uncertainty_metrics[key] = value
+                        elif key.startswith('log_var_'):
+                            uncertainty_metrics[key] = value
+                    
+                    if uncertainty_metrics:
+                        optimizer_logger.info(f"[训练] Step {current_step} 不确定性权重: " + 
+                                           ", ".join([f"{k}={v:.6f}" for k, v in uncertainty_metrics.items()]))
+                        metric_logger.log_metrics(uncertainty_metrics, prefix="uncertainty", step=current_step)
         
         if i % vis_interval == 0:
             try:
-                metric_logger.logger.info(f"开始记录可视化数据，步骤: {current_step}")
+                vis_logger.info(f"======== 开始记录可视化数据，步骤: {current_step} ========")
                 vis_raw_first_item = raw_imgs[0, 0].unsqueeze(0)
                 vis_depth_first_item = depth_gt[0].unsqueeze(0) if depth_gt is not None and depth_gt.nelement() > 0 and B > 0 else None
                 vis_gt_first_item = gt[0].unsqueeze(0) if gt is not None and gt.nelement() > 0 and B > 0 else None
 
                 # 跟踪深度特征 - 添加详细的深度可视化
                 if vis_depth_first_item is not None:
+                    vis_logger.info(f"Step {current_step}: 正在处理深度图可视化...")
                     # 对深度图执行对数变换和归一化处理，确保显示正确
                     log_depth = torch.log(vis_depth_first_item + 1.0)
                     # 从配置中获取深度范围
@@ -1102,11 +1035,20 @@ def train_epoch(train_loader, model, criterion, optimizer, device, metric_logger
                     norm_depth = torch.clamp(norm_depth, 0, 1)
                     
                     # 记录各种深度相关可视化
-                    metric_logger.log_image("train/depth_gt", norm_depth, step=current_step)
+                    metric_logger.log_image("train/depth_gt_normalized", norm_depth, step=current_step)
+                    vis_logger.info(f"  - 已记录 'train/depth_gt_normalized'")
                     
                     # 对原始深度使用另一种可视化方式（热力图风格）
-                    depth_for_colormap = norm_depth.repeat(1, 3, 1, 1) if norm_depth.shape[1] == 1 else norm_depth
-                    metric_logger.log_image("train/depth_gt_colored", depth_for_colormap, step=current_step)
+                    try:
+                        import matplotlib.pyplot as plt
+                        import matplotlib.cm as cm
+                        norm_depth_np = norm_depth.squeeze().cpu().numpy()
+                        colored_depth = torch.from_numpy(cm.viridis(norm_depth_np)[:, :, :3]).permute(2, 0, 1)
+                        metric_logger.log_image("train/depth_gt_colored", colored_depth, step=current_step)
+                        vis_logger.info(f"  - 已记录 'train/depth_gt_colored'")
+                    except ImportError:
+                        warning_logger.warning("matplotlib 未安装, 跳过彩色深度图可视化。 `pip install matplotlib`")
+                        metric_logger.log_image("train/depth_gt_colored", norm_depth.repeat(1, 3, 1, 1), step=current_step)
                 
                 with torch.no_grad():
                     # 模型前向传播，获取所有输出
@@ -1123,6 +1065,7 @@ def train_epoch(train_loader, model, criterion, optimizer, device, metric_logger
                     
                     # 可视化注意力图（如果有）
                     if attention_maps is not None and config.get('visualization', {}).get('save_attention_maps', False):
+                        vis_logger.info(f"Step {current_step}: 正在处理注意力图可视化...")
                         depth2rgb_attn, rgb2depth_attn = attention_maps
                         
                         if depth2rgb_attn is not None:
@@ -1130,26 +1073,30 @@ def train_epoch(train_loader, model, criterion, optimizer, device, metric_logger
                             depth2rgb_viz = depth2rgb_attn[0, 0].unsqueeze(0).unsqueeze(0)  # [1, 1, N, N]
                             depth2rgb_viz = (depth2rgb_viz - depth2rgb_viz.min()) / (depth2rgb_viz.max() - depth2rgb_viz.min() + 1e-8)
                             metric_logger.log_image("train/depth2rgb_attention", depth2rgb_viz, step=current_step)
+                            attention_logger.info(f"  - 已记录 'train/depth2rgb_attention', shape={depth2rgb_viz.shape}")
                         
                         if rgb2depth_attn is not None:
                             # 为可视化选择第一个头的注意力图
                             rgb2depth_viz = rgb2depth_attn[0, 0].unsqueeze(0).unsqueeze(0)  # [1, 1, N, N]
                             rgb2depth_viz = (rgb2depth_viz - rgb2depth_viz.min()) / (rgb2depth_viz.max() - rgb2depth_viz.min() + 1e-8)
                             metric_logger.log_image("train/rgb2depth_attention", rgb2depth_viz, step=current_step)
+                            attention_logger.info(f"  - 已记录 'train/rgb2depth_attention', shape={rgb2depth_viz.shape}")
                     
                     # 记录调试信息，确认是否获取了连续深度预测
                     if vis_depth_pred is not None:
-                        metric_logger.logger.info(f"Train step {current_step}: 获取到连续深度预测 shape={vis_depth_pred.shape}, range=[{vis_depth_pred.min().item():.4f}, {vis_depth_pred.max().item():.4f}]")
+                        depth_logger.info(f"Train step {current_step}: 获取到连续深度预测 shape={vis_depth_pred.shape}, range=[{vis_depth_pred.min().item():.4f}, {vis_depth_pred.max().item():.4f}]")
                     else:
-                        metric_logger.logger.warning(f"Train step {current_step}: 连续深度预测为None")
+                        warning_logger.warning(f"Train step {current_step}: 连续深度预测为None")
                     
                     # 1. 记录单独的图像
+                    vis_logger.info(f"Step {current_step}: 正在处理RGB图像可视化...")
                     # 输入图像归一化（假设输入已经在[0,1]或[-1,1]）
                     if vis_raw_first_item.min() < 0:
                         vis_input_normalized = (vis_raw_first_item + 1.0) / 2.0
                     else:
                         vis_input_normalized = vis_raw_first_item
                     metric_logger.log_image("train/input", vis_input_normalized, step=current_step)
+                    vis_logger.info(f"  - 已记录 'train/input'")
                     
                     # 增强图归一化处理：从[-1,1]映射到[0,1]
                     if vis_outputs is not None:
@@ -1158,10 +1105,9 @@ def train_epoch(train_loader, model, criterion, optimizer, device, metric_logger
                         else:
                             vis_outputs_normalized = vis_outputs
                         metric_logger.log_image("train/enhanced", vis_outputs_normalized, step=current_step)
-                        # 添加彩色增强图（更易观察）
-                        metric_logger.log_image("train/enhanced_color", vis_outputs_normalized, step=current_step)
+                        vis_logger.info(f"  - 已记录 'train/enhanced'")
                     else:
-                        metric_logger.logger.warning(f"训练可视化: 增强图为None，无法记录")
+                        warning_logger.warning(f"训练可视化: 增强图为None，无法记录")
                     
                     # GT图像
                     if vis_gt_first_item is not None:
@@ -1170,11 +1116,11 @@ def train_epoch(train_loader, model, criterion, optimizer, device, metric_logger
                         else:
                             vis_gt_normalized = vis_gt_first_item
                         metric_logger.log_image("train/gt", vis_gt_normalized, step=current_step)
-                        # 添加彩色GT图（更易观察）
-                        metric_logger.log_image("train/gt_color", vis_gt_normalized, step=current_step)
+                        vis_logger.info(f"  - 已记录 'train/gt'")
                         
                         # 2. 创建RGB对比图（输入/增强/GT并排）
                         if vis_outputs is not None:
+                            vis_logger.info(f"Step {current_step}: 正在创建RGB对比图...")
                             # 确保所有图像尺寸相同
                             comparison_list = []
                             
@@ -1207,34 +1153,53 @@ def train_epoch(train_loader, model, criterion, optimizer, device, metric_logger
                             if len(comparison_list) >= 2:  # 至少需要2张图片才能比较
                                 comparison_rgb = torch.cat(comparison_list, dim=-1)
                                 metric_logger.log_image("train/comparison_rgb", comparison_rgb, step=current_step)
+                                vis_logger.info(f"  - 已记录 'train/comparison_rgb'")
                             else:
-                                metric_logger.logger.warning(f"训练可视化: 没有足够的图像进行对比（仅有{len(comparison_list)}张），跳过对比图")
+                                warning_logger.warning(f"训练可视化: 没有足够的图像进行对比（仅有{len(comparison_list)}张），跳过对比图")
                             
                             # 3. 计算并显示误差图
+                            vis_logger.info(f"Step {current_step}: 正在创建误差图...")
                             error_map = torch.abs(vis_outputs_normalized - vis_gt_normalized)
-                            error_map_colored = error_map.repeat(1, 3, 1, 1) if error_map.shape[1] == 1 else error_map
-                            metric_logger.log_image("train/error_map", error_map_colored, step=current_step)
+                            metric_logger.log_image("train/error_map", error_map, step=current_step)
+                            vis_logger.info(f"  - 已记录 'train/error_map'")
                             
                             # 4. 添加热图形式的误差可视化（更易观察）
-                            metric_logger.log_image("train/error_heatmap", error_map_colored, step=current_step)
+                            try:
+                                import matplotlib.pyplot as plt
+                                import matplotlib.cm as cm
+                                error_map_gray = error_map.squeeze().cpu().numpy()
+                                
+                                # 确保error_map_gray是2D数组
+                                if error_map_gray.ndim > 2:
+                                    error_map_gray = error_map_gray.mean(axis=0)  # 如果是多维，取平均
+                                
+                                # 应用viridis色彩映射，只取RGB三个通道
+                                colored_array = cm.viridis(error_map_gray)[:, :, :3]  # 只取RGB，去掉alpha
+                                colored_error = torch.from_numpy(colored_array).permute(2, 0, 1).unsqueeze(0)  # 添加batch维度
+                                metric_logger.log_image("train/error_heatmap", colored_error, step=current_step)
+                                vis_logger.info(f"  - 已记录 'train/error_heatmap'")
+                            except ImportError:
+                                warning_logger.warning("matplotlib 未安装, 跳过彩色误差图可视化。 `pip install matplotlib`")
+                                metric_logger.log_image("train/error_heatmap", error_map.repeat(1, 3, 1, 1) if error_map.shape[1] == 1 else error_map, step=current_step)
                         else:
-                            metric_logger.logger.warning(f"训练可视化: 增强图为None，跳过对比图和误差图")
+                            warning_logger.warning(f"训练可视化: 增强图为None，跳过对比图和误差图")
                     
                     # 深度相关可视化
+                    vis_logger.info(f"Step {current_step}: 正在处理深度相关可视化...")
                     if vis_pred_gate is not None:
                         # 添加调试信息，输出深度门控的值范围和统计信息
                         pred_gate_min = vis_pred_gate.min().item()
                         pred_gate_max = vis_pred_gate.max().item()
                         pred_gate_mean = vis_pred_gate.mean().item()
                         pred_gate_std = vis_pred_gate.std().item()
-                        metric_logger.logger.info(f"深度门控(depth_pred_gate)统计: 最小值={pred_gate_min:.6f}, 最大值={pred_gate_max:.6f}, 平均值={pred_gate_mean:.6f}, 标准差={pred_gate_std:.6f}")
+                        depth_logger.info(f"深度门控(pred_gate)统计: Step {current_step} | 范围: [{pred_gate_min:.6f}, {pred_gate_max:.6f}] | 均值: {pred_gate_mean:.6f} | 标准差: {pred_gate_std:.6f}")
                         
                         # 改进深度门控可视化 - 使用更强的对比度增强
                         vis_pred_gate_enhanced = vis_pred_gate.clone()
                         
                         # 如果值域过小（导致看起来是空白），增强对比度
                         if pred_gate_max - pred_gate_min < 0.1:  # 如果范围很小
-                            metric_logger.logger.info(f"深度门控值域过小 ({pred_gate_max - pred_gate_min:.6f})，应用对比度增强")
+                            depth_logger.info(f"  - 深度门控值域过小 ({pred_gate_max - pred_gate_min:.6f})，应用对比度增强")
                             # 应用标准化增强对比度
                             if pred_gate_std > 0:  # 避免除以零
                                 # 使用Z-score标准化增强对比度（扩大差异）
@@ -1243,15 +1208,16 @@ def train_epoch(train_loader, model, criterion, optimizer, device, metric_logger
                                 vis_pred_gate_enhanced = torch.clamp(vis_pred_gate_enhanced, -3, 3)  # 限制在±3个标准差内
                                 vis_pred_gate_enhanced = (vis_pred_gate_enhanced + 3) / 6  # 从[-3,3]映射到[0,1]
                             else:
-                                metric_logger.logger.warning(f"深度门控标准差为零，无法增强对比度")
+                                warning_logger.warning(f"  - 深度门控标准差为零，无法增强对比度")
                                 # 为避免全黑图像，手动设置一个渐变
                                 h, w = vis_pred_gate.shape[-2:]
                                 vis_pred_gate_enhanced = torch.linspace(0, 1, w).view(1, 1, 1, w).repeat(1, 1, h, 1)
                         
                         # 记录原始深度门控
-                        metric_logger.log_image("train/depth_pred_gate_original", vis_pred_gate, step=current_step)
+                        metric_logger.log_image("train/depth_gate_original", vis_pred_gate, step=current_step)
                         # 记录增强后的深度门控
-                        metric_logger.log_image("train/depth_pred_gate", vis_pred_gate_enhanced, step=current_step)
+                        metric_logger.log_image("train/depth_gate_enhanced", vis_pred_gate_enhanced, step=current_step)
+                        vis_logger.info(f"  - 已记录 'depth_gate' (原始图与增强图)")
                     
                     # 连续深度预测可视化
                     if vis_depth_pred is not None:
@@ -1260,16 +1226,19 @@ def train_epoch(train_loader, model, criterion, optimizer, device, metric_logger
                         if depth_pred_norm.min() != depth_pred_norm.max():
                             depth_pred_norm = (depth_pred_norm - depth_pred_norm.min()) / (depth_pred_norm.max() - depth_pred_norm.min())
                         metric_logger.log_image("train/depth_pred_continuous", depth_pred_norm, step=current_step)
+                        vis_logger.info(f"  - 已记录 'depth_pred_continuous'")
                     
                     if depth_conf_map is not None:
                         metric_logger.log_image("train/depth_conf_map", depth_conf_map, step=current_step)
+                        vis_logger.info(f"  - 已记录 'depth_conf_map'")
                     
                     if vis_depth_first_item is not None:
                         # 确保深度GT可视化在全部范围内可见
                         norm_depth_vis = norm_depth.clone()
                         
                         # 显示深度GT
-                        metric_logger.log_image("train/depth_gt", norm_depth_vis, step=current_step)
+                        metric_logger.log_image("train/depth_gt_comparison", norm_depth_vis, step=current_step)
+                        vis_logger.info(f"  - 已记录 'depth_gt_comparison'")
                         
                         # 创建深度对比图（如果有连续深度预测）
                         if vis_depth_pred is not None and 'depth_pred_norm' in locals():
@@ -1304,40 +1273,49 @@ def train_epoch(train_loader, model, criterion, optimizer, device, metric_logger
                             norm_depth_vis_4d, depth_pred_norm_4d = ensure_same_dims(norm_depth_vis, depth_pred_norm)
                             depth_comparison = torch.cat([norm_depth_vis_4d, depth_pred_norm_4d], dim=-1)
                             metric_logger.log_image("train/depth_comparison", depth_comparison, step=current_step)
+                            vis_logger.info(f"  - 已记录 'depth_comparison'")
                 
                 # 特征图可视化
                 if vis_student_feats:
+                    vis_logger.info(f"Step {current_step}: 正在处理特征图可视化...")
                     for j, feat in enumerate(vis_student_feats):
                         if feat is not None:
                             # 添加类型检查，确保是张量而不是列表
                             if isinstance(feat, list):
-                                metric_logger.logger.warning(f"特征level{j}是列表类型而不是张量，跳过可视化")
+                                warning_logger.warning(f"特征level{j}是列表类型而不是张量，跳过可视化")
                                 continue
                                 
                             # 取特征图的前几个通道进行可视化
                             feat_vis = feat[0:1, 0:min(3, feat.shape[1])].mean(1, keepdim=True)  # 平均前3个通道
                             feat_vis = (feat_vis - feat_vis.min()) / (feat_vis.max() - feat_vis.min() + 1e-6)
                             metric_logger.log_image(f"train/student_feat_level{j}", feat_vis, step=current_step)
+                            vis_logger.info(f"  - 已记录 'train/student_feat_level{j}'")
                 
                 # 融合权重可视化
+                vis_logger.info(f"Step {current_step}: 正在处理融合权重可视化...")
                 current_model_for_weights = model.module if hasattr(model, 'module') else model
                 if hasattr(current_model_for_weights.decoder, 'last_fusion_weights') and current_model_for_weights.decoder.last_fusion_weights is not None:
                     fusion_weights = current_model_for_weights.decoder.last_fusion_weights
+                    vis_logger.info(f"  - 找到融合权重，形状: {fusion_weights.shape}")
                     # 可视化每个尺度的权重
                     for scale_idx in range(min(4, fusion_weights.shape[2])):  # 最多显示4个尺度
                         weight_map = fusion_weights[0, 0, scale_idx:scale_idx+1]
                         metric_logger.log_image(f"train/depth_fusion_weight_scale{scale_idx}", weight_map, step=current_step)
+                        vis_logger.info(f"    - 已记录 'train/depth_fusion_weight_scale{scale_idx}'")
+                else:
+                    vis_logger.info("  - 未找到融合权重，跳过可视化")
                 
-                metric_logger.logger.info(f"可视化数据记录完成，步骤: {current_step}")
+                vis_logger.info(f"======== 可视化数据记录完成，步骤: {current_step} ========")
             except Exception as e:
-                metric_logger.logger.error(f"记录可视化数据时发生错误: {str(e)}，步骤: {current_step}")
+                error_logger.error(f"记录可视化数据时发生错误: {str(e)}，步骤: {current_step}")
                 import traceback
-                metric_logger.logger.error(traceback.format_exc())
+                error_logger.error(traceback.format_exc())
         
         if i % param_vis_interval == 0:
             metric_logger.log_model_parameters(model, step=current_step)
         
     epoch_loss /= len(train_loader)
+    train_logger.info(f"======== [Epoch {epoch+1}] 结束 | 平均损失: {epoch_loss:.4f} ========")
     return epoch_loss
 
 
@@ -1345,16 +1323,26 @@ def validate(val_loader, model, criterion, device, metric_logger, epoch, config,
     model.eval()
     progress_bar = tqdm(val_loader, desc=f"Validation [{epoch+1}]")
     
-    # DECL Loss setup (remains the same)
-    lambda_decl = config['train'].get('lambda_decl', 0.1)
-    if hasattr(criterion, 'decl'):
-        loss_decl = criterion.decl
+    # 获取常用的logger实例，避免重复调用
+    if multi_logger:
+        validation_logger = multi_logger.get_logger('validation')
+        vis_logger = multi_logger.get_logger('visualization')
+        warning_logger = multi_logger.get_logger('warning')
+        error_logger = multi_logger.get_logger('error')
+        depth_logger = multi_logger.get_logger('depth')
+        metrics_logger = multi_logger.get_logger('metrics')
+        debug_logger = multi_logger.get_logger('debug')
+        data_logger = multi_logger.get_logger('data') # 新增
     else:
-        from modules.loss_fn import DepthEdgeColorLoss
-        decl_config = config['loss'].get('depth_edge_color', {})
-        w_edge = decl_config.get('w_edge', 1.0)
-        w_depth = decl_config.get('w_depth', 0.5)
-        loss_decl = DepthEdgeColorLoss(w_edge=w_edge, w_depth=w_depth).to(device)
+        # 如果没有multi_logger，则回退到默认logger
+        validation_logger = vis_logger = warning_logger = error_logger = depth_logger = metrics_logger = debug_logger = data_logger = metric_logger.logger
+    
+    validation_logger.info(f"======== [Epoch {epoch+1}] 开始验证 ========")
+
+    # 验证中也禁用DECL损失
+    lambda_decl = config.get('loss', {}).get('lambda_decl', 0)
+    if lambda_decl > 0:
+        warning_logger.warning(f"Epoch {epoch+1} [验证]: 配置文件中DECL损失权重 (lambda_decl) 为 {lambda_decl}，但代码已禁用此损失。")
     
     # Visualization and metric config from YAML
     vis_config = config.get('visualization', {})
@@ -1368,9 +1356,9 @@ def validate(val_loader, model, criterion, device, metric_logger, epoch, config,
     if save_val_imgs_to_disk and hasattr(metric_logger, 'tb_writer') and metric_logger.tb_writer is not None:
         val_img_output_dir = os.path.join(metric_logger.tb_writer.log_dir, f'val_images_epoch{epoch+1}')
         os.makedirs(val_img_output_dir, exist_ok=True)
-        metric_logger.logger.info(f"Validation images will be saved to: {val_img_output_dir}")
+        vis_logger.info(f"Validation images will be saved to: {val_img_output_dir}")
     elif save_val_imgs_to_disk:
-        metric_logger.logger.warning("Cannot save validation images to disk: TensorBoard writer not initialized.")
+        warning_logger.warning("Cannot save validation images to disk: TensorBoard writer not initialized.")
 
     collected_samples_for_processing = [] 
     epoch_total_batch_losses = [] 
@@ -1438,38 +1426,7 @@ def validate(val_loader, model, criterion, device, metric_logger, epoch, config,
                             model_outputs_dict.I_A[n_idx_in_degradations:n_idx_in_degradations+1] if hasattr(model_outputs_dict, 'I_A') and model_outputs_dict.I_A is not None else None,  # 传递I_A用于物理损失
                             raw_n_degradations[n_idx_in_degradations:n_idx_in_degradations+1]  # 传递raw用于物理损失
                         )
-                        if depth_conf_map_for_b_item is not None: # Assuming DECL loss uses the batch-item specific conf map
-                            # 添加调试信息，检查depth_conf_map的值域
-                            conf_min = depth_conf_map_for_b_item.min().item()
-                            conf_max = depth_conf_map_for_b_item.max().item()
-                            conf_mean = depth_conf_map_for_b_item.mean().item()
-                            
-                            # 如果depth_conf_map值域异常，生成合理的置信图
-                            if conf_max - conf_min < 1e-6:  # 基本没有变化
-                                metric_logger.logger.warning(f"验证：depth_conf_map值域过小 ({conf_min:.6f}-{conf_max:.6f})，生成合理的置信图")
-                                # 生成基于深度梯度的置信图（与训练时一致）
-                                if depth_gt_for_model is not None:
-                                    depth_dx, depth_dy = torch.gradient(depth_gt_for_model, dim=(-2, -1))
-                                    depth_grad_mag = torch.sqrt(depth_dx**2 + depth_dy**2)
-                                    depth_conf_map_for_b_item = torch.exp(-depth_grad_mag / 0.1)
-                                else:
-                                    # 如果没有深度GT，使用默认的均匀置信图
-                                    depth_conf_map_for_b_item = torch.ones_like(current_pred_gate_item) * 0.5
-                            
-                            decl_loss_value = loss_decl(current_enhanced_item, gt_for_model, depth_conf_map_for_b_item)
-                            # 处理DECL损失返回字典的情况
-                            if isinstance(decl_loss_value, dict):
-                                decl_total = decl_loss_value.get("total", decl_loss_value.get("loss", 0.0))
-                                loss_value += lambda_decl * decl_total
-                                # 记录DECL损失组件（用于调试）
-                                if hasattr(metric_logger, 'logger'):
-                                    metric_logger.logger.debug(f"验证DECL损失 - total:{decl_total:.6f}, color:{decl_loss_value.get('color', 0.0):.6f}, edge:{decl_loss_value.get('edge', 0.0):.6f}")
-                            else:
-                                loss_value += lambda_decl * decl_loss_value
-                        else:
-                            # 如果depth_conf_map为None，跳过DECL损失
-                            if hasattr(metric_logger, 'logger'):
-                                metric_logger.logger.debug(f"验证：depth_conf_map为None，跳过DECL损失")
+                        # 注意：DECL损失已禁用（深度边缘颜色损失）
                         epoch_total_batch_losses.append(loss_value.item())
 
                     # Collect samples for detailed metric calculation and disk saving (only from first b_item for simplicity)
@@ -1526,25 +1483,25 @@ def validate(val_loader, model, criterion, device, metric_logger, epoch, config,
                     if tb_log_raw_img is not None:
                         normalized_input = normalize_image(tb_log_raw_img)
                         metric_logger.log_image(f"val/sample{sample_idx}/input", normalized_input, step=epoch)
-                        metric_logger.logger.info(f"记录验证图像: val/sample{sample_idx}/input")
+                        vis_logger.info(f"记录验证图像到TensorBoard: val/sample{sample_idx}/input")
                     else:
-                        metric_logger.logger.warning(f"验证样本{sample_idx}的输入图像为None，跳过")
+                        warning_logger.warning(f"验证样本{sample_idx}的输入图像为None，跳过TB记录")
                         
                     if tb_log_enh_img is not None:
                         normalized_enhanced = normalize_image(tb_log_enh_img)
                         metric_logger.log_image(f"val/sample{sample_idx}/enhanced", normalized_enhanced, step=epoch)
                         # 添加彩色增强图（更易观察）
                         metric_logger.log_image(f"val/sample{sample_idx}/enhanced_color", normalized_enhanced, step=epoch)
-                        metric_logger.logger.info(f"记录验证图像: val/sample{sample_idx}/enhanced")
+                        vis_logger.info(f"记录验证图像到TensorBoard: val/sample{sample_idx}/enhanced")
                     else:
-                        metric_logger.logger.warning(f"验证样本{sample_idx}的增强图像为None，跳过")
+                        warning_logger.warning(f"验证样本{sample_idx}的增强图像为None，跳过TB记录")
                         
                     if tb_log_gt_img is not None: 
                         normalized_gt = normalize_image(tb_log_gt_img)
                         metric_logger.log_image(f"val/sample{sample_idx}/gt", normalized_gt, step=epoch)
                         # 添加彩色GT图（更易观察）
                         metric_logger.log_image(f"val/sample{sample_idx}/gt_color", normalized_gt, step=epoch)
-                        metric_logger.logger.info(f"记录验证图像: val/sample{sample_idx}/gt")
+                        vis_logger.info(f"记录验证图像到TensorBoard: val/sample{sample_idx}/gt")
                         
                         # 2. RGB对比图（输入/增强/GT并排）
                         if normalized_enhanced is not None and normalized_input is not None:
@@ -1560,16 +1517,16 @@ def validate(val_loader, model, criterion, device, metric_logger, epoch, config,
                             # 水平拼接
                             comparison_rgb = torch.cat(comparison_list, dim=-1)
                             metric_logger.log_image(f"val/sample{sample_idx}/comparison_rgb", comparison_rgb, step=epoch)
-                            metric_logger.logger.info(f"记录验证图像: val/sample{sample_idx}/comparison_rgb")
+                            vis_logger.info(f"记录验证对比图到TensorBoard: val/sample{sample_idx}/comparison_rgb")
                             
                             # 3. 误差图
                             error_map = torch.abs(normalized_enhanced - normalized_gt)
                             error_map_colored = error_map.repeat(1, 3, 1, 1) if error_map.shape[1] == 1 else error_map
                             metric_logger.log_image(f"val/sample{sample_idx}/error_map", error_map_colored, step=epoch)
                             metric_logger.log_image(f"val/sample{sample_idx}/error_heatmap", error_map_colored, step=epoch)
-                            metric_logger.logger.info(f"记录验证图像: val/sample{sample_idx}/error_map")
+                            vis_logger.info(f"记录验证图像到TensorBoard: val/sample{sample_idx}/error_map")
                     else:
-                        metric_logger.logger.warning(f"验证样本{sample_idx}的GT图像为None，跳过对比图和误差图")
+                        warning_logger.warning(f"验证样本{sample_idx}的GT图像为None，跳过对比图和误差图")
                     
                     # 4. 深度相关可视化
                     if tb_log_depth_gt_img is not None: 
@@ -1580,14 +1537,14 @@ def validate(val_loader, model, criterion, device, metric_logger, epoch, config,
                         gate_max = tb_log_depth_gate_pred.max().item()
                         gate_mean = tb_log_depth_gate_pred.mean().item()
                         gate_std = tb_log_depth_gate_pred.std().item()
-                        metric_logger.logger.info(f"验证深度门控(depth_pred_gate)统计: 最小值={gate_min:.6f}, 最大值={gate_max:.6f}, 平均值={gate_mean:.6f}, 标准差={gate_std:.6f}")
+                        depth_logger.info(f"验证深度门控(depth_pred_gate)统计: 最小值={gate_min:.6f}, 最大值={gate_max:.6f}, 平均值={gate_mean:.6f}, 标准差={gate_std:.6f}")
                         
                         # 改进深度门控可视化 - 使用更强的对比度增强
                         gate_enhanced = tb_log_depth_gate_pred.clone()
                         
                         # 如果值域过小（导致看起来是空白），增强对比度
                         if gate_max - gate_min < 0.1:  # 如果范围很小
-                            metric_logger.logger.info(f"验证深度门控值域过小 ({gate_max - gate_min:.6f})，应用对比度增强")
+                            depth_logger.info(f"验证深度门控值域过小 ({gate_max - gate_min:.6f})，应用对比度增强")
                             # 应用标准化增强对比度
                             if gate_std > 0:  # 避免除以零
                                 # 使用Z-score标准化增强对比度（扩大差异）
@@ -1596,7 +1553,7 @@ def validate(val_loader, model, criterion, device, metric_logger, epoch, config,
                                 gate_enhanced = torch.clamp(gate_enhanced, -3, 3)  # 限制在±3个标准差内
                                 gate_enhanced = (gate_enhanced + 3) / 6  # 从[-3,3]映射到[0,1]
                             else:
-                                metric_logger.logger.warning(f"验证深度门控标准差为零，无法增强对比度")
+                                warning_logger.warning(f"验证深度门控标准差为零，无法增强对比度")
                                 # 为避免全黑图像，手动设置一个渐变
                                 h, w = tb_log_depth_gate_pred.shape[-2:]
                                 gate_enhanced = torch.linspace(0, 1, w).view(1, 1, 1, w).repeat(1, 1, h, 1)
@@ -1613,7 +1570,7 @@ def validate(val_loader, model, criterion, device, metric_logger, epoch, config,
                         metric_logger.log_image(f"val/sample{sample_idx}/depth_continuous", depth_continuous_norm, step=epoch)
                         
                         # 确保记录一条日志，帮助诊断是否正确获取了连续深度预测
-                        metric_logger.logger.info(f"Val sample {sample_idx}: 记录连续深度预测 shape={tb_log_depth_continuous_pred.shape}, range=[{tb_log_depth_continuous_pred.min().item():.4f}, {tb_log_depth_continuous_pred.max().item():.4f}]")
+                        depth_logger.info(f"Val sample {sample_idx}: 记录连续深度预测 shape={tb_log_depth_continuous_pred.shape}, range=[{tb_log_depth_continuous_pred.min().item():.4f}, {tb_log_depth_continuous_pred.max().item():.4f}]")
                     if tb_log_depth_conf_map is not None: 
                         metric_logger.log_image(f"val/sample{sample_idx}/depth_conf_map", tb_log_depth_conf_map, step=epoch)
                     
@@ -1636,7 +1593,7 @@ def validate(val_loader, model, criterion, device, metric_logger, epoch, config,
         aggregated_metric_values = defaultdict(list) # To store lists of metric values for averaging
 
         if collected_samples_for_processing:
-            metric_logger.logger.info(f"Calculating detailed metrics for {len(collected_samples_for_processing)} validation samples...")
+            metrics_logger.info(f"Calculating detailed metrics for {len(collected_samples_for_processing)} validation samples...")
             # Loop through the collected samples to calculate detailed metrics
             for sample_data in tqdm(collected_samples_for_processing, desc="Calculating Detailed Val Metrics"):
                 pred_img_tensor = sample_data['output'] # Expected CPU tensor
@@ -1658,25 +1615,25 @@ def validate(val_loader, model, criterion, device, metric_logger, epoch, config,
                                     else: # Other depth metrics (MAE, RMSE)
                                         calculated_value = metric_func_handle(depth_pred_tensor, depth_gt_tensor)
                                 else:
-                                    metric_logger.logger.debug(f"Skipping depth metric {metric_name} for {sample_data['filename_suffix']}: depth_pred or depth_gt is None.")
+                                    debug_logger.debug(f"Skipping depth metric {metric_name} for {sample_data['filename_suffix']}: depth_pred or depth_gt is None.")
                             elif metric_name in metrics_module.FULL_REFERENCE_METRICS: # PSNR, SSIM, LPIPS, etc.
                                 if gt_img_tensor is not None:
                                     calculated_value = metric_func_handle(pred_img_tensor, gt_img_tensor)
                                 else:
-                                    metric_logger.logger.debug(f"Skipping FR metric {metric_name} for {sample_data['filename_suffix']}: gt_img is None.")
+                                    debug_logger.debug(f"Skipping FR metric {metric_name} for {sample_data['filename_suffix']}: gt_img is None.")
                             elif metric_name in metrics_module.NO_REFERENCE_METRICS: # UCIQE, NIQE, etc.
                                 calculated_value = metric_func_handle(pred_img_tensor)
                             else:
-                                metric_logger.logger.warning(f"Metric {metric_name} not categorized as DEPTH, FR, or NR. Skipping.")
+                                warning_logger.warning(f"Metric {metric_name} not categorized as DEPTH, FR, or NR. Skipping.")
 
                             if calculated_value is not None: # If the metric returned a single value
                                 if isinstance(calculated_value, (float, int)) and not (np.isnan(calculated_value) or np.isinf(calculated_value)):
                                     aggregated_metric_values[metric_name].append(calculated_value)
                                 elif isinstance(calculated_value, (float, int)) and (np.isnan(calculated_value) or np.isinf(calculated_value)):
-                                     metric_logger.logger.warning(f"Metric {metric_name} for {sample_data['filename_suffix']} resulted in NaN/Inf, not included in average.")
+                                     warning_logger.warning(f"Metric {metric_name} for {sample_data['filename_suffix']} resulted in NaN/Inf, not included in average.")
 
                         except Exception as e_metric_calculation:
-                            metric_logger.logger.error(f"Error calculating metric '{metric_name}' for sample {sample_data['filename_suffix']}: {e_metric_calculation}")
+                            error_logger.error(f"Error calculating metric '{metric_name}' for sample {sample_data['filename_suffix']}: {e_metric_calculation}")
             
             # Average all collected metric values
             for name, values_list in aggregated_metric_values.items():
@@ -1685,7 +1642,7 @@ def validate(val_loader, model, criterion, device, metric_logger, epoch, config,
                 else:
                     final_metrics_summary[name] = 0.0 # Default if no valid calculations (e.g., all samples skipped)
         else: # No samples collected for detailed metrics
-            metric_logger.logger.warning("No samples were collected for detailed metric calculations during validation.")
+            warning_logger.warning("No samples were collected for detailed metric calculations during validation.")
 
         # Log all averaged metrics to TensorBoard and console
         metric_logger.log_metrics(final_metrics_summary, prefix="val", step=epoch)
@@ -1709,7 +1666,7 @@ def validate(val_loader, model, criterion, device, metric_logger, epoch, config,
         save_metrics_text_on_disk_image = vis_config.get('val_images', {}).get('save_metrics', True)
         if save_val_imgs_to_disk and val_img_output_dir and collected_samples_for_processing:
             import matplotlib.pyplot as plt # Keep import local
-            metric_logger.logger.info(f"Saving {len(collected_samples_for_processing)} validation image sets to {val_img_output_dir}")
+            vis_logger.info(f"Saving {len(collected_samples_for_processing)} validation image sets to {val_img_output_dir}")
             
             for vis_item_data in tqdm(collected_samples_for_processing, desc="Saving Validation Images"):
                 img_filename_suffix = vis_item_data.get('filename_suffix', f'sample_e{epoch}_unknownidx')
@@ -1779,7 +1736,7 @@ def validate(val_loader, model, criterion, device, metric_logger, epoch, config,
     if not metrics_config_from_yaml.get('psnr', True) and epoch_total_batch_losses: 
         primary_metric_for_scheduler = -avg_epoch_loss 
     
-    # 使用多文件日志系统记录验证指标
+    # 使用多文件日志系统记录详细分类的验证指标
     if multi_logger:
         metrics_dict = {
             'val_loss': avg_epoch_loss,
@@ -1790,45 +1747,58 @@ def validate(val_loader, model, criterion, device, metric_logger, epoch, config,
             if k != 'psnr':  # 已经添加过了
                 metrics_dict[f'val_{k}'] = v
         
+        # 基本指标记录
         multi_logger.log_metrics(metrics_dict, epoch, prefix="val")
+        
+        # 将验证指标按类别分组记录
+        # 图像质量相关指标
+        image_metrics = {}
+        for k in ['psnr', 'ssim', 'lpips']:
+            if k in final_metrics_summary:
+                image_metrics[k] = final_metrics_summary[k]
+        if image_metrics:
+            multi_logger.log_validation(f"[验证] Epoch {epoch+1} 图像质量指标: " + 
+                                       ", ".join([f"{k}={v:.6f}" for k, v in image_metrics.items()]))
+        
+        # 深度相关指标
+        depth_metrics = {}
+        for k in final_metrics_summary:
+            if 'depth' in k.lower():
+                depth_metrics[k] = final_metrics_summary[k]
+        if depth_metrics:
+            multi_logger.log_depth(f"[验证] Epoch {epoch+1} 深度评估指标: " + 
+                                 ", ".join([f"{k}={v:.6f}" for k, v in depth_metrics.items()]))
+        
+        # 其他评估指标
+        other_metrics = {}
+        for k in final_metrics_summary:
+            if not any(term in k.lower() for term in ['psnr', 'ssim', 'lpips', 'depth']):
+                other_metrics[k] = final_metrics_summary[k]
+        if other_metrics:
+            multi_logger.log_validation(f"[验证] Epoch {epoch+1} 其他评估指标: " + 
+                                       ", ".join([f"{k}={v:.6f}" for k, v in other_metrics.items()]))
         
     return avg_epoch_loss, primary_metric_for_scheduler
 
 
 def distributed_worker(rank, world_size, config, args):
-    """
-    用于torch.multiprocessing.spawn的工作进程函数，
-    负责设置DDP环境并启动训练
+    """分布式训练的工作进程"""
+    # 设置当前进程的排名
+    args.local_rank = rank
     
-    Args:
-        rank (int): 当前进程的排名
-        world_size (int): 总进程数
-        config (dict): 配置字典
-        args (argparse.Namespace): 命令行参数
-    """
-    try:
-        # 将进程排名传递给原有的参数
-        args.local_rank = rank
-        args.distributed = True
-        
-        # 初始化进程组
-        dist.init_process_group(
-            backend=config['gpu'].get('backend', 'nccl'),
-            world_size=world_size,
-            rank=rank
-        )
-        
-        # 执行训练主循环
-        main_worker(config, args)
-    except Exception as e_dist: # Renamed exception variable
-        print(f"进程 {rank} 出错: {str(e_dist)}")
-        # 尝试获取详细的异常堆栈
-        import traceback
-        traceback.print_exc()
-        # 确保所有进程终止
-        if dist.is_initialized(): # Check before destroying
-            dist.destroy_process_group()
-        raise e_dist
+    # 设置进程组
+    dist.init_process_group(
+        backend='nccl',
+        init_method=f"env://",
+        world_size=world_size,
+        rank=rank
+    )
+    
+    # 确保每个进程有不同的随机种子
+    set_seed(args.seed + rank)
+    
+    # 每个进程都运行主工作函数
+    main_worker(config, args)
 
 
 def resume_from_checkpoint(checkpoint_dir: str,
@@ -1838,466 +1808,258 @@ def resume_from_checkpoint(checkpoint_dir: str,
                          device = None,
                          scaler = None) -> tuple:
     """
-    从检查点目录恢复训练，支持混合精度训练
-    
+    从检查点目录中找到最新的检查点并恢复模型、优化器、调度器状态
+
     Args:
-        checkpoint_dir (str): 包含检查点文件的目录
-        model (nn.Module): 要加载状态的模型
-        optimizer (Optimizer, optional): 要加载状态的优化器
-        scheduler (_LRScheduler, optional): 要加载状态的调度器
-        device: 加载设备
-        scaler: 混合精度训练的梯度缩放器
-        
+        checkpoint_dir: 包含检查点文件的目录
+        model: 模型实例
+        optimizer: 优化器实例
+        scheduler: 学习率调度器实例
+        device: 模型应该加载到的设备
+        scaler: GradScaler实例（用于混合精度训练）
+
     Returns:
-        epoch (int): 恢复的起始epoch
-        best_metric (float): 目前为止的最佳验证指标
+        A tuple containing:
+        - model: The loaded model
+        - optimizer: The loaded optimizer state
+        - scheduler: The loaded scheduler state
+        - scaler: The loaded GradScaler state
+        - start_epoch: The epoch to start training from
+        - best_metric: The best metric value from previous training
     """
-    # 查找最新的检查点
-    if not os.path.isdir(checkpoint_dir): # Check if dir exists
-        print(f"检查点目录不存在: {checkpoint_dir}")
-        return 0, 0.0
+    # 查找最新的检查点文件
+    if not os.path.isdir(checkpoint_dir):
+        logger.warning(f"检查点目录 '{checkpoint_dir}' 不存在，从头开始训练。")
+        return model, optimizer, scheduler, scaler, 0, 0.0
 
-    files = [f for f in os.listdir(checkpoint_dir) if f.endswith(".pth.tar")]
-    if not files:
-        print(f"在目录 {checkpoint_dir} 中未找到检查点文件。")
-        return 0, 0.0  # 没有找到检查点文件
-        
-    # 按修改时间排序，找到最新的检查点
-    # latest = max(files, key=lambda x: os.path.getmtime(os.path.join(checkpoint_dir, x)))
-    # Prioritize 'best_model.pth.tar' if available
-    best_checkpoint_name = 'best_model.pth.tar'
-    if best_checkpoint_name in files:
-        latest_file = best_checkpoint_name
-    else:
-        # Fallback to most recently modified .pth.tar if best_model is not found
-        latest_file = max(files, key=lambda x: os.path.getmtime(os.path.join(checkpoint_dir, x)))
+    checkpoints = [f for f in os.listdir(checkpoint_dir) if f.endswith('.pth')]
+    if not checkpoints:
+        logger.warning(f"在 '{checkpoint_dir}' 中没有找到检查点文件，从头开始训练。")
+        return model, optimizer, scheduler, scaler, 0, 0.0
 
-    
-    checkpoint_path = os.path.join(checkpoint_dir, latest_file)
-    print(f"从检查点恢复: {checkpoint_path}")
-    
-    # 加载检查点
-    map_location = device if device is not None else torch.device('cpu')
-    checkpoint = torch.load(checkpoint_path, map_location=map_location)
-    
-    # 加载模型权重
-    if 'state_dict' in checkpoint:
-        state_dict_to_load = checkpoint['state_dict'] # Renamed
-    elif isinstance(checkpoint, dict) and all(isinstance(k, str) for k in checkpoint.keys()): # Heuristic for raw state_dict
-        state_dict_to_load = checkpoint
-    else:
-        print(f"检查点格式无效: {checkpoint_path}")
-        return 0, 0.0
-        
-    # 处理DataParallel/DDP前缀
-    new_state_dict = {}
-    is_ddp_model = isinstance(model, DDP)
-    
-    for k, v in state_dict_to_load.items():
-        name = k
-        if k.startswith('module.') and not is_ddp_model:
-            name = k[7:]  # remove `module.`
-        elif not k.startswith('module.') and is_ddp_model:
-            name = 'module.' + k # add `module.`
-        new_state_dict[name] = v
-        
+    # 按修改时间排序，找到最新的文件
+    latest_checkpoint_path = max([os.path.join(checkpoint_dir, f) for f in checkpoints], key=os.path.getmtime)
+    logger.info(f"从最新的检查点恢复训练: {latest_checkpoint_path}")
+
     try:
-        model.load_state_dict(new_state_dict)
-    except RuntimeError as e_load:
-        print(f"加载模型状态字典时出错: {e_load}. 尝试非严格加载...")
+        # 加载检查点
+        checkpoint = torch.load(latest_checkpoint_path, map_location=device)
+        
+        # 恢复模型权重
+        # 兼容DDP和非DDP模型
+        model_to_load = model.module if hasattr(model, 'module') else model
+        
+        # 处理可能的状态字典键不匹配问题
+        state_dict = checkpoint['model_state_dict']
+        # 移除 'module.' 前缀 (如果存在)
+        if all(key.startswith('module.') for key in state_dict.keys()):
+            state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
+        
         try:
-            model.load_state_dict(new_state_dict, strict=False)
-            print("非严格加载模型状态成功。")
-        except RuntimeError as e_load_nostrict:
-            print(f"非严格加载模型状态也失败: {e_load_nostrict}")
-            return 0, 0.0 # Propagate error or handle as critical
-    
-    # 加载优化器状态
-    if optimizer is not None and 'optimizer' in checkpoint:
-        try:
-            optimizer.load_state_dict(checkpoint['optimizer'])
-            # 将优化器状态移动到正确的设备
-            if device is not None:
-                for state in optimizer.state.values():
-                    for k_opt, v_opt in state.items(): # Renamed loop vars
-                        if isinstance(v_opt, torch.Tensor):
-                            state[k_opt] = v_opt.to(device)
-        except Exception as e_optim: # Renamed exception var
-            print(f"警告: 无法加载优化器状态: {e_optim}")
-    
-    # 加载学习率调度器状态
-    if scheduler is not None and 'scheduler' in checkpoint:
-        try:
-            scheduler.load_state_dict(checkpoint['scheduler'])
-        except Exception as e_sched: # Renamed exception var
-            print(f"警告: 无法加载学习率调度器状态: {e_sched}")
-            
-    # 加载AMP梯度缩放器状态（用于混合精度训练）
-    if scaler is not None and 'scaler' in checkpoint:
-        try:
-            scaler.load_state_dict(checkpoint['scaler'])
-        except Exception as e_scaler: # Renamed exception var
-            print(f"警告: 无法加载混合精度缩放器状态: {e_scaler}")
-    
-    start_epoch_res = checkpoint.get('epoch', 0) # Renamed
-    best_metric_res = checkpoint.get('best_metric', 0.0) # Renamed
-    
-    return start_epoch_res, best_metric_res
+            model_to_load.load_state_dict(state_dict)
+        except RuntimeError as e:
+            logger.warning(f"加载模型状态时遇到严格模式错误: {e}")
+            logger.info("尝试以非严格模式加载...")
+            model_to_load.load_state_dict(state_dict, strict=False)
+
+        # 恢复优化器状态
+        if optimizer and 'optimizer_state_dict' in checkpoint:
+            try:
+                optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            except Exception as e:
+                logger.error(f"无法恢复优化器状态: {e}, 优化器将从头开始。")
+
+        # 恢复调度器状态
+        if scheduler and 'scheduler_state_dict' in checkpoint:
+            try:
+                scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+            except Exception as e:
+                logger.error(f"无法恢复调度器状态: {e}, 调度器将从头开始。")
+
+        # 恢复混合精度scaler状态
+        if scaler and 'scaler_state_dict' in checkpoint:
+            try:
+                scaler.load_state_dict(checkpoint['scaler_state_dict'])
+            except Exception as e:
+                logger.error(f"无法恢复混合精度scaler状态: {e}")
+
+        # 恢复训练轮次和最佳指标
+        start_epoch = checkpoint.get('epoch', 0)
+        best_metric = checkpoint.get('best_metric', 0.0)
+
+        logger.info(f"成功从 epoch {start_epoch} 恢复训练, 最佳PSNR为 {best_metric:.4f}")
+
+        return model, optimizer, scheduler, scaler, start_epoch, best_metric
+
+    except Exception as e:
+        logger.error(f"加载检查点 '{latest_checkpoint_path}' 失败: {e}")
+        logger.error(traceback.format_exc())
+        logger.warning("将从头开始训练。")
+        return model, optimizer, scheduler, scaler, 0, 0.0
 
 
 def main_worker(config, args):
-    """单进程/DDP训练主函数"""
-    # 导入torch以避免UnboundLocalError
-    import torch
-    import torch.nn as nn
+    """主工作函数，负责训练和验证"""
     
-    # ----- 初始化 -----
-    # 本地排名 (用于分布式训练)
-    local_rank = args.local_rank
+    # 1. 设置训练环境
+    setup_result = setup_training(args, config, args.local_rank)
     
-    # 只在主进程初始化日志
-    if local_rank == 0:
-        logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] [%(name)s] %(message)s')
+    # 在DDP模式下，mp.spawn会为每个进程调用此函数。
+    # setup_training会处理DDP进程的启动，完成后主进程可以退出
+    if setup_result is None:
+        return
+        
+    model = setup_result['model']
+    criterion = setup_result['criterion']
+    optimizer = setup_result['optimizer']
+    scheduler = setup_result['scheduler']
+    device = setup_result['device']
+    exp_dir = setup_result['exp_dir']
+    logger = setup_result['logger']
+    metric_logger = setup_result['metric_logger']
+    scaler = setup_result['scaler']
+    mixed_precision = setup_result['mixed_precision']
+    world_size = setup_result['world_size']
+    local_rank = setup_result['local_rank']
+    multi_logger = setup_result['multi_logger'] # 获取multi_logger
     
-    # 设置实验目录并保存配置
-    exp_dir = setup_experiment_dir(config)
-    
-    # 准备训练/验证数据
+    # 2. 准备数据
     data_loaders = prepare_data(config, args)
     train_loader = data_loaders['train_loader']
     val_loader = data_loaders['val_loader']
-    train_sampler = data_loaders.get('train_sampler')
-    val_sampler = data_loaders.get('val_sampler')
-    
-    # 设置设备、模型、优化器等
-    training_setup = setup_training(args, config, local_rank)
-    if training_setup is None: # Occurs if mp.spawn was called and this is the parent process
-        return
+    train_sampler = data_loaders['train_sampler']
 
-    device = training_setup['device']
-    model = training_setup['model']
-    criterion = training_setup['criterion']
-    optimizer = training_setup['optimizer']
-    scheduler = training_setup['scheduler']
-    scaler = training_setup['scaler']
-    mixed_precision = training_setup['mixed_precision']
-    exp_dir = training_setup['exp_dir'] # exp_dir is already defined above, re-assigning here
-    logger = training_setup['logger']
-    metric_logger = training_setup['metric_logger']
-    debug_logger = training_setup['debug_logger']
-    
-    # 记录设备信息
-    if torch.cuda.is_available():
-        logger.info(f"使用GPU: {torch.cuda.get_device_name(0)}")
-    if mixed_precision:
-        logger.info("启用混合精度训练")
-        
-    # 使用多文件日志系统记录训练开始信息
-    multi_logger = training_setup['multi_logger']
-    multi_logger.log_training_start(config)
-
-    # 记录数据集相关信息
-    data_logger = multi_logger.get_logger('data')
-    data_logger.info(f"训练数据根目录: {config['data'].get('train_root')}")
-    data_logger.info(f"验证数据根目录: {config['data'].get('val_root')}")
-    data_logger.info(f"退化类型: {config['data'].get('degradation_folders', ['raw'])}")
-    
-    # 日志记录模型架构
-    if config['visualization'].get('save_model_graph', False):
-        try:
-            # 使用一个示例输入记录模型图
-            dummy_input = torch.zeros(1, 3, 64, 64).to(device)
-            dummy_depth = torch.zeros(1, 1, 64, 64).to(device)
-            dummy_gt = None  # 推理阶段不使用GT
-            
-            # 使用简化的模型包装来处理 TensorBoard 图跟踪问题
-            class TracedModelWrapper(nn.Module):
-                def __init__(self, base_model):
-                    super().__init__()
-                    self.base_model = base_model
-                    
-                def forward(self, x):
-                    # 简化的前向传播，只处理图像输入，返回增强图像
-                    # ModelOutput对象通过属性访问而不是下标访问
-                    outputs = self.base_model(x)
-                    # 如果是ModelOutput对象，访问enhanced属性
-                    if hasattr(outputs, 'enhanced'):
-                        return outputs.enhanced
-                    # 兼容旧格式，如果是元组/列表则返回第一个元素
-                    elif isinstance(outputs, (tuple, list)) and len(outputs) > 0:
-                        return outputs[0]
-                    # 如果是字典类型，尝试获取'enhanced'键
-                    elif isinstance(outputs, dict) and 'enhanced' in outputs:
-                        return outputs['enhanced']
-                    # 如果都不是，直接返回输出（可能会失败，但至少尝试）
-                    return outputs
-
-            # 创建包装的模型用于图保存
-            traced_model = TracedModelWrapper(model)
-            # 确保模型处于评估模式
-            traced_model.eval()
-            
-            # 添加更详细的调试信息
-            logger.info(f"尝试记录模型图到TensorBoard，输入形状：{dummy_input.shape}")
-            
-            try:
-                # 先尝试使用跟踪功能
-                with torch.no_grad():
-                    # 直接尝试log_model_graph
-                    metric_logger.log_model_graph(traced_model, dummy_input)
-                    logger.info("模型架构已成功保存到TensorBoard")
-            except Exception as e_graph:
-                logger.warning(f"记录模型图结构失败: {str(e_graph)}")
-                # 添加更多诊断信息
-                logger.debug("尝试使用备用方法记录模型图...")
-                
-                try:
-                    # 备用方法：尝试使用trace_module
-                    import torch.jit
-                    with torch.no_grad():
-                        # 确保输入是设备匹配的
-                        dummy_input_on_device = dummy_input.to(next(traced_model.parameters()).device)
-                        # 尝试获取一个前向传播输出
-                        sample_output = traced_model(dummy_input_on_device)
-                        logger.debug(f"模型前向传播测试成功，输出类型: {type(sample_output)}")
-                        
-                        # 使用JIT跟踪模型
-                        logger.debug("尝试使用torch.jit.trace追踪模型...")
-                        traced = torch.jit.trace(traced_model, dummy_input_on_device)
-                        logger.debug("模型追踪成功，将其传递给TensorBoard")
-                        
-                        # 记录追踪后的模型
-                        metric_logger.tb_writer.add_graph(traced, dummy_input_on_device)
-                        logger.info("使用备用方法成功记录模型图到TensorBoard")
-                except Exception as e_trace:
-                    logger.error(f"备用方法记录模型图也失败: {str(e_trace)}")
-                    logger.debug(f"详细错误信息: {traceback.format_exc()}")
-                    logger.info("跳过模型图记录，继续训练过程")
-
-            # 替换为简化版本：
-            # 简化的模型图记录 - 避免设备不匹配问题
-            logger.info(f"尝试记录模型图到TensorBoard，输入形状：{dummy_input.shape}")
-            
-            try:
-                # 将模型和输入都移到CPU进行追踪，避免设备不匹配
-                with torch.no_grad():
-                    dummy_input_cpu = torch.zeros(1, 3, 64, 64)  # 直接在CPU上创建
-                    traced_model_cpu = TracedModelWrapper(model.cpu())  # 临时移到CPU
-                    traced_model_cpu.eval()
-                    
-                    # 使用CPU进行模型图追踪
-                    metric_logger.tb_writer.add_graph(traced_model_cpu, dummy_input_cpu)
-                    logger.info("模型架构已成功保存到TensorBoard (CPU模式)")
-                    
-                    # 将模型移回原设备
-                    model.to(device)
-                    
-            except Exception as e_graph:
-                logger.warning(f"记录模型图失败: {str(e_graph)}")
-                logger.info("跳过模型图记录，继续训练过程")
-        except Exception as e_outer:
-            logger.error(f"记录模型图过程中发生未捕获的错误: {str(e_outer)}")
-            logger.debug(f"外层错误详细信息: {traceback.format_exc()}")
-    
-    # ----- 断点续训处理 -----
-    checkpoint_dir = os.path.join(exp_dir, 'checkpoints')
+    # 3. 恢复训练 (如果需要)
     start_epoch = 0
-    best_psnr = 0.0
-    best_loss = float('inf')
+    best_metric = 0.0
+    checkpoint_dir = os.path.join(exp_dir, 'checkpoints')
     
-    # 检查是否从检查点继续训练
-    if args.resume and os.path.exists(checkpoint_dir):
-        start_epoch, best_metric = resume_from_checkpoint(
-            checkpoint_dir, model, optimizer, scheduler, device, scaler
+    # 打印日志，确认是否尝试恢复训练
+    if args.resume:
+        logger.info(f"正在尝试从检查点目录 '{checkpoint_dir}' 恢复训练...")
+        model, optimizer, scheduler, scaler, start_epoch, best_metric = resume_from_checkpoint(
+            checkpoint_dir=checkpoint_dir,
+            model=model,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            device=device,
+            scaler=scaler
         )
-        best_psnr = best_metric
-        logger.info(f"从epoch {start_epoch}继续训练，当前最佳PSNR: {best_psnr:.4f}")
-
-    # 输出调试信息到debug.log而非控制台
-    # Corrected access from config['model_params'] to config['model']
-    model_config_for_debug = config.get('model', {}) # Get the model config block safely
-    debug_logger.info("=== 模型架构信息 ===")
-    debug_logger.info(f"基础通道数: {model_config_for_debug.get('base_channels')}")
-    debug_logger.info(f"编码器层级数: {model_config_for_debug.get('levels')}")
-    debug_logger.info(f"注意力头数: {model_config_for_debug.get('heads')}")
-    debug_logger.info(f"瓶颈Transformer块数: {model_config_for_debug.get('bottleneck_blocks')}")
-    
-    # 添加UnderwaterEnhanceNet层级输出到debug文件中
-    debug_logger.info("\n=== UnderwaterEnhanceNet特征层级 ===")
-    debug_logger.info(f"SFE: 输入3通道 -> 输出{model_config_for_debug.get('base_channels')}通道")
-    debug_logger.info(f"编码器: {model_config_for_debug.get('levels')}级下采样，每级{model_config_for_debug.get('base_channels')}通道") # This might need adjustment based on actual encoder channel progression
-    debug_logger.info(f"Bottleneck: {model_config_for_debug.get('bottleneck_blocks')}个Transformer块")
-    debug_logger.info(f"解码器: {model_config_for_debug.get('levels')-1 if model_config_for_debug.get('levels') else 'N/A'}级上采样，PixelShuffle和自适应深度融合")
-    
-    # 仅评估模式（如果启用）
-    if args.eval_only and val_loader is not None:
-        logger.info("仅评估模式")
-        validate(
-            val_loader, model, criterion, device, metric_logger, 
-            0, config, mixed_precision
-        )
-        metric_logger.close() # Close logger in eval_only mode
+    else:
+        logger.info("不从检查点恢复，将从头开始训练。")
+        
+    # 如果只进行评估，直接进入验证流程
+    if args.eval_only:
+        logger.info("进入仅验证模式...")
+        validate(val_loader, model, criterion, device, metric_logger, start_epoch, config, mixed_precision, multi_logger)
+        logger.info("验证完成。")
         return
-    
-    # ----- 训练循环 -----
-    logger.info(f"开始训练... 总epoch数: {config['train']['epochs']}, "
-               f"批次大小: {config['data']['batch_size']}")
-
-    epochs = config['train']['epochs']
-    save_interval = config.get('train', {}).get('save_interval', 10)
-    save_best = config.get('train', {}).get('save_best', True)
-    val_interval = config.get('train', {}).get('val_interval', 1)
-
-    for epoch in range(start_epoch, epochs):
-        # 分布式采样器的 epoch 设定
-        if train_sampler is not None and hasattr(train_sampler, 'set_epoch'):
+        
+    # 记录模型图 (在开始训练前)
+    # 确保只在主进程上执行
+    if local_rank in [-1, 0]:
+        try:
+            # 由于模型包含动态操作，暂时跳过模型图记录
+            # 未来可以考虑使用torch.onnx.export或手动创建静态图
+            logger.info("跳过模型图记录 - 模型包含动态操作，无法被PyTorch JIT trace")
+            
+            # 可选：记录模型的基本信息
+            if hasattr(model, 'module'):
+                actual_model = model.module
+            else:
+                actual_model = model
+                
+            # 统计模型参数
+            total_params = sum(p.numel() for p in actual_model.parameters())
+            trainable_params = sum(p.numel() for p in actual_model.parameters() if p.requires_grad)
+            
+            metric_logger.log_text('model_info', 
+                f"模型参数统计:\n"
+                f"- 总参数数量: {total_params:,}\n"
+                f"- 可训练参数: {trainable_params:,}\n"
+                f"- 模型类型: {type(actual_model).__name__}", 
+                step=0)
+            
+        except Exception as e:
+            logger.error(f"记录模型信息失败: {e}", exc_info=True)
+            
+    # 4. 训练循环
+    logger.info("="*20 + " 开始训练 " + "="*20)
+    for epoch in range(start_epoch, config['train']['epochs']):
+        if args.distributed:
             train_sampler.set_epoch(epoch)
             
-        # 记录epoch开始
-        multi_logger.log_epoch_start(epoch, epochs)
-
-        # 训练一个 epoch
+        # 训练
         train_loss = train_epoch(
             train_loader, model, criterion, optimizer, device,
-            metric_logger, epoch, config, scaler, mixed_precision,
-            multi_logger=multi_logger
+            metric_logger, epoch, config, scaler, mixed_precision, multi_logger
         )
-
-        # 验证
-        val_psnr_for_scheduler = train_loss
-        if val_loader and (epoch + 1) % val_interval == 0:
-            current_val_loss, current_val_psnr = validate(
-                val_loader, model, criterion, device,
-                metric_logger, epoch, config, mixed_precision,
-                multi_logger=multi_logger
-            )
-            val_psnr_for_scheduler = current_val_psnr
-            logger.info(
-                f"Epoch {epoch+1}/{epochs} - "
-                f"Train Loss: {train_loss:.4f}, "
-                f"Val Loss: {current_val_loss:.4f}, "
-                f"Val PSNR: {current_val_psnr:.4f}"
-            )
-            is_best = current_val_psnr > best_psnr
-            if is_best:
-                best_psnr = current_val_psnr
-                logger.info(f"发现新的最佳模型，PSNR: {best_psnr:.4f}")
-        else:
-            is_best = train_loss < best_loss
-            if is_best:
-                best_loss = train_loss
-            logger.info(f"Epoch {epoch+1}/{epochs} - Train Loss: {train_loss:.4f}")
-
-        # 更新学习率
-        if scheduler is not None:
-            if config['scheduler']['name'] == 'plateau':
-                scheduler.step(val_psnr_for_scheduler)
-            else:
-                scheduler.step()
-
-        current_lr = optimizer.param_groups[0]['lr']
-        metric_logger.log_metrics({'lr': current_lr}, prefix='train', step=epoch)
-
-        # 使用多文件日志系统记录epoch结束信息
-        metrics_summary = {
-            'train_loss': train_loss,
-            'val_loss': current_val_loss if 'current_val_loss' in locals() else None,
-            'val_psnr': current_val_psnr if 'current_val_psnr' in locals() else None,
-            'lr': current_lr
-        }
-        multi_logger.log_epoch_end(epoch, metrics_summary)
         
-        # 保存检查点（仅主进程）
-        if local_rank <= 0:
-            if ((epoch + 1) % save_interval == 0) or (is_best and save_best):
-                checkpoint_save_dir = os.path.join(exp_dir, 'checkpoints')
-                os.makedirs(checkpoint_save_dir, exist_ok=True)
-                checkpoint_data = {
-                    'epoch': epoch + 1,
-                    'state_dict': model.state_dict(),
-                    'best_metric': best_psnr,
-                    'optimizer': optimizer.state_dict(),
-                }
-                if scheduler is not None:
-                    checkpoint_data['scheduler'] = scheduler.state_dict()
-                if mixed_precision and scaler is not None:
-                    checkpoint_data['scaler'] = scaler.state_dict()
-
-                save_checkpoint(checkpoint_data, is_best, checkpoint_save_dir, epoch=(epoch+1))
-                checkpoint_logger.info(
-                    f"Checkpoint saved at epoch {epoch+1} (best={is_best})"
-                )
-
-                if is_best and save_best:
-                    model_to_save = model.module if hasattr(model, 'module') else model
-                    torch.save(
-                        model_to_save.state_dict(),
-                        os.path.join(checkpoint_save_dir, 'best_model_weights.pth')
-                    )
-
-    # 保存最终模型
-    if local_rank <= 0:
-        final_model_dir = os.path.join(exp_dir, 'checkpoints')
-        os.makedirs(final_model_dir, exist_ok=True)
-        model_to_save_final = model.module if hasattr(model, 'module') else model
-        torch.save(
-            model_to_save_final.state_dict(),
-            os.path.join(final_model_dir, 'final_model_weights.pth')
+        # 验证
+        val_metric = validate(
+            val_loader, model, criterion, device, metric_logger,
+            epoch, config, mixed_precision, multi_logger
         )
-        final_path = os.path.join(final_model_dir, 'final_model_weights.pth')
-        logger.info(f"最终模型已保存到 {final_path}")
-        checkpoint_logger.info(f"Final model saved to {final_path}")
+        
+        # 更新学习率
+        if scheduler:
+            if isinstance(scheduler, optim.lr_scheduler.ReduceLROnPlateau):
+                scheduler.step(val_metric) # 基于验证指标更新
+            else:
+                scheduler.step() # 基于epoch更新
+        
+        # 保存检查点
+        if local_rank in [-1, 0]:
+            is_best = val_metric > best_metric
+            if is_best:
+                best_metric = val_metric
+            
+            save_checkpoint(
+                state={
+                    'epoch': epoch + 1,
+                    'model_state_dict': model.module.state_dict() if hasattr(model, 'module') else model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
+                    'best_metric': best_metric,
+                    'scaler_state_dict': scaler.state_dict() if scaler else None,
+                },
+                is_best=is_best,
+                checkpoint_dir=checkpoint_dir,
+                filename=f"checkpoint_epoch_{epoch+1}.pth"
+            )
+            logger.info(f"Epoch {epoch+1}: 已保存检查点，当前PSNR: {val_metric:.4f}, 最佳PSNR: {best_metric:.4f}")
 
-    if metric_logger is not None:
-        metric_logger.close()
+    logger.info("="*20 + " 训练完成 " + "="*20)
+    metric_logger.close()
 
 
 def main():
     # 解析命令行参数
     args = parse_args()
-    
-    # 加载配置文件
-    config = None # Initialize config
-    try:
-        with open(args.config, 'r') as f:
-            config = yaml.safe_load(f)
-    except FileNotFoundError:
-        logging.basicConfig(level=logging.ERROR, format='%(asctime)s [%(levelname)s] %(message)s')
-        logging.error(f"错误：配置文件 {args.config} 未找到。请检查路径是否正确。")
-        sys.exit(1)
-    except yaml.YAMLError as e_yaml: 
-        logging.basicConfig(level=logging.ERROR, format='%(asctime)s [%(levelname)s] %(message)s')
-        logging.error(f"错误：解析配置文件 {args.config} 失败：{e_yaml}")
-        sys.exit(1)
 
-    # Override args.log_level if specified in config for console_level
-    if config and 'logging' in config and isinstance(config['logging'], dict) and 'console_level' in config['logging']:
-        new_console_level = config['logging']['console_level'].upper()
-        # Validate the level string
-        if new_console_level in ['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL']:
-            # Use a temporary basic logger for this message if main logger isn't set up yet
-            # Or, since setup_actual_logger is called in setup_training, which is called in main_worker,
-            # this log message might not use the full-fledged logger if we print here.
-            # For now, let's assume it's okay or will be caught by the main logger eventually.
-            # print(f"Console log level set from YAML: {new_console_level}") # Changed to logger.info
-            logger.info(f"Console log level set from YAML to: {new_console_level}")
-            args.log_level = new_console_level
-        else:
-            # print(f"Warning: Invalid console_level '{config['logging']['console_level']}' in YAML. Using default/CLI.") # Changed to logger.warning
-            logger.warning(f"Invalid console_level '{config['logging']['console_level']}' in YAML. Using default/CLI instead.")
+    # 加载配置文件
+    with open(args.config, 'r') as f:
+        config = yaml.safe_load(f)
 
     # 设置随机种子
     set_seed(args.seed)
 
-    # 根据配置和参数决定是否进行分布式训练
-    # Check if config is loaded before accessing it for DDP
-    if config is not None and (args.distributed or config.get('gpu', {}).get('distributed')) and torch.cuda.device_count() > 1:
+    # 分布式训练处理
+    if args.distributed and torch.cuda.device_count() > 1:
+        # 使用mp.spawn启动分布式训练
         world_size = torch.cuda.device_count()
-        mp.spawn(distributed_worker, nprocs=world_size, args=(world_size, config, args))
+        os.environ['MASTER_ADDR'] = 'localhost'
+        os.environ['MASTER_PORT'] = str(random.randint(10000, 20000))
+        os.environ['WORLD_SIZE'] = str(world_size)
+        
+        mp.spawn(distributed_worker,
+                 args=(world_size, config, args),
+                 nprocs=world_size,
+                 join=True)
     else:
         # 单GPU或CPU训练
+        args.local_rank = -1
         main_worker(config, args)
-
 
 if __name__ == '__main__':
     main()

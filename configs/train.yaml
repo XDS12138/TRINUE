@@ -14,8 +14,8 @@ model:
   heads: 8
   bottleneck_blocks: 4
   encoder_window_size: 8 
-  bottleneck_window_size: 16  # 启用瓶颈窗口
-  decoder_block_window_size: 16  
+  bottleneck_window_size: 8  # 启用瓶颈窗口
+  decoder_block_window_size: 8
   depth_processor_config:
     double_channels: False
     use_cross_attn: true

@@ -40,15 +40,57 @@ class MultiFileLogger:
             datefmt='%H:%M:%S'
         )
         
-        # 分类名称
-        # 新增 'optimizer' 和 'checkpoint' 两个类别，用于记录优化器和检查点相关信息
-        self.categories = [
-            'train', 'loss', 'metrics', 'model', 'data',
-            'optimizer', 'checkpoint', 'error', 'debug'
-        ]
+        # 更新分类名称和描述
+        self.categories = {
+            # 训练过程相关
+            'train': '训练主流程日志（整体进度、epoch、迭代等）',
+            'validation': '验证过程相关日志',
+            
+            # 性能指标相关
+            'loss': '损失函数相关日志（所有损失组件的详细信息）',
+            'metrics': '评估指标相关日志（PSNR、SSIM等）',
+            
+            # 模型相关
+            'model': '模型结构、参数、前向传播等信息',
+            'architecture': '模型架构特定信息（网络层、特征等）',
+            
+            # 数据相关
+            'data': '数据集、数据加载、预处理等信息',
+            'dataloader': '数据加载器详细日志（批量大小、迭代次数等）',
+            
+            # 优化相关
+            'optimizer': '优化器配置、学习率、权重衰减等',
+            'gradient': '梯度信息、梯度裁剪等',
+            'scheduler': '学习率调度器相关日志',
+            
+            # 模型特定功能
+            'depth': '深度预测相关日志（深度损失、预测结果等）',
+            'physics': '物理模型相关日志（Beer-Lambert、深度条件PSF等）',
+            'attention': '注意力机制相关日志（交叉注意力、自注意力等）',
+            
+            # 系统相关
+            'checkpoint': '模型保存和加载相关信息',
+            'memory': '内存使用、CUDA内存等系统资源',
+            'gpu': 'GPU使用情况、利用率等',
+            
+            # 其他
+            'error': '错误信息和异常日志',
+            'warning': '警告信息',
+            'debug': '调试信息',
+            'experiment': '实验配置和环境信息',
+            'visualization': '可视化相关日志',
+            'uncertainty': '不确定性权重相关日志（自动加权训练）'
+        }
+
+        # 控制台显示的日志类别（其他只写入文件）
+        self.console_categories = ['train', 'validation', 'error', 'warning']
+        
+        # 是否在控制台输出所有类别的日志（如果console_level <= DEBUG）
+        if self.console_level <= logging.DEBUG:
+            self.console_categories = list(self.categories.keys())
 
         # 创建日志目录结构
-        for cat in self.categories + ['general']:
+        for cat in list(self.categories.keys()) + ['general']:
             os.makedirs(os.path.join(self.log_dir, cat), exist_ok=True)
 
         # 各logger实例及其当前文件handler
@@ -56,7 +98,7 @@ class MultiFileLogger:
         self.file_handlers = {}
 
         for cat in self.categories:
-            self.loggers[cat] = self._create_logger(cat)
+            self.loggers[cat] = self._create_logger(cat, self.categories[cat])
             self.file_handlers[cat] = None
 
         # 设置根logger，捕获未分类的日志
@@ -64,7 +106,9 @@ class MultiFileLogger:
         self.file_handlers['general'] = None
         
         # 记录日志系统初始化
-        self.loggers['train'].info(f"Multi-file logging system initialized. Logs directory: {log_dir}")
+        self.loggers['train'].info(f"多文件日志系统初始化完成. 日志目录: {log_dir}")
+        self.loggers['experiment'].info(f"已配置 {len(self.categories)} 个日志类别")
+        self.loggers['experiment'].info(f"控制台日志级别: {console_level}, 文件日志级别: {file_level}")
         
     def _create_logger(self, name: str, description: str = "") -> logging.Logger:
         """
@@ -85,14 +129,14 @@ class MultiFileLogger:
         logger.handlers = []
 
         # 控制台handler - 根据logger类型决定是否添加
-        if name in ['train', 'error'] or self.console_level <= logging.DEBUG:
+        if name in self.console_categories:
             console_handler = logging.StreamHandler(sys.stdout)
             console_handler.setLevel(self.console_level)
             console_handler.setFormatter(self.console_formatter)
             logger.addHandler(console_handler)
         
         # 记录logger创建
-        logger.debug(f"Logger '{name}' created - {description}")
+        logger.debug(f"Logger '{name}' 创建完成 - {description}")
         
         return logger
     
@@ -113,7 +157,7 @@ class MultiFileLogger:
         # 设置警告捕获
         def custom_showwarning(message, category, filename, lineno, file=None, line=None):
             warning_msg = warnings.formatwarning(message, category, filename, lineno, line)
-            self.loggers['error'].warning(warning_msg.strip())
+            self.loggers['warning'].warning(warning_msg.strip())
         
         warnings.showwarning = custom_showwarning
 
@@ -124,7 +168,7 @@ class MultiFileLogger:
 
         self.current_epoch = epoch
 
-        target_categories = self.categories + ['general']
+        target_categories = list(self.categories.keys()) + ['general']
 
         for cat in target_categories:
             logger = logging.getLogger() if cat == 'general' else self.loggers[cat]
@@ -150,27 +194,38 @@ class MultiFileLogger:
         获取指定类型的logger
         
         Args:
-            logger_type: logger类型 ('train', 'loss', 'metrics', 'model',
-                                    'data', 'optimizer', 'checkpoint',
-                                    'error', 'debug')
+            logger_type: logger类型名称
             
         Returns:
             对应的logger实例
         """
-        return self.loggers.get(logger_type, self.loggers['debug'])
+        if logger_type not in self.categories:
+            self.loggers['warning'].warning(f"请求了未知类型的logger: '{logger_type}'，使用debug logger代替")
+            return self.loggers['debug']
+        return self.loggers[logger_type]
     
     def log_training_start(self, config: dict):
         """记录训练开始的信息"""
         train_logger = self.loggers['train']
+        exp_logger = self.loggers['experiment']
+        
         train_logger.info("="*80)
-        train_logger.info("TRAINING STARTED")
+        train_logger.info("训练开始")
         train_logger.info("="*80)
-        train_logger.info(f"Experiment: {config.get('experiment', {}).get('name', 'unnamed')}")
-        train_logger.info(f"Epochs: {config.get('train', {}).get('epochs', 'N/A')}")
-        train_logger.info(f"Batch size: {config.get('data', {}).get('batch_size', 'N/A')}")
-        train_logger.info(f"Learning rate: {config.get('optimizer', {}).get('lr', 'N/A')}")
-        train_logger.info(f"Mixed precision: {config.get('gpu', {}).get('mixed_precision', False)}")
-        train_logger.info("="*80)
+        
+        # 记录基本配置到experiment日志
+        exp_logger.info("="*80)
+        exp_logger.info("实验配置信息")
+        exp_logger.info("="*80)
+        exp_logger.info(f"实验名称: {config.get('experiment', {}).get('name', 'unnamed')}")
+        exp_logger.info(f"总训练轮次: {config.get('train', {}).get('epochs', 'N/A')}")
+        exp_logger.info(f"批量大小: {config.get('data', {}).get('batch_size', 'N/A')}")
+        exp_logger.info(f"学习率: {config.get('optimizer', {}).get('lr', 'N/A')}")
+        exp_logger.info(f"优化器: {config.get('optimizer', {}).get('name', 'N/A')}")
+        exp_logger.info(f"调度器: {config.get('scheduler', {}).get('name', 'N/A')}")
+        exp_logger.info(f"混合精度: {config.get('gpu', {}).get('mixed_precision', False)}")
+        exp_logger.info(f"分布式训练: {config.get('gpu', {}).get('distributed', False)}")
+        exp_logger.info("="*80)
 
         # 初始化第一轮日志文件
         self._attach_epoch_file_handlers(0)
@@ -179,23 +234,36 @@ class MultiFileLogger:
         """记录epoch开始"""
         self._attach_epoch_file_handlers(epoch)
         self.loggers['train'].info(f"\n{'='*60}")
-        self.loggers['train'].info(f"Epoch {epoch+1}/{total_epochs} started")
+        self.loggers['train'].info(f"Epoch {epoch+1}/{total_epochs} 开始")
         self.loggers['train'].info(f"{'='*60}")
     
     def log_epoch_end(self, epoch: int, metrics: dict):
         """记录epoch结束和总结"""
         train_logger = self.loggers['train']
-        train_logger.info(f"Epoch {epoch+1} completed")
+        metrics_logger = self.loggers['metrics']
+        
+        train_logger.info(f"Epoch {epoch+1} 完成")
         
         # 记录主要指标
+        metrics_list = []
         if 'train_loss' in metrics:
-            train_logger.info(f"  Train Loss: {metrics['train_loss']:.4f}")
+            metrics_list.append(f"Train Loss: {metrics['train_loss']:.4f}")
         if 'val_loss' in metrics:
-            train_logger.info(f"  Val Loss: {metrics['val_loss']:.4f}")
+            metrics_list.append(f"Val Loss: {metrics['val_loss']:.4f}")
         if 'val_psnr' in metrics:
-            train_logger.info(f"  Val PSNR: {metrics['val_psnr']:.2f}")
+            metrics_list.append(f"Val PSNR: {metrics['val_psnr']:.2f}")
         if 'lr' in metrics:
-            train_logger.info(f"  Learning Rate: {metrics['lr']:.6f}")
+            metrics_list.append(f"LR: {metrics['lr']:.6f}")
+            
+        train_logger.info(f"  指标汇总: {' | '.join(metrics_list)}")
+        
+        # 详细记录到metrics日志
+        metrics_logger.info(f"Epoch {epoch+1} 指标详情:")
+        for k, v in metrics.items():
+            if isinstance(v, float):
+                metrics_logger.info(f"  {k}: {v:.6f}")
+            else:
+                metrics_logger.info(f"  {k}: {v}")
     
     def log_loss(self, losses: dict, step: int, prefix: str = "train"):
         """记录损失值"""
@@ -213,7 +281,7 @@ class MultiFileLogger:
                 components.append(f"{k}={v:.6f}")
         
         if components:
-            loss_logger.debug(f"[{prefix}] Step {step}: Components - {', '.join(components)}")
+            loss_logger.info(f"[{prefix}] Step {step}: Components - {', '.join(components)}")
     
     def log_metrics(self, metrics: dict, step: int, prefix: str = "val"):
         """记录评估指标"""
@@ -236,16 +304,40 @@ class MultiFileLogger:
         log_func = getattr(model_logger, level.lower(), model_logger.info)
         log_func(message)
     
+    def log_architecture(self, message: str, level: str = "info"):
+        """记录模型架构相关信息"""
+        arch_logger = self.loggers['architecture']
+        log_func = getattr(arch_logger, level.lower(), arch_logger.info)
+        log_func(message)
+    
     def log_data_info(self, message: str, level: str = "info"):
         """记录数据相关信息"""
         data_logger = self.loggers['data']
         log_func = getattr(data_logger, level.lower(), data_logger.info)
+        log_func(message)
+    
+    def log_dataloader(self, message: str, level: str = "info"):
+        """记录数据加载器信息"""
+        loader_logger = self.loggers['dataloader']
+        log_func = getattr(loader_logger, level.lower(), loader_logger.info)
         log_func(message)
 
     def log_optimizer(self, message: str, level: str = "info"):
         """记录优化器相关信息"""
         opt_logger = self.loggers['optimizer']
         log_func = getattr(opt_logger, level.lower(), opt_logger.info)
+        log_func(message)
+    
+    def log_scheduler(self, message: str, level: str = "info"):
+        """记录学习率调度器信息"""
+        scheduler_logger = self.loggers['scheduler']
+        log_func = getattr(scheduler_logger, level.lower(), scheduler_logger.info)
+        log_func(message)
+    
+    def log_gradient(self, message: str, level: str = "info"):
+        """记录梯度相关信息"""
+        grad_logger = self.loggers['gradient']
+        log_func = getattr(grad_logger, level.lower(), grad_logger.info)
         log_func(message)
 
     def log_checkpoint(self, message: str, level: str = "info"):
@@ -254,17 +346,71 @@ class MultiFileLogger:
         log_func = getattr(ckpt_logger, level.lower(), ckpt_logger.info)
         log_func(message)
     
+    def log_memory(self, message: str, level: str = "info"):
+        """记录内存使用情况"""
+        mem_logger = self.loggers['memory']
+        log_func = getattr(mem_logger, level.lower(), mem_logger.info)
+        log_func(message)
+    
+    def log_gpu(self, message: str, level: str = "info"):
+        """记录GPU使用情况"""
+        gpu_logger = self.loggers['gpu']
+        log_func = getattr(gpu_logger, level.lower(), gpu_logger.info)
+        log_func(message)
+    
+    def log_visualization(self, message: str, level: str = "info"):
+        """记录可视化相关信息"""
+        viz_logger = self.loggers['visualization']
+        log_func = getattr(viz_logger, level.lower(), viz_logger.info)
+        log_func(message)
+    
     def log_error(self, message: str, exc_info=None):
         """记录错误信息"""
         self.loggers['error'].error(message, exc_info=exc_info)
     
     def log_warning(self, message: str):
         """记录警告信息"""
-        self.loggers['error'].warning(message)
+        self.loggers['warning'].warning(message)
     
     def log_debug(self, message: str):
         """记录调试信息"""
         self.loggers['debug'].debug(message)
+    
+    def log_experiment(self, message: str, level: str = "info"):
+        """记录实验配置和环境信息"""
+        exp_logger = self.loggers['experiment']
+        log_func = getattr(exp_logger, level.lower(), exp_logger.info)
+        log_func(message)
+    
+    def log_depth(self, message: str, level: str = "info"):
+        """记录深度预测相关信息"""
+        depth_logger = self.loggers['depth']
+        log_func = getattr(depth_logger, level.lower(), depth_logger.info)
+        log_func(message)
+    
+    def log_physics(self, message: str, level: str = "info"):
+        """记录物理模型相关信息"""
+        physics_logger = self.loggers['physics']
+        log_func = getattr(physics_logger, level.lower(), physics_logger.info)
+        log_func(message)
+    
+    def log_attention(self, message: str, level: str = "info"):
+        """记录注意力机制相关信息"""
+        attn_logger = self.loggers['attention']
+        log_func = getattr(attn_logger, level.lower(), attn_logger.info)
+        log_func(message)
+    
+    def log_uncertainty(self, message: str, level: str = "info"):
+        """记录不确定性权重相关信息"""
+        uncertainty_logger = self.loggers['uncertainty']
+        log_func = getattr(uncertainty_logger, level.lower(), uncertainty_logger.info)
+        log_func(message)
+    
+    def log_validation(self, message: str, level: str = "info"):
+        """记录验证相关日志"""
+        validation_logger = self.loggers['validation']
+        log_func = getattr(validation_logger, level.lower(), validation_logger.info)
+        log_func(message)
     
     def close(self):
         """关闭所有logger的handlers"""
