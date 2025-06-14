@@ -1,3 +1,5 @@
+Trident-Former: Physically-Decoupled Underwater Enhancement Fueled by a High-Fidelity Synthetic Dataset
+
 ## 摘要
 水下图像增强在水下视觉任务中扮演着关键角色，其效果直接影响着诸如资源勘测、生态监测与自主导航等系统的可靠性。
 然而，由于水体中光的散射与折射引发的复杂退化机制，现有方法常常难以兼顾色彩校正与结构还原，尤其在面对严重的图像模糊、边缘漂移与纹理丢失时表现乏力。
