@@ -553,4 +553,52 @@ DEPTH_METRICS = [
     "depth_mae",
     "depth_rmse",
     "depth_delta"
-] 
+]
+
+def calculate_depth_statistics(pred: Union[torch.Tensor, np.ndarray], 
+                              gt: Union[torch.Tensor, np.ndarray]) -> Dict[str, float]:
+    """
+    Calculate comprehensive depth statistics including MAE, RMSE, AbsRel, SqRel
+    
+    Args:
+        pred: Predicted depth map
+        gt: Ground truth depth map
+        
+    Returns:
+        Dict containing various depth metrics
+    """
+    pred_np = _prepare_image_for_metric(pred, target_range_0_1=False).squeeze()
+    gt_np = _prepare_image_for_metric(gt, target_range_0_1=False).squeeze()
+    
+    # Resize if shapes don't match
+    if pred_np.shape != gt_np.shape:
+        pred_tensor = torch.from_numpy(pred_np).unsqueeze(0).unsqueeze(0)
+        pred_resized = F.interpolate(pred_tensor, size=gt_np.shape[-2:], mode='bilinear', align_corners=False)
+        pred_np = pred_resized.squeeze().numpy()
+    
+    if pred_np.shape != gt_np.shape:
+        print(f"Depth statistics: pred shape {pred_np.shape} and gt shape {gt_np.shape} mismatch. Returning zeros.")
+        return {'mae': 0.0, 'rmse': 0.0, 'abs_rel': 0.0, 'sq_rel': 0.0}
+    
+    # Create valid mask (avoid division by zero)
+    valid_mask = (gt_np > 1e-3) & (pred_np > 1e-3)
+    
+    if not np.any(valid_mask):
+        print("Depth statistics: No valid pixels for comparison.")
+        return {'mae': 0.0, 'rmse': 0.0, 'abs_rel': 0.0, 'sq_rel': 0.0}
+    
+    pred_valid = pred_np[valid_mask]
+    gt_valid = gt_np[valid_mask]
+    
+    # Calculate metrics
+    mae = np.mean(np.abs(pred_valid - gt_valid))
+    rmse = np.sqrt(np.mean((pred_valid - gt_valid) ** 2))
+    abs_rel = np.mean(np.abs(pred_valid - gt_valid) / gt_valid)
+    sq_rel = np.mean(((pred_valid - gt_valid) ** 2) / gt_valid)
+    
+    return {
+        'mae': float(mae),
+        'rmse': float(rmse),
+        'abs_rel': float(abs_rel),
+        'sq_rel': float(sq_rel)
+    } 

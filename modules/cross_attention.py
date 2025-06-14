@@ -82,6 +82,10 @@ class CrossAttention(nn.Module):
     def forward(self, rgb_feat: torch.Tensor, dep_feat: torch.Tensor) -> torch.Tensor:
         B, C, H, W = rgb_feat.shape
 
+        # 清理之前的注意力图引用
+        if hasattr(self, 'last_attn'):
+            self.last_attn = None
+
         # -- 1×1 conv 先做，再按需打窗 --
         q = self.to_q(rgb_feat)
         k = self.to_k(dep_feat)
@@ -103,9 +107,11 @@ class CrossAttention(nn.Module):
         q = q.view(B_, self.heads, self.d_k, H_*W_)
         k = k.view(B_, self.heads, self.d_k, H_*W_)
         v = v.view(B_, self.heads, self.d_k, H_*W_)
-        # 计算注意力: qᵀ·k → [B, heads, N, N]
+        
+        # 计算注意力
         attn = torch.einsum('bhcN,bhcM->bhNM', q, k) / math.sqrt(self.d_k)
         attn = torch.softmax(attn, dim=-1)
+        out = torch.einsum('bhNM,bhcM->bhcN', attn, v)
         
         # 保存注意力图（如果启用）
         if self.save_attention:
@@ -113,14 +119,14 @@ class CrossAttention(nn.Module):
             if pad_hw is not None:
                 # 这里实现窗口注意力的合并比较复杂，简化为仅保存第一个窗口的注意力
                 # 在实际实现中可能需要更复杂的合并逻辑
-                self.last_attn = attn[:B, :, :, :].detach()
+                self.last_attn = attn[:B, :, :, :].detach().clone()
                 print(f"[CrossAttention] 保存窗口注意力图: shape={self.last_attn.shape}")
             else:
-                self.last_attn = attn.detach()
+                self.last_attn = attn.detach().clone()
                 print(f"[CrossAttention] 保存全局注意力图: shape={self.last_attn.shape}")
         
-        # 加权 v: attn @ vᵀ → [B, heads, N, d_k]
-        out = torch.einsum('bhNM,bhcM->bhcN', attn, v)
+            # 立即断开与原始计算图的所有连接
+            self.last_attn.requires_grad_(False)
         # 恢复形状: [B, C, H, W]
         out = out.contiguous().view(B_, C, H_, W_)
 

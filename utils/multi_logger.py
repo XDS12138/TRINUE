@@ -247,13 +247,25 @@ class MultiFileLogger:
         # 记录主要指标
         metrics_list = []
         if 'train_loss' in metrics:
-            metrics_list.append(f"Train Loss: {metrics['train_loss']:.4f}")
+            train_loss = metrics['train_loss']
+            if isinstance(train_loss, (tuple, list)):
+                train_loss = train_loss[0]  # 取第一个元素
+            metrics_list.append(f"Train Loss: {train_loss:.4f}")
         if 'val_loss' in metrics:
-            metrics_list.append(f"Val Loss: {metrics['val_loss']:.4f}")
+            val_loss = metrics['val_loss']
+            if isinstance(val_loss, (tuple, list)):
+                val_loss = val_loss[0]  # 取第一个元素
+            metrics_list.append(f"Val Loss: {val_loss:.4f}")
         if 'val_psnr' in metrics:
-            metrics_list.append(f"Val PSNR: {metrics['val_psnr']:.2f}")
+            val_psnr = metrics['val_psnr']
+            if isinstance(val_psnr, (tuple, list)):
+                val_psnr = val_psnr[0]  # 取第一个元素
+            metrics_list.append(f"Val PSNR: {val_psnr:.2f}")
         if 'lr' in metrics:
-            metrics_list.append(f"LR: {metrics['lr']:.6f}")
+            lr = metrics['lr']
+            if isinstance(lr, (tuple, list)):
+                lr = lr[0]  # 取第一个元素
+            metrics_list.append(f"LR: {lr:.6f}")
             
         train_logger.info(f"  指标汇总: {' | '.join(metrics_list)}")
         

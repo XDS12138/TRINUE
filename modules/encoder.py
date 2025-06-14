@@ -53,8 +53,8 @@ class RawEncoder(nn.Module):
 
         # === 一、准备 Depth 投影层，用于把深度特征映射到和当前层级一致的通道数 ===
         self.depth_projections = nn.ModuleList()
-        # 计算每级 depth 输入通道数：level 0 总是 base_channels；后续由配置决定是否翻倍
-        expected_depth_channels = [base_channels] + self.channels[:-1]
+        # 计算每级 depth 输入通道数：与DepthDecoder的输出一致，都是递增的
+        expected_depth_channels = [base_channels * (2**i) for i in range(levels)]
 
         for i in range(levels):
             in_ch = expected_depth_channels[i]
@@ -207,28 +207,13 @@ class RawEncoder(nn.Module):
                         logger.debug(f"RawEncoder: Level {i} depth_feat shape before projection: {current_depth.shape}")
                         logger.debug(f"RawEncoder: Level {i} RGB feat shape: {current_x.shape}")
                     
-                    # 检查通道数是否匹配投影层的输入通道
+                    # 检查通道数是否匹配投影层的输入通道 - 现在应该不会出现不匹配
                     if current_depth.shape[1] != self.depth_projections[i].weight.shape[1]:
-                        logger.warning(f"RawEncoder: Level {i} depth_feat channel mismatch. "
-                                       f"Expected: {self.depth_projections[i].weight.shape[1]}, "
-                                       f"Got: {current_depth.shape[1]}")
-                        
-                        # 创建临时适配层处理通道数不匹配
-                        temp_adapter = nn.Conv2d(
-                            current_depth.shape[1], 
-                            self.depth_projections[i].weight.shape[1], 
-                            kernel_size=1, 
-                            bias=False
-                        ).to(current_depth.device)
-                        
-                        # 初始化权重以保留信息
-                        nn.init.ones_(temp_adapter.weight[:, :min(current_depth.shape[1], 
-                                                                  self.depth_projections[i].weight.shape[1]), :, :])
-                        
-                        # 应用适配层
-                        current_depth = temp_adapter(current_depth)
-                        logger.info(f"RawEncoder: Adapted Level {i} depth_feat channels from "
-                                    f"{current_depth.shape[1]} to {self.depth_projections[i].weight.shape[1]}")
+                        logger.error(f"RawEncoder: Level {i} depth_feat channel mismatch. "
+                                     f"Expected: {self.depth_projections[i].weight.shape[1]}, "
+                                     f"Got: {current_depth.shape[1]}. "
+                                     f"这不应该发生，请检查depth_feats的生成逻辑。")
+                        raise ValueError(f"深度特征通道数不匹配：{current_depth.shape[1]} vs {self.depth_projections[i].weight.shape[1]}")
                     
                     current_depth_projected = self.depth_projections[i](current_depth)
                 else:

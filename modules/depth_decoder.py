@@ -21,6 +21,7 @@ class DepthDecoder(nn.Module):
     def __init__(self, base_c=48, levels=4, window=4):
         super().__init__()
         self.levels = levels
+        self.base_c = base_c  # 保存base_c用于后续计算
         ch = [base_c * 2**i for i in range(levels)][::-1]   # H/16→H
         self.ups = nn.ModuleList()
         self.skip_proj = nn.ModuleList()
@@ -43,6 +44,10 @@ class DepthDecoder(nn.Module):
             in_c = out_c
 
         self.pred = nn.Conv2d(ch[-1], 1, 3, padding=1)
+        
+        # 移除冗余的channel_adapters，由RawEncoder统一管理通道适配
+        # DepthDecoder现在直接输出与自身架构一致的通道数
+        logger.info(f"DepthDecoder initialized with levels={levels}, channels={ch}")
 
     def forward(self, bottleneck, skip_feats):
         # 检查skip_feats长度
@@ -73,6 +78,11 @@ class DepthDecoder(nn.Module):
         # 记录每层特征的形状，便于调试
         logger.debug(f"DepthDecoder bottleneck shape: {bottleneck.shape}")
         
+        # 保存每个层次的特征，用于与投影层期望的通道数匹配
+        level_features = []
+        # 保存原始bottleneck用于最深层特征
+        original_bottleneck = bottleneck
+        
         for i in range(self.levels-1):
             x = self.ups[i](x)
             logger.debug(f"DepthDecoder after upsampling[{i}]: shape={x.shape}")
@@ -96,13 +106,40 @@ class DepthDecoder(nn.Module):
             x = self.blocks[i](x)
             logger.debug(f"DepthDecoder after block[{i}]: shape={x.shape}")
             
-            # 插入到输出特征列表的前面（从深到浅的顺序）
-            depth_feats.insert(0, x)
+            # 保存每一层的特征
+            level_features.append(x)
         
-        # 生成最终深度预测并添加到特征列表开头
+        # 生成最终深度预测
         depth_pred = torch.sigmoid(self.pred(x))
         logger.debug(f"DepthDecoder final prediction shape: {depth_pred.shape}")
-        depth_feats.insert(0, depth_pred)
+        
+        # 构建depth_feats列表，按照从浅到深的顺序（与encoder一致）
+        # level_features存储了上采样过程中的特征：[192ch@16x16, 96ch@32x32, 48ch@64x64]
+        # 最终的x是48ch@64x64
+        depth_feats = []
+        
+        # 第0级：最浅层，使用最后处理的x（48通道）
+        depth_feats.append(x)  # 48 channels
+        
+        # 第1级：96通道，从level_features倒数第二个取
+        if len(level_features) >= 2:
+            depth_feats.append(level_features[-2])  # 96 channels
+        else:
+            depth_feats.append(x)  # fallback
+            
+        # 第2级：192通道，从level_features倒数第三个取  
+        if len(level_features) >= 3:
+            depth_feats.append(level_features[-3])  # 192 channels
+        else:
+            depth_feats.append(level_features[-1] if level_features else x)  # fallback
+            
+        # 第3级：384通道，使用原始bottleneck（最深层）
+        depth_feats.append(original_bottleneck)  # 384 channels
+            
+        # 确保depth_feats长度正确
+        while len(depth_feats) < self.levels:
+            depth_feats.append(depth_feats[-1])  # 用最后一个填充
+        depth_feats = depth_feats[:self.levels]  # 截断到正确长度
         
         # 打印所有特征形状以便调试
         logger.debug(f"DepthDecoder output feature shapes: {[f.shape for f in depth_feats]}")

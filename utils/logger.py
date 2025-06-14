@@ -736,13 +736,14 @@ art)."""
         """
         self.tb_writer.add_graph(model, input_tensor)
 
-    def log_model_parameters(self, model, step: int = None):
+    def log_model_parameters(self, model, step: int = None, log_gradients: bool = True):
         """
         Log parameter statistics of model layers.
         
         Args:
             model: PyTorch model
             step: Global step; defaults to current global_step
+            log_gradients: Whether to log gradient histograms (can be expensive)
         """
         for name, param in model.named_parameters():
             if param.requires_grad:
@@ -751,7 +752,7 @@ art)."""
                     self.tb_writer.add_histogram(f"params/{name}", param, step or self.global_step)
                 
                 # 梯度需要检查是否为None和是否包含有效值
-                if param.grad is not None:
+                if log_gradients and param.grad is not None:
                     # 确保梯度是有限值且不为空
                     if torch.isfinite(param.grad).all() and param.grad.numel() > 0:
                         self.tb_writer.add_histogram(f"grads/{name}", param.grad, step or self.global_step)

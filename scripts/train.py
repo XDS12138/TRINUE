@@ -44,7 +44,7 @@ from utils.logger import setup_logger, MetricLogger
 
 def custom_showwarning(message, category, filename, lineno, file=None, line=None):
     """自定义的警告处理函数，将 Python 警告转为 logger 日志输出。"""
-    # 格式化警告信息，生成类似 “'filename:lineno: category: message'" 的字符串
+    # 格式化警告信息，生成类似 "'filename:lineno: category: message'" 的字符串
     log_message = warnings.formatwarning(message, category, filename, lineno, line)
     # 使用名为 'py.warnings' 的 logger 记录 WARNING 级别的日志
     # strip() 用于去除末尾可能多余的换行符
@@ -66,7 +66,7 @@ from modules.loss_fn import TotalLoss, DepthEdgeColorLoss
 from modules.depth import get_depth_config_params, ensure_normalized_depth
 from utils.checkpoint import save_checkpoint
 from utils.lr_scheduler import get_scheduler
-from utils.metrics import calculate_psnr as compute_psnr, calculate_ssim as compute_ssim
+from utils.metrics import calculate_psnr as compute_psnr, calculate_ssim as compute_ssim, calculate_depth_statistics
 from utils import metrics as metrics_module  # 如果需要使用所有指标
 
 def setup_logging_system(exp_dir, config):
@@ -281,10 +281,6 @@ def setup_training(args, config, local_rank):
         lambda_smooth=config['loss']['lambda_smooth'],
         lambda_decl=config['loss'].get('lambda_decl', 0.1),  # 深度边缘颜色损失权重
         lambda_cons=config['loss'].get('lambda_cons', 0.1),  # 注意力一致性损失权重
-        lambda_phy_A=config['loss'].get('lambda_phy_A', 0.1),   # 物理一致性A损失权重
-        lambda_phy_D=config['loss'].get('lambda_phy_D', 0.1),   # 物理一致性D损失权重
-        beta_c=model.beta_c if hasattr(model, 'beta_c') else None,  # 从模型获取Beer-Lambert衰减系数
-        B_c=model.B_c if hasattr(model, 'B_c') else None,           # 从模型获取全局背景光
         use_uncertainty_weighting=config['loss'].get('use_uncertainty_weighting', True)  # 从配置中读取是否使用自动调参
     )
     criterion = criterion.to(device)
@@ -325,19 +321,24 @@ def setup_training(args, config, local_rank):
     experiment_logger = multi_logger.get_logger('experiment')  # 实验配置日志
     gpu_logger = multi_logger.get_logger('gpu')  # GPU使用日志
     
-    # 参数分组，将交叉注意力参数和其他参数分开，应用不同的学习率
-    base_params, attn_params = [], []
+    # 参数分组，将交叉注意力参数、物理参数和其他参数分开，应用不同的学习率
+    base_params, attn_params, physics_params = [], [], []
     for name, p in model.named_parameters():
         if 'depth2rgb_attn' in name or 'rgb2depth_attn' in name:
             attn_params.append(p)
+        elif 'physics_head' in name:
+            physics_params.append(p)
         else:
             base_params.append(p)
     
-    # 获取注意力模块学习率缩放因子
+    # 获取注意力模块和物理模块学习率缩放因子
     attn_lr_scale = config['optimizer'].get('attn_lr_scale', 0.1)
+    physics_lr_scale = config['optimizer'].get('physics_lr_scale', 1.0)  # 物理参数默认使用相同学习率
+    
     msg = (
         f"使用差异化学习率: 主干 {config['optimizer']['lr']}, "
-        f"注意力模块 {config['optimizer']['lr'] * attn_lr_scale}"
+        f"注意力模块 {config['optimizer']['lr'] * attn_lr_scale}, "
+        f"物理模块 {config['optimizer']['lr'] * physics_lr_scale}"
     )
     optimizer_logger.info(msg)
     
@@ -361,6 +362,10 @@ def setup_training(args, config, local_rank):
         {'params': attn_params, 'lr': config['optimizer']['lr'] * attn_lr_scale}
     ]
     
+    # 添加物理参数组（如果有）
+    if physics_params:
+        param_groups.append({'params': physics_params, 'lr': config['optimizer']['lr'] * physics_lr_scale})
+    
     # 添加不确定性权重参数组（如果有）
     if uncertainty_params:
         param_groups.append({'params': uncertainty_params, 'lr': config['optimizer']['lr']})
@@ -368,14 +373,19 @@ def setup_training(args, config, local_rank):
         # 统计优化器中不同参数组的参数数量
         base_param_count = sum(p.numel() for p in base_params)
         attn_param_count = sum(p.numel() for p in attn_params)
-        uncertainty_param_count = sum(p.numel() for p in uncertainty_params)
-        total_param_count = base_param_count + attn_param_count + uncertainty_param_count
+    physics_param_count = sum(p.numel() for p in physics_params) if physics_params else 0
+    uncertainty_param_count = sum(p.numel() for p in uncertainty_params) if uncertainty_params else 0
+    total_param_count = base_param_count + attn_param_count + physics_param_count + uncertainty_param_count
         
-        optimizer_logger.info("优化器参数统计:")
-        msg_main = f"  主干参数: {base_param_count:,} ({base_param_count/total_param_count*100:.2f}%)"
-        optimizer_logger.info(msg_main)
-        msg_attn = f"  注意力参数: {attn_param_count:,} ({attn_param_count/total_param_count*100:.2f}%)"
-        optimizer_logger.info(msg_attn)
+    optimizer_logger.info("优化器参数统计:")
+    msg_main = f"  主干参数: {base_param_count:,} ({base_param_count/total_param_count*100:.2f}%)"
+    optimizer_logger.info(msg_main)
+    msg_attn = f"  注意力参数: {attn_param_count:,} ({attn_param_count/total_param_count*100:.2f}%)"
+    optimizer_logger.info(msg_attn)
+    if physics_param_count > 0:
+        msg_physics = f"  物理参数: {physics_param_count:,} ({physics_param_count/total_param_count*100:.2f}%)"
+        optimizer_logger.info(msg_physics)
+    if uncertainty_param_count > 0:
         msg_unc = f"  不确定性权重参数: {uncertainty_param_count:,} ({uncertainty_param_count/total_param_count*100:.2f}%)"
         optimizer_logger.info(msg_unc)
         msg_total = f"  总参数数量: {total_param_count:,}"
@@ -385,6 +395,29 @@ def setup_training(args, config, local_rank):
     arch_logger.info(f"模型类型: {type(model).__name__}")
     if hasattr(model, 'encoder') and hasattr(model.encoder, 'channels'):
         arch_logger.info(f"编码器通道数: {model.encoder.channels}")
+    
+    # 添加动态参数管理功能
+    def update_optimizer_with_new_params(model, optimizer):
+        """检查模型中是否有新参数需要添加到优化器"""
+        # 获取当前优化器管理的所有参数ID
+        current_param_ids = set()
+        for group in optimizer.param_groups:
+            for param in group['params']:
+                current_param_ids.add(id(param))
+        
+        # 检查模型中的所有参数
+        new_params = []
+        for name, param in model.named_parameters():
+            if id(param) not in current_param_ids:
+                new_params.append(param)
+                optimizer_logger.warning(f"发现新参数: {name}")
+        
+        # 如果有新参数，添加到优化器的第一个参数组中
+        if new_params:
+            optimizer.param_groups[0]['params'].extend(new_params)
+            optimizer_logger.info(f"向优化器添加了 {len(new_params)} 个新参数")
+            return True
+        return False
     
     if optimizer_name == 'adam':
         optimizer = optim.Adam(
@@ -517,7 +550,8 @@ def setup_training(args, config, local_rank):
         'distributed': distributed,
         'local_rank': local_rank,
         'debug_logger': debug_logger_instance,
-        'multi_logger': multi_logger
+        'multi_logger': multi_logger,
+        'update_optimizer_fn': update_optimizer_with_new_params
     }
 
 
@@ -710,7 +744,8 @@ def extract_visualization_data(model_outputs, depth_feats, batch_size=4):
 
 
 def train_epoch(train_loader, model, criterion, optimizer, device, metric_logger, 
-               epoch, config, scaler=None, mixed_precision=False, multi_logger=None):
+               epoch, config, scaler=None, mixed_precision=False, multi_logger=None, 
+               update_optimizer_fn=None):
     """
     训练一个epoch的函数
     使用统一的多输入处理逻辑，同时支持单输入和多输入场景
@@ -735,6 +770,22 @@ def train_epoch(train_loader, model, criterion, optimizer, device, metric_logger
     progress_bar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{config['train']['epochs']}")
     vis_interval = config['train'].get('vis_interval', 100)
     param_vis_interval = config['train'].get('param_vis_interval', 500)
+    
+    # 从配置文件获取TensorBoard记录频率控制
+    tb_config = config.get('visualization', {}).get('tensorboard', {})
+    train_metrics_freq = tb_config.get('train_metrics_freq', 1)
+    physics_config = tb_config.get('physics_metrics', {})
+    physics_enable = physics_config.get('enable', True)
+    physics_freq = physics_config.get('freq', 1)
+    params_config = tb_config.get('model_params', {})
+    params_enable = params_config.get('enable', False)
+    params_freq = params_config.get('freq', 500)
+    grads_config = tb_config.get('gradients', {})
+    grads_enable = grads_config.get('enable', False)
+    grads_freq = grads_config.get('freq', 500)
+    uncertainty_config = tb_config.get('uncertainty_weights', {})
+    uncertainty_enable = uncertainty_config.get('enable', True)
+    uncertainty_freq = uncertainty_config.get('freq', 10)
     
     # 获取常用的logger实例，避免重复调用
     if multi_logger:
@@ -805,17 +856,28 @@ def train_epoch(train_loader, model, criterion, optimizer, device, metric_logger
         current_step = epoch * len(train_loader) + i
         
         if isinstance(batch, dict):
-            raw_imgs = batch['raw_imgs'].to(device)
+            raw_imgs = batch['raw_imgs'].to(device)  # Shape: [B, N, C, H, W]
             depth_gt = batch['depth'].to(device) if 'depth' in batch else None
             gt = batch['gt'].to(device) if 'gt' in batch else None
-            if len(raw_imgs.shape) == 4: raw_imgs = raw_imgs.unsqueeze(1)
-            B, N = raw_imgs.shape[:2]
+            
+            # MultiDegradationDataset returns 5D tensor [B, N, C, H, W], squeeze N dimension
+            if raw_imgs.dim() == 5 and raw_imgs.shape[1] == 1:
+                raw_imgs = raw_imgs.squeeze(1)  # [B, N, C, H, W] -> [B, C, H, W]
+            elif raw_imgs.dim() == 5:
+                # If multiple degradations, use the first one
+                raw_imgs = raw_imgs[:, 0]  # [B, N, C, H, W] -> [B, C, H, W]
+            B = raw_imgs.shape[0]
         else:
             raw, depth_gt_tuple, gt_tuple = batch[:3] # Renamed to avoid conflict
-            raw_imgs = raw.unsqueeze(1).to(device) 
+            raw_imgs = raw.to(device)
             depth_gt = depth_gt_tuple.to(device) if depth_gt_tuple is not None else None
             gt = gt_tuple.to(device) if gt_tuple is not None else None
-            B, N = raw_imgs.shape[:2]
+            # Handle potential 5D tensor from dataset
+            if raw_imgs.dim() == 5 and raw_imgs.shape[1] == 1:
+                raw_imgs = raw_imgs.squeeze(1)  # [B, N, C, H, W] -> [B, C, H, W]
+            elif raw_imgs.dim() == 5:
+                raw_imgs = raw_imgs[:, 0]  # Use first degradation
+            B = raw_imgs.shape[0]
         
         # 记录输入数据
         log_input_data(raw_imgs, "raw_imgs", current_step)
@@ -824,50 +886,43 @@ def train_epoch(train_loader, model, criterion, optimizer, device, metric_logger
         
         optimizer.zero_grad()
         
+        # 在第一个step后检查是否有新的动态参数需要添加到优化器中
+        if current_step == 1 and update_optimizer_fn is not None:
+            model_to_check = model.module if hasattr(model, 'module') else model
+            update_optimizer_fn(model_to_check, optimizer)
+        
         # 记录学习率
         current_lr = optimizer.param_groups[0]['lr']
         optimizer_logger.info(f"Step {current_step}: 当前学习率: {current_lr:.6f}")
-        metric_logger.log_metrics({"lr": current_lr}, prefix="optimizer", step=current_step)
+        
+        # 根据配置控制训练指标记录频率
+        if current_step % train_metrics_freq == 0:
+            metric_logger.log_metrics({"lr": current_lr}, prefix="optimizer", step=current_step)
         
         if mixed_precision and scaler is not None:
             with torch.amp.autocast(device_type='cuda'):
-                all_losses = []
-                # 按批次逐个处理
-                for b_loop_idx in range(B): # Renamed loop variable to avoid potential confusion if 'b' is used outside
-                    raw_batch_b = raw_imgs[b_loop_idx]
-                    depth_gt_b = depth_gt[b_loop_idx:b_loop_idx+1] if depth_gt is not None else None
-                    gt_b = gt[b_loop_idx:b_loop_idx+1] if gt is not None else None
+                # 混合精度训练 - 使用原始的multi_forward处理整个批次
+                outputs = model.multi_forward(raw_imgs, depth_gt, gt)
                     
-                    outputs = model.multi_forward(raw_batch_b, depth_gt_b, gt_b)
-                    
-                    enhanced = outputs.enhanced
-                    pred_gate = outputs.pred_gate
-                    student_feats = outputs.student_feats
-                    depth_conf_map = outputs.depth_conf_map
-                    attention_maps = outputs.attention_maps
-                    depth_pred = outputs.depth_pred  # 获取深度预测
-                    
-                    for n_loop_idx in range(N): # Renamed loop variable
-                        loss_n = criterion(
-                            enhanced[n_loop_idx:n_loop_idx+1], 
-                            gt_b, 
-                            pred_gate[n_loop_idx:n_loop_idx+1], 
-                            depth_gt_b,
-                            student_feats[n_loop_idx], 
-                            attention_maps,  # 传递注意力图
-                            depth_pred[n_loop_idx:n_loop_idx+1],  # 传递 depth_pred 给 criterion
-                            depth_conf_map,  # 传递depth_conf_map给criterion
-                            outputs.J_D[n_loop_idx:n_loop_idx+1] if hasattr(outputs, 'J_D') and outputs.J_D is not None else None,  # 传递J_D用于物理损失
-                            outputs.I_A[n_loop_idx:n_loop_idx+1] if hasattr(outputs, 'I_A') and outputs.I_A is not None else None,  # 传递I_A用于物理损失
-                            raw_batch_b[n_loop_idx:n_loop_idx+1]  # 传递raw用于物理损失
-                        )
-                        
-                        # 注意：DECL损失已禁用（深度边缘颜色损失）
-                            
-                        all_losses.append(loss_n)
+                enhanced = outputs.enhanced
+                pred_gate = outputs.pred_gate
+                student_feats = outputs.student_feats
+                depth_conf_map = outputs.depth_conf_map
+                attention_maps = outputs.attention_maps
+                depth_pred = outputs.depth_pred
                 
-                loss = torch.stack(all_losses).mean()
+                # 计算损失（对整个批次）
+                loss = criterion(
+                    outputs.enhanced, gt, 
+                    depth_gt=depth_gt,
+                    student_feats=student_feats,
+                    attention_maps=attention_maps,
+                    depth_pred=depth_pred,
+                    depth_conf_map=depth_conf_map,
+                    raw=raw_imgs
+                )
             
+            # 反向传播
             scaler.scale(loss).backward()
             
             # 梯度裁剪 (如果配置)
@@ -876,64 +931,178 @@ def train_epoch(train_loader, model, criterion, optimizer, device, metric_logger
                 scaler.unscale_(optimizer)
                 clip_norm_val = torch.nn.utils.clip_grad_norm_(model.parameters(), config['optimizer']['clip_grad_norm'])
                 gpu_logger.info(f"Step {current_step}: 梯度范数 (裁剪前): {clip_norm_val:.4f}")
-                metric_logger.log_metrics({"grad_norm": clip_norm_val.item()}, prefix="gpu", step=current_step)
+                if current_step % train_metrics_freq == 0:
+                    metric_logger.log_metrics({"grad_norm": clip_norm_val.item()}, prefix="gpu", step=current_step)
 
             scaler.step(optimizer)
             scaler.update()
-        else:
-            # 常规训练
-            all_losses = []
-            # 按批次逐个处理
-            for b_loop_idx in range(B): # Renamed loop variable
-                raw_batch_b = raw_imgs[b_loop_idx]
-                depth_gt_b = depth_gt[b_loop_idx:b_loop_idx+1] if depth_gt is not None else None
-                gt_b = gt[b_loop_idx:b_loop_idx+1] if gt is not None else None
-                
-                outputs = model.multi_forward(raw_batch_b, depth_gt_b, gt_b)
-                
-                enhanced = outputs.enhanced
-                pred_gate = outputs.pred_gate
-                student_feats = outputs.student_feats
-                depth_conf_map = outputs.depth_conf_map
-                attention_maps = outputs.attention_maps
-                depth_pred = outputs.depth_pred  # 获取深度预测
-                
-                for n_loop_idx in range(N): # Renamed loop variable
-                    loss_n = criterion(
-                        enhanced[n_loop_idx:n_loop_idx+1], 
-                        gt_b, 
-                        pred_gate[n_loop_idx:n_loop_idx+1], 
-                        depth_gt_b,
-                        student_feats[n_loop_idx], 
-                        attention_maps,  # 传递注意力图
-                        depth_pred[n_loop_idx:n_loop_idx+1],  # 传递 depth_pred 给 criterion
-                        depth_conf_map,  # 传递depth_conf_map给criterion
-                        outputs.J_D[n_loop_idx:n_loop_idx+1] if hasattr(outputs, 'J_D') and outputs.J_D is not None else None,  # 传递J_D用于物理损失
-                        outputs.I_A[n_loop_idx:n_loop_idx+1] if hasattr(outputs, 'I_A') and outputs.I_A is not None else None,  # 传递I_A用于物理损失
-                        raw_batch_b[n_loop_idx:n_loop_idx+1]  # 传递raw用于物理损失
-                    )
-                    
-                    # 注意：DECL损失已禁用（深度边缘颜色损失）
-                        
-                    all_losses.append(loss_n)
             
-            loss = torch.stack(all_losses).mean()
+            # 清理梯度和计算图
+            optimizer.zero_grad()
+        else:
+            # 常规训练 - 使用原始的multi_forward处理整个批次
+            outputs = model.multi_forward(raw_imgs, depth_gt, gt)
+                
+            enhanced = outputs.enhanced
+            pred_gate = outputs.pred_gate
+            student_feats = outputs.student_feats
+            depth_conf_map = outputs.depth_conf_map
+            attention_maps = outputs.attention_maps
+            depth_pred = outputs.depth_pred
+            
+            # 计算损失（对整个批次）
+            loss = criterion(
+                outputs.enhanced, gt, 
+                depth_gt=depth_gt,
+                student_feats=student_feats,
+                attention_maps=attention_maps,
+                depth_pred=depth_pred,
+                depth_conf_map=depth_conf_map,
+                raw=raw_imgs
+            )
+            
+            # 反向传播
             loss.backward()
 
             # 梯度裁剪 (如果配置)
             if config['optimizer'].get('clip_grad_norm', 0) > 0:
                 clip_norm_val = torch.nn.utils.clip_grad_norm_(model.parameters(), config['optimizer']['clip_grad_norm'])
                 gpu_logger.info(f"Step {current_step}: 梯度范数 (裁剪前): {clip_norm_val:.4f}")
-                metric_logger.log_metrics({"grad_norm": clip_norm_val.item()}, prefix="gpu", step=current_step)
+                if current_step % train_metrics_freq == 0:
+                    metric_logger.log_metrics({"grad_norm": clip_norm_val.item()}, prefix="gpu", step=current_step)
 
             optimizer.step()
+            
+            # 清理梯度和计算图
+            optimizer.zero_grad()
         
         current_loss = loss.item()
         epoch_loss += current_loss
+        step_count += 1
+        
+        # 清理计算图引用，防止重复反向传播错误
+        del loss
+        
+        # 安全地清理模型状态，只清理自定义状态，不触碰PyTorch内部状态
+        def clear_model_state_safe(model):
+            """安全地清理模型中的自定义状态，避免破坏PyTorch内部结构"""
+            for name, module in model.named_modules():
+                # 清理注意力图
+                if hasattr(module, 'last_attn'):
+                    module.last_attn = None
+                # 清理自定义缓存（但避免触碰PyTorch内部属性）
+                if hasattr(module, '_cached_features'):
+                    module._cached_features = None
+                # 清理RNN/LSTM状态
+                if hasattr(module, 'hidden'):
+                    module.hidden = None
+        
+        clear_model_state_safe(model)
+        
+        if mixed_precision:
+            torch.cuda.empty_cache()
         
         progress_bar.set_postfix({"Loss": f"{current_loss:.4f}"})
         
         metrics = {"loss": current_loss}
+        
+        # 记录物理参数到TensorBoard (支持固定参数和动态预测参数)
+        # 根据配置控制物理参数记录频率
+        if physics_enable and (current_step % physics_freq == 0):
+            # 获取实际模型（处理DataParallel）
+            if hasattr(model, 'module'):
+                actual_model = model.module
+            else:
+                actual_model = model
+            
+            # 🔥 记录物理参数
+            try:
+                # 获取物理参数
+                if hasattr(actual_model, 'physics_head'):
+                    # 创建一个dummy输入来获取物理参数
+                    with torch.no_grad():
+                        # 使用当前batch的瓶颈特征
+                        if hasattr(actual_model, 'bottleneck') and len(student_feats) > 0:
+                            # 使用最后一层特征作为瓶颈输入
+                            bottleneck_feat = actual_model.bottleneck(student_feats[-1])
+                            
+                            # 检查输入特征是否包含NaN或Inf
+                            if torch.isnan(bottleneck_feat).any() or torch.isinf(bottleneck_feat).any():
+                                physics_logger.warning(f"Step {current_step}: bottleneck_feat包含NaN或Inf，跳过物理参数记录")
+                                continue
+                            
+                            beta_c, B_c, blur_scale = actual_model.physics_head(bottleneck_feat)
+                            
+                            # 检查物理参数是否包含NaN或Inf
+                            if (torch.isnan(beta_c).any() or torch.isinf(beta_c).any() or
+                                torch.isnan(B_c).any() or torch.isinf(B_c).any() or
+                                torch.isnan(blur_scale).any() or torch.isinf(blur_scale).any()):
+                                physics_logger.warning(f"Step {current_step}: 物理参数包含NaN或Inf")
+                                physics_logger.warning(f"  beta_c: NaN={torch.isnan(beta_c).any()}, Inf={torch.isinf(beta_c).any()}")
+                                physics_logger.warning(f"  B_c: NaN={torch.isnan(B_c).any()}, Inf={torch.isinf(B_c).any()}")
+                                physics_logger.warning(f"  blur_scale: NaN={torch.isnan(blur_scale).any()}, Inf={torch.isinf(blur_scale).any()}")
+                                continue
+                            
+                            # 安全计算统计信息
+                            def safe_stat(tensor, stat_name):
+                                try:
+                                    if stat_name == 'mean':
+                                        return tensor.mean().item()
+                                    elif stat_name == 'std':
+                                        # 处理单元素张量的情况
+                                        if tensor.numel() <= 1:
+                                            return 0.0  # 单元素的标准差定义为0
+                                        std_val = tensor.std().item()
+                                        return 0.0 if torch.isnan(torch.tensor(std_val)) else std_val
+                                    elif stat_name == 'min':
+                                        return tensor.min().item()
+                                    elif stat_name == 'max':
+                                        return tensor.max().item()
+                                except:
+                                    physics_logger.warning(f"计算{stat_name}失败，返回0")
+                                    return 0.0
+                            
+                            # 记录物理参数统计信息
+                            physics_metrics = {
+                                'beta_c_mean': safe_stat(beta_c, 'mean'),
+                                'beta_c_std': safe_stat(beta_c, 'std'),
+                                'beta_c_min': safe_stat(beta_c, 'min'),
+                                'beta_c_max': safe_stat(beta_c, 'max'),
+                                'B_c_mean': safe_stat(B_c, 'mean'),
+                                'B_c_std': safe_stat(B_c, 'std'),
+                                'B_c_min': safe_stat(B_c, 'min'),
+                                'B_c_max': safe_stat(B_c, 'max'),
+                                'blur_scale_mean': safe_stat(blur_scale, 'mean'),
+                                'blur_scale_std': safe_stat(blur_scale, 'std'),
+                                'blur_scale_min': safe_stat(blur_scale, 'min'),
+                                'blur_scale_max': safe_stat(blur_scale, 'max'),
+                            }
+                            
+                            # 记录到TensorBoard
+                            metric_logger.log_metrics(physics_metrics, prefix="physics", step=current_step)
+                            
+                            # 记录到物理日志
+                            physics_logger.info(f"[训练] Step {current_step} 物理参数: " + 
+                                              f"beta_c=[{beta_c.min().item():.3f}, {beta_c.max().item():.3f}], " +
+                                              f"B_c=[{B_c.min().item():.3f}, {B_c.max().item():.3f}], " +
+                                              f"blur_scale=[{blur_scale.min().item():.3f}, {blur_scale.max().item():.3f}]")
+                            
+                            # 记录物理参数的分布直方图（可选）
+                            physics_save_histograms = physics_config.get('save_histograms', True)
+                            if (physics_save_histograms and 
+                                hasattr(metric_logger, 'tb_writer') and 
+                                metric_logger.tb_writer is not None):
+                                metric_logger.tb_writer.add_histogram('physics/beta_c_distribution', beta_c, current_step)
+                                metric_logger.tb_writer.add_histogram('physics/B_c_distribution', B_c, current_step)
+                                metric_logger.tb_writer.add_histogram('physics/blur_scale_distribution', blur_scale, current_step)
+                        
+                else:
+                    physics_logger.warning(f"模型没有physics_head属性，跳过物理参数记录")
+                    
+            except Exception as e:
+                physics_logger.error(f"记录物理参数时出错: {e}")
+                import traceback
+                physics_logger.debug(traceback.format_exc())
         
         if hasattr(criterion, 'get_latest_losses'):
             loss_components = criterion.get_latest_losses()
@@ -952,7 +1121,9 @@ def train_epoch(train_loader, model, criterion, optimizer, device, metric_logger
         
         # 注意：DECL损失已禁用
         
-        metric_logger.log_metrics(metrics, prefix="train", step=current_step) # Added step to log_metrics
+        # 根据配置控制训练指标记录频率
+        if current_step % train_metrics_freq == 0:
+            metric_logger.log_metrics(metrics, prefix="train", step=current_step) # Added step to log_metrics
         
         # 使用多文件日志系统记录详细分类的损失信息
         if multi_logger:
@@ -981,14 +1152,7 @@ def train_epoch(train_loader, model, criterion, optimizer, device, metric_logger
                     depth_logger.info(f"[训练] Step {current_step} 深度损失: " + 
                                     ", ".join([f"{k}={v:.6f}" for k, v in depth_metrics.items()]))
                 
-                # 物理模型相关损失
-                physics_metrics = {}
-                for k in ['phy_A_L1', 'phy_A_SSIM', 'L_phy_A', 'phy_D_L1', 'phy_D_SSIM', 'L_phy_D']:
-                    if k in loss_components:
-                        physics_metrics[k] = loss_components[k]
-                if physics_metrics:
-                    physics_logger.info(f"[训练] Step {current_step} 物理模型损失: " + 
-                                      ", ".join([f"{k}={v:.6f}" for k, v in physics_metrics.items()]))
+                # 物理模型相关损失已删除
                 
                 # 注意力相关损失
                 attention_metrics = {}
@@ -1011,12 +1175,13 @@ def train_epoch(train_loader, model, criterion, optimizer, device, metric_logger
                     if uncertainty_metrics:
                         optimizer_logger.info(f"[训练] Step {current_step} 不确定性权重: " + 
                                            ", ".join([f"{k}={v:.6f}" for k, v in uncertainty_metrics.items()]))
-                        metric_logger.log_metrics(uncertainty_metrics, prefix="uncertainty", step=current_step)
+                        if uncertainty_enable and (current_step % uncertainty_freq == 0):
+                            metric_logger.log_metrics(uncertainty_metrics, prefix="uncertainty", step=current_step)
         
         if i % vis_interval == 0:
             try:
                 vis_logger.info(f"======== 开始记录可视化数据，步骤: {current_step} ========")
-                vis_raw_first_item = raw_imgs[0, 0].unsqueeze(0)
+                vis_raw_first_item = raw_imgs[0].unsqueeze(0)  # [C, H, W] -> [1, C, H, W]
                 vis_depth_first_item = depth_gt[0].unsqueeze(0) if depth_gt is not None and depth_gt.nelement() > 0 and B > 0 else None
                 vis_gt_first_item = gt[0].unsqueeze(0) if gt is not None and gt.nelement() > 0 and B > 0 else None
 
@@ -1311,474 +1476,425 @@ def train_epoch(train_loader, model, criterion, optimizer, device, metric_logger
                 import traceback
                 error_logger.error(traceback.format_exc())
         
-        if i % param_vis_interval == 0:
-            metric_logger.log_model_parameters(model, step=current_step)
+        # 根据配置控制参数分布记录频率
+        if params_enable and (current_step % params_freq == 0):
+            metric_logger.log_model_parameters(model, step=current_step, log_gradients=grads_enable)
         
-    epoch_loss /= len(train_loader)
-    train_logger.info(f"======== [Epoch {epoch+1}] 结束 | 平均损失: {epoch_loss:.4f} ========")
-    return epoch_loss
+        # 记录各种指标和参数
+        
+        # 记录损失
+        metrics = criterion.get_latest_losses()  # 获取损失函数记录的最新损失值
+        
+        # 深度相关指标记录
+        if outputs.depth_pred is not None:
+            try:
+                depth_stats = calculate_depth_statistics(outputs.depth_pred)
+                for stat_key, stat_value in depth_stats.items():
+                    metrics[f"depth/{stat_key}"] = stat_value
+                
+                if current_step % 100 == 0:
+                    multi_logger.get_logger('depth').info(f"Depth stats: {depth_stats}")
+            except Exception as e:
+                multi_logger.get_logger('warning').warning(f"Error computing depth statistics: {e}")
+        
+        # 物理参数记录已删除
+        
+        if hasattr(criterion, 'get_latest_losses'):
+            loss_components = criterion.get_latest_losses()
+            for loss_name, loss_value in loss_components.items():
+                if loss_name != 'total_loss':
+                    if not (loss_name.startswith('loss_') or loss_name.endswith('_loss')):
+                        metrics[f"loss_{loss_name}"] = loss_value
+                    else:
+                        metrics[loss_name] = loss_value
+            if 'depth_total_loss' in loss_components:
+                progress_bar.set_postfix({
+                    "Loss": f"{current_loss:.4f}",
+                    "Depth Loss": f"{loss_components['depth_total_loss']:.4f}",
+                    "LR": f"{current_lr:.6f}"
+                })
+        
+        # 注意：DECL损失已禁用
+        
+        # 根据配置控制训练指标记录频率
+        if current_step % train_metrics_freq == 0:
+            metric_logger.log_metrics(metrics, prefix="train", step=current_step) # Added step to log_metrics
+        
+        # 使用多文件日志系统记录详细分类的损失信息
+        if multi_logger:
+            # 基本损失记录
+            multi_logger.log_loss(metrics, current_step, prefix="train")
+        
+            # 将损失按类别分组记录
+            if hasattr(criterion, 'get_latest_losses'):
+                loss_components = criterion.get_latest_losses()
+                
+                # 图像质量相关损失
+                image_metrics = {}
+                for k in ['l1_loss', 'ssim_loss', 'perc_loss', 'fft_loss', 'grad_loss', 'img_total_loss']:
+                    if k in loss_components:
+                        image_metrics[k] = loss_components[k]
+                if image_metrics:
+                    metrics_logger.info(f"[训练] Step {current_step} 图像质量损失: " + 
+                                      ", ".join([f"{k}={v:.6f}" for k, v in image_metrics.items()]))
+                
+                # 深度相关损失
+                depth_metrics = {}
+                for k in ['depth_pred_loss', 'depth_smooth_loss', 'depth_decoder_loss', 'depth_rec_loss', 'depth_total_loss']:
+                    if k in loss_components:
+                        depth_metrics[k] = loss_components[k]
+                if depth_metrics:
+                    depth_logger.info(f"[训练] Step {current_step} 深度损失: " + 
+                                    ", ".join([f"{k}={v:.6f}" for k, v in depth_metrics.items()]))
+                
+                # 物理模型相关损失已删除
+                
+                # 注意力相关损失
+                attention_metrics = {}
+                for k in ['attn_cons_loss']:
+                    if k in loss_components:
+                        attention_metrics[k] = loss_components[k]
+                if attention_metrics:
+                    attention_logger.info(f"[训练] Step {current_step} 注意力损失: " + 
+                                        ", ".join([f"{k}={v:.6f}" for k, v in attention_metrics.items()]))
+                
+                # 不确定性权重
+                if hasattr(criterion, 'use_uncertainty_weighting') and criterion.use_uncertainty_weighting:
+                    uncertainty_metrics = {}
+                    for key, value in loss_components.items():
+                        if key.startswith('uncertainty_'):
+                            uncertainty_metrics[key] = value
+                        elif key.startswith('log_var_'):
+                            uncertainty_metrics[key] = value
+                    
+                    if uncertainty_metrics:
+                        optimizer_logger.info(f"[训练] Step {current_step} 不确定性权重: " + 
+                                           ", ".join([f"{k}={v:.6f}" for k, v in uncertainty_metrics.items()]))
+        
+    # 计算平均损失
+    avg_epoch_loss = epoch_loss / step_count if step_count > 0 else 0.0
+    
+    # 主要指标用于学习率调度器（通常使用平均损失）
+    primary_metric_for_scheduler = avg_epoch_loss
+    
+    return avg_epoch_loss, primary_metric_for_scheduler
 
 
-def validate(val_loader, model, criterion, device, metric_logger, epoch, config, mixed_precision=False, multi_logger=None):
+def validate(val_loader, model, criterion, device, metric_logger, epoch, config, 
+             mixed_precision=False, multi_logger=None):
+    """
+    验证函数，计算RGB和深度的各种指标并记录到TensorBoard
+    
+    Returns:
+        tuple: (avg_val_loss, primary_metric)
+    """
     model.eval()
-    progress_bar = tqdm(val_loader, desc=f"Validation [{epoch+1}]")
     
-    # 获取常用的logger实例，避免重复调用
+    # 获取日志记录器
     if multi_logger:
-        validation_logger = multi_logger.get_logger('validation')
-        vis_logger = multi_logger.get_logger('visualization')
-        warning_logger = multi_logger.get_logger('warning')
-        error_logger = multi_logger.get_logger('error')
-        depth_logger = multi_logger.get_logger('depth')
+        val_logger = multi_logger.get_logger('validation')
         metrics_logger = multi_logger.get_logger('metrics')
-        debug_logger = multi_logger.get_logger('debug')
-        data_logger = multi_logger.get_logger('data') # 新增
+        depth_logger = multi_logger.get_logger('depth')
     else:
-        # 如果没有multi_logger，则回退到默认logger
-        validation_logger = vis_logger = warning_logger = error_logger = depth_logger = metrics_logger = debug_logger = data_logger = metric_logger.logger
+        val_logger = metrics_logger = depth_logger = logging.getLogger(__name__)
     
-    validation_logger.info(f"======== [Epoch {epoch+1}] 开始验证 ========")
-
-    # 验证中也禁用DECL损失
-    lambda_decl = config.get('loss', {}).get('lambda_decl', 0)
-    if lambda_decl > 0:
-        warning_logger.warning(f"Epoch {epoch+1} [验证]: 配置文件中DECL损失权重 (lambda_decl) 为 {lambda_decl}，但代码已禁用此损失。")
-    
-    # Visualization and metric config from YAML
+    # 获取可视化配置
     vis_config = config.get('visualization', {})
-    val_imgs_config = vis_config.get('val_images', {})
-    save_val_imgs_to_disk = val_imgs_config.get('save', True)
-    max_samples_for_processing = val_imgs_config.get('max_samples', 8) # For disk saving and detailed metrics
-    # save_comparison_to_disk = val_imgs_config.get('save_comparison', True) # Implicitly handled by save_val_imgs_to_disk
-    # save_metrics_text_on_disk_image = val_imgs_config.get('save_metrics', True) # Will be handled during plotting
-
-    val_img_output_dir = None
-    if save_val_imgs_to_disk and hasattr(metric_logger, 'tb_writer') and metric_logger.tb_writer is not None:
-        val_img_output_dir = os.path.join(metric_logger.tb_writer.log_dir, f'val_images_epoch{epoch+1}')
-        os.makedirs(val_img_output_dir, exist_ok=True)
-        vis_logger.info(f"Validation images will be saved to: {val_img_output_dir}")
-    elif save_val_imgs_to_disk:
-        warning_logger.warning("Cannot save validation images to disk: TensorBoard writer not initialized.")
-
-    collected_samples_for_processing = [] 
-    epoch_total_batch_losses = [] 
+    val_vis_interval = vis_config.get('val_vis_interval', 50)
+    max_val_vis_samples = vis_config.get('max_val_vis_samples', 10)
+    val_metrics_freq = vis_config.get('tensorboard', {}).get('val_metrics_freq', 1)
+    
+    # 获取验证图像保存配置
+    val_images_config = vis_config.get('val_images', {})
+    save_val_images = val_images_config.get('save', False)
+    max_val_samples = val_images_config.get('max_samples', 8)
+    save_comparison = val_images_config.get('save_comparison', True)
+    
+    # 创建验证图像保存目录
+    val_images_dir = None
+    if save_val_images:
+        exp_dir = config.get('experiment', {}).get('output_dir', 'experiments/train')
+        exp_name = config.get('experiment', {}).get('name', 'underwater_enhance_run')
+        # 找到当前实验目录
+        import glob
+        exp_pattern = os.path.join(exp_dir, f"{exp_name}_*")
+        exp_dirs = glob.glob(exp_pattern)
+        if exp_dirs:
+            current_exp_dir = max(exp_dirs, key=os.path.getctime)  # 最新的实验目录
+            val_images_dir = os.path.join(current_exp_dir, 'val_images', f'epoch_{epoch+1:03d}')
+            os.makedirs(val_images_dir, exist_ok=True)
+            val_logger.info(f"验证图像将保存到: {val_images_dir}")
+    
+    val_logger.info(f"开始验证 Epoch {epoch+1}...")
+    
+    total_loss = 0.0
+    num_batches = 0
+    
+    # RGB指标累积
+    total_psnr = 0.0
+    total_ssim = 0.0
+    total_lpips = 0.0
+    
+    # 深度指标累积
+    total_depth_mae = 0.0
+    total_depth_rmse = 0.0
+    total_depth_abs_rel = 0.0
+    total_depth_sq_rel = 0.0
+    
+    # 损失组件累积
+    loss_components_sum = defaultdict(float)
+    
+    vis_count = 0  # 可视化计数器
     
     with torch.no_grad():
-        for i_batch_loop, current_batch_data in enumerate(progress_bar):
-            raw_imgs_b_n_c_h_w, depth_gt_b_or_1, gt_imgs_b_or_1 = None, None, None
-            current_batch_size_B, num_degradations_N = 0, 0
-
-            if isinstance(current_batch_data, dict):
-                raw_imgs_b_n_c_h_w = current_batch_data['raw_imgs'].to(device)
-                depth_gt_b_or_1 = current_batch_data['depth'].to(device) if 'depth' in current_batch_data else None
-                gt_imgs_b_or_1 = current_batch_data['gt'].to(device) if 'gt' in current_batch_data else None
-                if raw_imgs_b_n_c_h_w.ndim == 4: # B,C,H,W -> B,1,C,H,W
-                    raw_imgs_b_n_c_h_w = raw_imgs_b_n_c_h_w.unsqueeze(1)
-                current_batch_size_B = raw_imgs_b_n_c_h_w.shape[0]
-                num_degradations_N = raw_imgs_b_n_c_h_w.shape[1]
-            else: # Old tuple format
-                raw_tuple, depth_gt_tuple, gt_tuple = current_batch_data[:3]
-                raw_imgs_b_n_c_h_w = raw_tuple.unsqueeze(1).to(device) # Add N dim for consistency
-                depth_gt_b_or_1 = depth_gt_tuple.to(device) if depth_gt_tuple is not None else None
-                gt_imgs_b_or_1 = gt_tuple.to(device) if gt_tuple is not None else None
-                current_batch_size_B = raw_imgs_b_n_c_h_w.shape[0]
-                num_degradations_N = raw_imgs_b_n_c_h_w.shape[1]
-
-            for b_idx_in_batch in range(current_batch_size_B):
-                # Prepare inputs for model.multi_forward (expects N,C,H,W for raw)
-                raw_n_degradations = raw_imgs_b_n_c_h_w[b_idx_in_batch] # Shape: N,C,H,W
-                # Depth GT and GT images might be per batch item B, or shared (shape [1,C,H,W])
-                depth_gt_for_model = depth_gt_b_or_1[b_idx_in_batch:b_idx_in_batch+1] if depth_gt_b_or_1 is not None and depth_gt_b_or_1.shape[0] == current_batch_size_B else depth_gt_b_or_1
-                gt_for_model = gt_imgs_b_or_1[b_idx_in_batch:b_idx_in_batch+1] if gt_imgs_b_or_1 is not None and gt_imgs_b_or_1.shape[0] == current_batch_size_B else gt_imgs_b_or_1
-
-                # Model forward pass
-                model_outputs_dict = {}
-                if mixed_precision:
-                    with torch.amp.autocast(device_type='cuda'):
-                        model_outputs_dict = model.multi_forward(raw_n_degradations, depth_gt_for_model, gt_for_model)
-                else:
-                    model_outputs_dict = model.multi_forward(raw_n_degradations, depth_gt_for_model, gt_for_model)
-
-                # Extract outputs (all are expected to be N,C,H,W or list for feats)
-                enhanced_n_items = model_outputs_dict.enhanced
-                pred_gate_n_items = model_outputs_dict.pred_gate
-                continuous_depth_pred_n_items = model_outputs_dict.depth_pred  # 获取连续深度输出
-                student_feats_n_lists = model_outputs_dict.student_feats
-                depth_conf_map_for_b_item = model_outputs_dict.depth_conf_map
-                attention_maps_for_b_item = model_outputs_dict.attention_maps  # 获取注意力图
-
-                for n_idx_in_degradations in range(num_degradations_N):
-                    # Get individual item from the N degradations
-                    current_enhanced_item = enhanced_n_items[n_idx_in_degradations:n_idx_in_degradations+1]
-                    current_pred_gate_item = pred_gate_n_items[n_idx_in_degradations:n_idx_in_degradations+1]
-                    current_student_feats = student_feats_n_lists[n_idx_in_degradations] if student_feats_n_lists and n_idx_in_degradations < len(student_feats_n_lists) else None
-                    current_continuous_depth_pred = continuous_depth_pred_n_items[n_idx_in_degradations:n_idx_in_degradations+1] if continuous_depth_pred_n_items is not None else None
-                    
-                    # Calculate loss if GT is available
-                    if gt_for_model is not None:
-                        loss_value = criterion(
-                            current_enhanced_item, gt_for_model, current_pred_gate_item, depth_gt_for_model,
-                            current_student_feats, 
-                            attention_maps_for_b_item,  # 传递注意力图
-                            current_continuous_depth_pred,  # 传递连续深度预测
-                            depth_conf_map_for_b_item,  # 传递depth_conf_map
-                            model_outputs_dict.J_D[n_idx_in_degradations:n_idx_in_degradations+1] if hasattr(model_outputs_dict, 'J_D') and model_outputs_dict.J_D is not None else None,  # 传递J_D用于物理损失
-                            model_outputs_dict.I_A[n_idx_in_degradations:n_idx_in_degradations+1] if hasattr(model_outputs_dict, 'I_A') and model_outputs_dict.I_A is not None else None,  # 传递I_A用于物理损失
-                            raw_n_degradations[n_idx_in_degradations:n_idx_in_degradations+1]  # 传递raw用于物理损失
-                        )
-                        # 注意：DECL损失已禁用（深度边缘颜色损失）
-                        epoch_total_batch_losses.append(loss_value.item())
-
-                    # Collect samples for detailed metric calculation and disk saving (only from first b_item for simplicity)
-                    if len(collected_samples_for_processing) < max_samples_for_processing and b_idx_in_batch == 0:
-                        collected_samples_for_processing.append({
-                            'input': raw_n_degradations[n_idx_in_degradations:n_idx_in_degradations+1].cpu(),
-                            'output': current_enhanced_item.cpu(),
-                            'gt': gt_for_model.cpu() if gt_for_model is not None else None,
-                            'depth_gt': depth_gt_for_model.cpu() if depth_gt_for_model is not None else None,
-                            'depth_pred_continuous': current_continuous_depth_pred.cpu() if current_continuous_depth_pred is not None else None,
-                            'depth_pred_gate': current_pred_gate_item.cpu(), # Store gate separately if needed for viz
-                            'filename_suffix': f"epoch{epoch+1}_bidx{i_batch_loop}_b{b_idx_in_batch}_n{n_idx_in_degradations}"
-                        })
-            
-            # 改进的验证过程TensorBoard可视化
-            val_vis_interval = vis_config.get('val_vis_interval', 50)  # 可以单独设置验证可视化间隔
-            max_val_vis_samples = vis_config.get('max_val_vis_samples', 10)  # 最多可视化几个样本
-            if i_batch_loop % val_vis_interval == 0 and (i_batch_loop // val_vis_interval) < max_val_vis_samples and current_batch_size_B > 0 and num_degradations_N > 0:
-                # Log the first degradation (n=0) of the first item in the batch (b=0)
-                tb_log_raw_img = raw_imgs_b_n_c_h_w[0,0].unsqueeze(0) 
-                tb_log_enh_img = enhanced_n_items[0:1] if enhanced_n_items is not None else None
-                tb_log_gt_img  = gt_imgs_b_or_1[0:1] if gt_imgs_b_or_1 is not None and gt_imgs_b_or_1.shape[0] == current_batch_size_B else gt_imgs_b_or_1
-                tb_log_depth_gt_img = depth_gt_b_or_1[0:1] if depth_gt_b_or_1 is not None and depth_gt_b_or_1.shape[0] == current_batch_size_B else depth_gt_b_or_1
-                tb_log_depth_gate_pred = pred_gate_n_items[0:1] if pred_gate_n_items is not None else None
-                tb_log_depth_continuous_pred = continuous_depth_pred_n_items[0:1] if continuous_depth_pred_n_items is not None else None
-                tb_log_depth_conf_map = depth_conf_map_for_b_item # This is from b_idx=0
-
-                if tb_log_enh_img is not None:
-                    sample_idx = i_batch_loop // val_vis_interval
-                    
-                    # 归一化函数（改进版）
-                    def normalize_image(img):
-                        if img is None: return None
-                        img = img.clone().detach().cpu()
-                        if img.min() < -0.5:  # 假设是[-1, 1]范围
-                            img = (img + 1.0) / 2.0
-                        return img.clamp(0, 1)
-                    
-                    def normalize_depth(depth):
-                        if depth is None: return None
-                        depth = depth.clone().detach().cpu()
-                        # 对数变换（如果深度值很大）
-                        if depth.max() > 100:  # 假设是原始深度值
-                            depth_config = config['loss'].get('depth_processing', {})
-                            min_depth = depth_config.get('min_depth_log', 5000.0)
-                            max_depth = depth_config.get('max_depth_log', 65000.0)
-                            depth = torch.log(depth + 1.0)
-                            log_min = torch.log(torch.tensor(min_depth) + 1.0)
-                            log_max = torch.log(torch.tensor(max_depth) + 1.0)
-                            depth = (depth - log_min) / (log_max - log_min + 1e-6)
-                        return depth.clamp(0, 1)
-
-                    # 1. 单独的图像 - 添加更详细的日志
-                    if tb_log_raw_img is not None:
-                        normalized_input = normalize_image(tb_log_raw_img)
-                        metric_logger.log_image(f"val/sample{sample_idx}/input", normalized_input, step=epoch)
-                        vis_logger.info(f"记录验证图像到TensorBoard: val/sample{sample_idx}/input")
-                    else:
-                        warning_logger.warning(f"验证样本{sample_idx}的输入图像为None，跳过TB记录")
-                        
-                    if tb_log_enh_img is not None:
-                        normalized_enhanced = normalize_image(tb_log_enh_img)
-                        metric_logger.log_image(f"val/sample{sample_idx}/enhanced", normalized_enhanced, step=epoch)
-                        # 添加彩色增强图（更易观察）
-                        metric_logger.log_image(f"val/sample{sample_idx}/enhanced_color", normalized_enhanced, step=epoch)
-                        vis_logger.info(f"记录验证图像到TensorBoard: val/sample{sample_idx}/enhanced")
-                    else:
-                        warning_logger.warning(f"验证样本{sample_idx}的增强图像为None，跳过TB记录")
-                        
-                    if tb_log_gt_img is not None: 
-                        normalized_gt = normalize_image(tb_log_gt_img)
-                        metric_logger.log_image(f"val/sample{sample_idx}/gt", normalized_gt, step=epoch)
-                        # 添加彩色GT图（更易观察）
-                        metric_logger.log_image(f"val/sample{sample_idx}/gt_color", normalized_gt, step=epoch)
-                        vis_logger.info(f"记录验证图像到TensorBoard: val/sample{sample_idx}/gt")
-                        
-                        # 2. RGB对比图（输入/增强/GT并排）
-                        if normalized_enhanced is not None and normalized_input is not None:
-                            # 确保所有图像尺寸相同
-                            comparison_list = []
-                            # 添加原始输入图
-                            comparison_list.append(normalized_input)
-                            # 添加增强图
-                            comparison_list.append(normalized_enhanced)
-                            # 添加GT图
-                            comparison_list.append(normalized_gt)
-                            
-                            # 水平拼接
-                            comparison_rgb = torch.cat(comparison_list, dim=-1)
-                            metric_logger.log_image(f"val/sample{sample_idx}/comparison_rgb", comparison_rgb, step=epoch)
-                            vis_logger.info(f"记录验证对比图到TensorBoard: val/sample{sample_idx}/comparison_rgb")
-                            
-                            # 3. 误差图
-                            error_map = torch.abs(normalized_enhanced - normalized_gt)
-                            error_map_colored = error_map.repeat(1, 3, 1, 1) if error_map.shape[1] == 1 else error_map
-                            metric_logger.log_image(f"val/sample{sample_idx}/error_map", error_map_colored, step=epoch)
-                            metric_logger.log_image(f"val/sample{sample_idx}/error_heatmap", error_map_colored, step=epoch)
-                            vis_logger.info(f"记录验证图像到TensorBoard: val/sample{sample_idx}/error_map")
-                    else:
-                        warning_logger.warning(f"验证样本{sample_idx}的GT图像为None，跳过对比图和误差图")
-                    
-                    # 4. 深度相关可视化
-                    if tb_log_depth_gt_img is not None: 
-                        metric_logger.log_image(f"val/sample{sample_idx}/depth_gt", normalize_depth(tb_log_depth_gt_img), step=epoch)
-                    if tb_log_depth_gate_pred is not None: 
-                        # 添加调试信息，输出深度门控的值范围和统计信息
-                        gate_min = tb_log_depth_gate_pred.min().item()
-                        gate_max = tb_log_depth_gate_pred.max().item()
-                        gate_mean = tb_log_depth_gate_pred.mean().item()
-                        gate_std = tb_log_depth_gate_pred.std().item()
-                        depth_logger.info(f"验证深度门控(depth_pred_gate)统计: 最小值={gate_min:.6f}, 最大值={gate_max:.6f}, 平均值={gate_mean:.6f}, 标准差={gate_std:.6f}")
-                        
-                        # 改进深度门控可视化 - 使用更强的对比度增强
-                        gate_enhanced = tb_log_depth_gate_pred.clone()
-                        
-                        # 如果值域过小（导致看起来是空白），增强对比度
-                        if gate_max - gate_min < 0.1:  # 如果范围很小
-                            depth_logger.info(f"验证深度门控值域过小 ({gate_max - gate_min:.6f})，应用对比度增强")
-                            # 应用标准化增强对比度
-                            if gate_std > 0:  # 避免除以零
-                                # 使用Z-score标准化增强对比度（扩大差异）
-                                gate_enhanced = (tb_log_depth_gate_pred - gate_mean) / (gate_std + 1e-8)
-                                # 将增强后的值裁剪到合理范围并重新缩放到[0,1]
-                                gate_enhanced = torch.clamp(gate_enhanced, -3, 3)  # 限制在±3个标准差内
-                                gate_enhanced = (gate_enhanced + 3) / 6  # 从[-3,3]映射到[0,1]
-                            else:
-                                warning_logger.warning(f"验证深度门控标准差为零，无法增强对比度")
-                                # 为避免全黑图像，手动设置一个渐变
-                                h, w = tb_log_depth_gate_pred.shape[-2:]
-                                gate_enhanced = torch.linspace(0, 1, w).view(1, 1, 1, w).repeat(1, 1, h, 1)
-                        
-                        # 记录原始深度门控
-                        metric_logger.log_image(f"val/sample{sample_idx}/depth_pred_gate_original", tb_log_depth_gate_pred, step=epoch)
-                        # 记录增强后的深度门控
-                        metric_logger.log_image(f"val/sample{sample_idx}/depth_pred_gate", gate_enhanced, step=epoch)
-                    if tb_log_depth_continuous_pred is not None: 
-                        # 使用简单的归一化方式确保深度可视化正确
-                        depth_continuous_norm = tb_log_depth_continuous_pred.clone().detach()
-                        if depth_continuous_norm.min() != depth_continuous_norm.max():
-                            depth_continuous_norm = (depth_continuous_norm - depth_continuous_norm.min()) / (depth_continuous_norm.max() - depth_continuous_norm.min())
-                        metric_logger.log_image(f"val/sample{sample_idx}/depth_continuous", depth_continuous_norm, step=epoch)
-                        
-                        # 确保记录一条日志，帮助诊断是否正确获取了连续深度预测
-                        depth_logger.info(f"Val sample {sample_idx}: 记录连续深度预测 shape={tb_log_depth_continuous_pred.shape}, range=[{tb_log_depth_continuous_pred.min().item():.4f}, {tb_log_depth_continuous_pred.max().item():.4f}]")
-                    if tb_log_depth_conf_map is not None: 
-                        metric_logger.log_image(f"val/sample{sample_idx}/depth_conf_map", tb_log_depth_conf_map, step=epoch)
-                    
-                    # 5. 深度对比图
-                    if tb_log_depth_gt_img is not None:
-                        depth_comparison_list = [normalize_depth(tb_log_depth_gt_img).cpu()]
-                        if tb_log_depth_gate_pred is not None:
-                            depth_comparison_list.append(tb_log_depth_gate_pred.cpu())
-                        if tb_log_depth_continuous_pred is not None:
-                            depth_comparison_list.append(normalize_depth(tb_log_depth_continuous_pred).cpu())
-                        
-                        if len(depth_comparison_list) > 1:
-                            depth_comparison = torch.cat(depth_comparison_list, dim=-1)
-                            metric_logger.log_image(f"val/sample{sample_idx}/depth_comparison", depth_comparison, step=epoch)
-                    
-        avg_epoch_loss = sum(epoch_total_batch_losses) / len(epoch_total_batch_losses) if epoch_total_batch_losses else 0.0
-        final_metrics_summary = {"loss": avg_epoch_loss} # Start with loss
+        progress_bar = tqdm(val_loader, desc=f"验证 Epoch {epoch+1}")
         
-        metrics_config_from_yaml = config.get('validation', {}).get('metrics', {})
-        aggregated_metric_values = defaultdict(list) # To store lists of metric values for averaging
-
-        if collected_samples_for_processing:
-            metrics_logger.info(f"Calculating detailed metrics for {len(collected_samples_for_processing)} validation samples...")
-            # Loop through the collected samples to calculate detailed metrics
-            for sample_data in tqdm(collected_samples_for_processing, desc="Calculating Detailed Val Metrics"):
-                pred_img_tensor = sample_data['output'] # Expected CPU tensor
-                gt_img_tensor = sample_data.get('gt')
-                depth_pred_tensor = sample_data.get('depth_pred_continuous')
-                depth_gt_tensor = sample_data.get('depth_gt')
-
-                for metric_name, metric_func_handle in metrics_module.ALL_METRICS.items():
-                    if metrics_config_from_yaml.get(metric_name, False):
-                        try:
-                            calculated_value = None # For single return value metrics
-                            if metric_name in metrics_module.DEPTH_METRICS:
-                                if depth_pred_tensor is not None and depth_gt_tensor is not None:
-                                    if metric_name == "depth_delta": # This metric returns a dictionary
-                                        delta_results_dict = metric_func_handle(depth_pred_tensor, depth_gt_tensor)
-                                        for d_key, d_val in delta_results_dict.items():
-                                            aggregated_metric_values[d_key].append(d_val) # Store each delta threshold result
-                                        # No single `calculated_value` for depth_delta, it's handled above
-                                    else: # Other depth metrics (MAE, RMSE)
-                                        calculated_value = metric_func_handle(depth_pred_tensor, depth_gt_tensor)
-                                else:
-                                    debug_logger.debug(f"Skipping depth metric {metric_name} for {sample_data['filename_suffix']}: depth_pred or depth_gt is None.")
-                            elif metric_name in metrics_module.FULL_REFERENCE_METRICS: # PSNR, SSIM, LPIPS, etc.
-                                if gt_img_tensor is not None:
-                                    calculated_value = metric_func_handle(pred_img_tensor, gt_img_tensor)
-                                else:
-                                    debug_logger.debug(f"Skipping FR metric {metric_name} for {sample_data['filename_suffix']}: gt_img is None.")
-                            elif metric_name in metrics_module.NO_REFERENCE_METRICS: # UCIQE, NIQE, etc.
-                                calculated_value = metric_func_handle(pred_img_tensor)
+        for i, batch in enumerate(progress_bar):
+            # 解析批次数据 - 处理字典格式的batch
+            if isinstance(batch, dict):
+                # MultiDegradationDataset 返回字典格式
+                raw_imgs = batch['raw_imgs'].to(device)  # [B, N, C, H, W]
+                depth_gt = batch['depth'].to(device) if batch['depth'] is not None else None
+                gt = batch['gt'].to(device) if batch['gt'] is not None else None
+                
+                # 处理5D张量 - 选择第一个退化级别
+                if raw_imgs.dim() == 5:
+                    raw_imgs = raw_imgs[:, 0]  # [B, C, H, W]
+                    
+            elif len(batch) >= 4:  # 其他数据集格式
+                raw_imgs, depth_gt_tuple, gt_tuple, _ = batch[:4]
+                raw_imgs = raw_imgs.to(device)
+                depth_gt = depth_gt_tuple.to(device) if depth_gt_tuple is not None else None
+                gt = gt_tuple.to(device) if gt_tuple is not None else None
+                
+                # 处理5D张量
+                if raw_imgs.dim() == 5 and raw_imgs.shape[1] == 1:
+                    raw_imgs = raw_imgs.squeeze(1)
+                elif raw_imgs.dim() == 5:
+                    raw_imgs = raw_imgs[:, 0]
+            else:
+                raw, depth_gt_tuple, gt_tuple = batch[:3]
+                raw_imgs = raw.to(device)
+                depth_gt = depth_gt_tuple.to(device) if depth_gt_tuple is not None else None
+                gt = gt_tuple.to(device) if gt_tuple is not None else None
+                
+                if raw_imgs.dim() == 5 and raw_imgs.shape[1] == 1:
+                    raw_imgs = raw_imgs.squeeze(1)
+                elif raw_imgs.dim() == 5:
+                    raw_imgs = raw_imgs[:, 0]
+            
+            B = raw_imgs.shape[0]
+            
+            # 前向传播
+            if mixed_precision:
+                with torch.amp.autocast(device_type='cuda'):
+                    outputs = model.multi_forward(raw_imgs, depth_gt, gt)
+                    loss = criterion(
+                        outputs.enhanced, gt,
+                        depth_gt=depth_gt,
+                        student_feats=outputs.student_feats,
+                        attention_maps=outputs.attention_maps,
+                        depth_pred=outputs.depth_pred,
+                        depth_conf_map=outputs.depth_conf_map,
+                        raw=raw_imgs
+                    )
+            else:
+                outputs = model.multi_forward(raw_imgs, depth_gt, gt)
+                loss = criterion(
+                    outputs.enhanced, gt,
+                    depth_gt=depth_gt,
+                    student_feats=outputs.student_feats,
+                    attention_maps=outputs.attention_maps,
+                    depth_pred=outputs.depth_pred,
+                    depth_conf_map=outputs.depth_conf_map,
+                    raw=raw_imgs
+                )
+            
+            total_loss += loss.item()
+            num_batches += 1
+            
+            # 累积损失组件
+            if hasattr(criterion, 'get_latest_losses'):
+                loss_components = criterion.get_latest_losses()
+                for k, v in loss_components.items():
+                    loss_components_sum[k] += v
+            
+            # 计算RGB指标
+            if outputs.enhanced is not None and gt is not None:
+                # 确保数据范围正确
+                enhanced_norm = outputs.enhanced
+                gt_norm = gt
+                
+                # 如果数据在[-1,1]范围，转换到[0,1]
+                if enhanced_norm.min() < 0:
+                    enhanced_norm = (enhanced_norm + 1.0) / 2.0
+                if gt_norm.min() < 0:
+                    gt_norm = (gt_norm + 1.0) / 2.0
+                
+                # 计算PSNR
+                psnr = compute_psnr(enhanced_norm, gt_norm)
+                total_psnr += psnr
+                
+                # 计算SSIM
+                ssim = compute_ssim(enhanced_norm, gt_norm)
+                total_ssim += ssim
+                
+                # 计算LPIPS (如果可用)
+                try:
+                    import lpips
+                    lpips_fn = lpips.LPIPS(net='alex').to(device)
+                    lpips_val = lpips_fn(enhanced_norm * 2 - 1, gt_norm * 2 - 1).mean().item()
+                    total_lpips += lpips_val
+                except:
+                    lpips_val = 0.0
+                    total_lpips += lpips_val
+            
+            # 计算深度指标
+            if outputs.depth_pred is not None and depth_gt is not None:
+                depth_stats = calculate_depth_statistics(outputs.depth_pred, depth_gt)
+                total_depth_mae += depth_stats.get('mae', 0.0)
+                total_depth_rmse += depth_stats.get('rmse', 0.0)
+                total_depth_abs_rel += depth_stats.get('abs_rel', 0.0)
+                total_depth_sq_rel += depth_stats.get('sq_rel', 0.0)
+            
+            # 可视化记录
+            if (vis_count < max_val_vis_samples and 
+                i % val_vis_interval == 0 and 
+                outputs.enhanced is not None):
+                
+                try:
+                    # 记录第一个样本的可视化
+                    sample_raw = raw_imgs[0:1]
+                    sample_enhanced = outputs.enhanced[0:1]
+                    sample_gt = gt[0:1] if gt is not None else None
+                    sample_depth_pred = outputs.depth_pred[0:1] if outputs.depth_pred is not None else None
+                    sample_depth_gt = depth_gt[0:1] if depth_gt is not None else None
+                    
+                    # 归一化到[0,1]
+                    if sample_raw.min() < 0:
+                        sample_raw = (sample_raw + 1.0) / 2.0
+                    if sample_enhanced.min() < 0:
+                        sample_enhanced = (sample_enhanced + 1.0) / 2.0
+                    if sample_gt is not None and sample_gt.min() < 0:
+                        sample_gt = (sample_gt + 1.0) / 2.0
+                    
+                    # 记录RGB图像
+                    metric_logger.log_image(f"val/input_{vis_count}", sample_raw, step=epoch)
+                    metric_logger.log_image(f"val/enhanced_{vis_count}", sample_enhanced, step=epoch)
+                    if sample_gt is not None:
+                        metric_logger.log_image(f"val/gt_{vis_count}", sample_gt, step=epoch)
+                    
+                    # 保存图像到本地文件
+                    if save_val_images and val_images_dir is not None and vis_count < max_val_samples:
+                        # 保存单独的图像
+                        save_image(sample_raw, os.path.join(val_images_dir, f'input_{vis_count:03d}.png'))
+                        save_image(sample_enhanced, os.path.join(val_images_dir, f'enhanced_{vis_count:03d}.png'))
+                        if sample_gt is not None:
+                            save_image(sample_gt, os.path.join(val_images_dir, f'gt_{vis_count:03d}.png'))
+                        
+                        # 保存对比图
+                        if save_comparison:
+                            if sample_gt is not None:
+                                comparison = torch.cat([sample_raw, sample_enhanced, sample_gt], dim=3)  # 水平拼接
+                                save_image(comparison, os.path.join(val_images_dir, f'comparison_{vis_count:03d}.png'))
                             else:
-                                warning_logger.warning(f"Metric {metric_name} not categorized as DEPTH, FR, or NR. Skipping.")
-
-                            if calculated_value is not None: # If the metric returned a single value
-                                if isinstance(calculated_value, (float, int)) and not (np.isnan(calculated_value) or np.isinf(calculated_value)):
-                                    aggregated_metric_values[metric_name].append(calculated_value)
-                                elif isinstance(calculated_value, (float, int)) and (np.isnan(calculated_value) or np.isinf(calculated_value)):
-                                     warning_logger.warning(f"Metric {metric_name} for {sample_data['filename_suffix']} resulted in NaN/Inf, not included in average.")
-
-                        except Exception as e_metric_calculation:
-                            error_logger.error(f"Error calculating metric '{metric_name}' for sample {sample_data['filename_suffix']}: {e_metric_calculation}")
-            
-            # Average all collected metric values
-            for name, values_list in aggregated_metric_values.items():
-                if values_list:
-                    final_metrics_summary[name] = sum(values_list) / len(values_list)
-                else:
-                    final_metrics_summary[name] = 0.0 # Default if no valid calculations (e.g., all samples skipped)
-        else: # No samples collected for detailed metrics
-            warning_logger.warning("No samples were collected for detailed metric calculations during validation.")
-
-        # Log all averaged metrics to TensorBoard and console
-        metric_logger.log_metrics(final_metrics_summary, prefix="val", step=epoch)
-        
-        # 记录不确定性权重（如果使用自动加权）
-        if hasattr(criterion, 'use_uncertainty_weighting') and criterion.use_uncertainty_weighting:
-            uncertainty_metrics = {}
-            # 从损失对象中提取不确定性权重
-            latest_losses = criterion.get_latest_losses()
-            for key, value in latest_losses.items():
-                if key.startswith('uncertainty_'):
-                    uncertainty_metrics[key] = value
-            
-            if uncertainty_metrics:
-                metric_logger.log_metrics(uncertainty_metrics, prefix="val_uncertainty", step=epoch)
-                
-        summary_print_string = ", ".join([f"{k}: {v:.4f}" for k, v in final_metrics_summary.items() if isinstance(v, (float, int))])
-        print(f"Validation Epoch {epoch+1} Summary: {summary_print_string}")
-
-        # --- Saving images to disk (using `collected_samples_for_processing`) ---
-        save_metrics_text_on_disk_image = vis_config.get('val_images', {}).get('save_metrics', True)
-        if save_val_imgs_to_disk and val_img_output_dir and collected_samples_for_processing:
-            import matplotlib.pyplot as plt # Keep import local
-            vis_logger.info(f"Saving {len(collected_samples_for_processing)} validation image sets to {val_img_output_dir}")
-            
-            for vis_item_data in tqdm(collected_samples_for_processing, desc="Saving Validation Images"):
-                img_filename_suffix = vis_item_data.get('filename_suffix', f'sample_e{epoch}_unknownidx')
-                
-                # RGB Image comparison plot
-                if vis_item_data.get('output') is not None:
-                    num_img_subplots = 0
-                    if vis_item_data.get('input') is not None: num_img_subplots += 1
-                    if vis_item_data.get('output') is not None: num_img_subplots += 1
-                    if vis_item_data.get('gt') is not None: num_img_subplots += 1
+                                comparison = torch.cat([sample_raw, sample_enhanced], dim=3)
+                                save_image(comparison, os.path.join(val_images_dir, f'comparison_{vis_count:03d}.png'))
                     
-                    if num_img_subplots > 0:
-                        fig_rgb, axs_rgb = plt.subplots(1, num_img_subplots, figsize=(6 * num_img_subplots, 6), squeeze=False)
-                        current_subplot_idx = 0
-                        if vis_item_data.get('input') is not None:
-                            img_in_np_rgb = metrics_module._prepare_image_for_metric(vis_item_data['input'], target_range_0_1=True, target_hwc=True)
-                            axs_rgb[0, current_subplot_idx].imshow(img_in_np_rgb.squeeze()); axs_rgb[0, current_subplot_idx].set_title('Input'); axs_rgb[0, current_subplot_idx].axis('off'); current_subplot_idx+=1
+                    # 记录深度图像
+                    if sample_depth_pred is not None:
+                        # 归一化深度图
+                        depth_norm = (sample_depth_pred - sample_depth_pred.min()) / (sample_depth_pred.max() - sample_depth_pred.min() + 1e-8)
+                        metric_logger.log_image(f"val/depth_pred_{vis_count}", depth_norm, step=epoch)
                         
-                        img_out_np_rgb = metrics_module._prepare_image_for_metric(vis_item_data['output'], target_range_0_1=True, target_hwc=True)
-                        title_enhanced_img = 'Enhanced'
-                        if save_metrics_text_on_disk_image:
-                            psnr_val_str = f"{final_metrics_summary.get('psnr', 0.0):.2f}" 
-                            ssim_val_str = f"{final_metrics_summary.get('ssim', 0.0):.4f}" 
-                            title_enhanced_img += f"\nPSNR:{psnr_val_str}(avg) SSIM:{ssim_val_str}(avg)"
-                        axs_rgb[0, current_subplot_idx].imshow(img_out_np_rgb.squeeze()); axs_rgb[0, current_subplot_idx].set_title(title_enhanced_img); axs_rgb[0, current_subplot_idx].axis('off'); current_subplot_idx+=1
-                        
-                        if vis_item_data.get('gt') is not None:
-                            img_gt_np_rgb = metrics_module._prepare_image_for_metric(vis_item_data['gt'], target_range_0_1=True, target_hwc=True)
-                            axs_rgb[0, current_subplot_idx].imshow(img_gt_np_rgb.squeeze()); axs_rgb[0, current_subplot_idx].set_title('Ground Truth'); axs_rgb[0, current_subplot_idx].axis('off')
-                        
-                        plt.tight_layout(); plt.savefig(os.path.join(val_img_output_dir, f'rgb_comparison_{img_filename_suffix}.png'), dpi=150); plt.close(fig_rgb)
-
-                # Depth plots (continuous prediction vs GT)
-                depth_pred_continuous_to_vis = vis_item_data.get('depth_pred_continuous')
-                depth_gt_to_vis = vis_item_data.get('depth_gt')
-
-                if depth_pred_continuous_to_vis is not None:
-                    plt.figure(figsize=(7,6))
-                    depth_pred_np_vis = metrics_module._prepare_image_for_metric(depth_pred_continuous_to_vis, target_range_0_1=False).squeeze()
-                    if depth_pred_np_vis.max() > 1.0 or depth_pred_np_vis.min() < 0.0 or depth_pred_np_vis.max() == depth_pred_np_vis.min():
-                        depth_pred_np_vis_norm = (depth_pred_np_vis - depth_pred_np_vis.min()) / (depth_pred_np_vis.max() - depth_pred_np_vis.min() + 1e-6)
-                    else:
-                        depth_pred_np_vis_norm = depth_pred_np_vis
-                    plt.imshow(depth_pred_np_vis_norm.clip(0,1), cmap='viridis'); plt.colorbar(label='Predicted Depth (Normalized)'); plt.title('Predicted Continuous Depth'); plt.axis('off'); plt.tight_layout()
-                    plt.savefig(os.path.join(val_img_output_dir, f'depth_continuous_pred_{img_filename_suffix}.png'), dpi=150); plt.close()
-                
-                if depth_gt_to_vis is not None and depth_pred_continuous_to_vis is not None:
-                    fig_depth_comp, axs_depth_comp = plt.subplots(1, 3, figsize=(18,6))
-                    depth_gt_np_vis = metrics_module._prepare_image_for_metric(depth_gt_to_vis, target_range_0_1=False).squeeze()
-                    depth_pred_np_comp_vis = metrics_module._prepare_image_for_metric(depth_pred_continuous_to_vis, target_range_0_1=False).squeeze()
+                        # 保存深度图到本地
+                        if save_val_images and val_images_dir is not None and vis_count < max_val_samples:
+                            save_image(depth_norm, os.path.join(val_images_dir, f'depth_pred_{vis_count:03d}.png'))
                     
-                    def robust_norm(d_map):
-                        if d_map.size == 0 or d_map.max() == d_map.min(): return np.zeros_like(d_map) if d_map.size > 0 else np.array([0.0])
-                        return (d_map - d_map.min()) / (d_map.max() - d_map.min() + 1e-6)
+                    if sample_depth_gt is not None:
+                        depth_gt_norm = (sample_depth_gt - sample_depth_gt.min()) / (sample_depth_gt.max() - sample_depth_gt.min() + 1e-8)
+                        metric_logger.log_image(f"val/depth_gt_{vis_count}", depth_gt_norm, step=epoch)
                         
-                    depth_gt_norm_for_plot = robust_norm(depth_gt_np_vis).clip(0,1)
-                    depth_pred_norm_for_plot = robust_norm(depth_pred_np_comp_vis).clip(0,1)
+                        # 保存GT深度图到本地
+                        if save_val_images and val_images_dir is not None and vis_count < max_val_samples:
+                            save_image(depth_gt_norm, os.path.join(val_images_dir, f'depth_gt_{vis_count:03d}.png'))
                     
-                    im0 = axs_depth_comp[0].imshow(depth_gt_norm_for_plot, cmap='viridis'); axs_depth_comp[0].set_title('GT Depth (Norm)'); axs_depth_comp[0].axis('off'); fig_depth_comp.colorbar(im0, ax=axs_depth_comp[0])
-                    im1 = axs_depth_comp[1].imshow(depth_pred_norm_for_plot, cmap='viridis'); axs_depth_comp[1].set_title('Pred. Depth (Norm)'); axs_depth_comp[1].axis('off'); fig_depth_comp.colorbar(im1, ax=axs_depth_comp[1])
-                    diff_map_norm = np.abs(depth_gt_norm_for_plot - depth_pred_norm_for_plot)
-                    im2 = axs_depth_comp[2].imshow(diff_map_norm, cmap='hot'); axs_depth_comp[2].set_title('Abs Difference (Norm)'); axs_depth_comp[2].axis('off'); fig_depth_comp.colorbar(im2, ax=axs_depth_comp[2])
-                    plt.tight_layout(); plt.savefig(os.path.join(val_img_output_dir, f'depth_comparison_continuous_{img_filename_suffix}.png'), dpi=150); plt.close(fig_depth_comp)
-
-    # Return main loss and a primary metric (e.g. PSNR) for scheduler and best model tracking
-    primary_metric_for_scheduler = final_metrics_summary.get('psnr', 0.0) 
-    if not metrics_config_from_yaml.get('psnr', True) and epoch_total_batch_losses: 
-        primary_metric_for_scheduler = -avg_epoch_loss 
+                    vis_count += 1
+                    
+                except Exception as e:
+                    val_logger.warning(f"验证可视化记录失败: {e}")
+            
+            # 更新进度条
+            progress_bar.set_postfix({
+                "Loss": f"{loss.item():.4f}",
+                "PSNR": f"{psnr:.2f}" if 'psnr' in locals() else "N/A"
+            })
     
-    # 使用多文件日志系统记录详细分类的验证指标
+    # 计算平均指标
+    avg_loss = total_loss / num_batches
+    avg_psnr = total_psnr / num_batches
+    avg_ssim = total_ssim / num_batches
+    avg_lpips = total_lpips / num_batches
+    
+    avg_depth_mae = total_depth_mae / num_batches
+    avg_depth_rmse = total_depth_rmse / num_batches
+    avg_depth_abs_rel = total_depth_abs_rel / num_batches
+    avg_depth_sq_rel = total_depth_sq_rel / num_batches
+    
+    # 计算平均损失组件
+    avg_loss_components = {k: v / num_batches for k, v in loss_components_sum.items()}
+    
+    # 记录到TensorBoard
+    val_metrics = {
+        'loss': avg_loss,
+        'psnr': avg_psnr,
+        'ssim': avg_ssim,
+        'lpips': avg_lpips,
+    }
+    
+    depth_metrics = {
+        'depth_mae': avg_depth_mae,
+        'depth_rmse': avg_depth_rmse,
+        'depth_abs_rel': avg_depth_abs_rel,
+        'depth_sq_rel': avg_depth_sq_rel,
+    }
+    
+    # 记录RGB指标
+    if epoch % val_metrics_freq == 0:
+        metric_logger.log_metrics(val_metrics, prefix="val", step=epoch)
+        metric_logger.log_metrics(depth_metrics, prefix="val", step=epoch)
+        metric_logger.log_metrics(avg_loss_components, prefix="val_loss", step=epoch)
+    
+    # 记录到日志文件
+    val_logger.info(f"[验证] Epoch {epoch+1} RGB指标: " + 
+                   f"Loss={avg_loss:.6f}, PSNR={avg_psnr:.2f}, SSIM={avg_ssim:.4f}, LPIPS={avg_lpips:.4f}")
+    
+    depth_logger.info(f"[验证] Epoch {epoch+1} 深度指标: " + 
+                     f"MAE={avg_depth_mae:.4f}, RMSE={avg_depth_rmse:.4f}, " +
+                     f"AbsRel={avg_depth_abs_rel:.4f}, SqRel={avg_depth_sq_rel:.4f}")
+    
     if multi_logger:
-        metrics_dict = {
-            'val_loss': avg_epoch_loss,
-            'val_psnr': primary_metric_for_scheduler
-        }
-        # 添加其他指标
-        for k, v in final_metrics_summary.items():
-            if k != 'psnr':  # 已经添加过了
-                metrics_dict[f'val_{k}'] = v
+        # 分类记录损失组件
+        rgb_loss_metrics = {}
+        depth_loss_metrics = {}
         
-        # 基本指标记录
-        multi_logger.log_metrics(metrics_dict, epoch, prefix="val")
+        for k, v in avg_loss_components.items():
+            if any(term in k.lower() for term in ['l1', 'ssim', 'perc', 'fft', 'grad', 'img']):
+                rgb_loss_metrics[k] = v
+            elif any(term in k.lower() for term in ['depth']):
+                depth_loss_metrics[k] = v
         
-        # 将验证指标按类别分组记录
-        # 图像质量相关指标
-        image_metrics = {}
-        for k in ['psnr', 'ssim', 'lpips']:
-            if k in final_metrics_summary:
-                image_metrics[k] = final_metrics_summary[k]
-        if image_metrics:
-            multi_logger.log_validation(f"[验证] Epoch {epoch+1} 图像质量指标: " + 
-                                       ", ".join([f"{k}={v:.6f}" for k, v in image_metrics.items()]))
+        if rgb_loss_metrics:
+            metrics_logger.info(f"[验证] Epoch {epoch+1} RGB损失: " + 
+                              ", ".join([f"{k}={v:.6f}" for k, v in rgb_loss_metrics.items()]))
         
-        # 深度相关指标
-        depth_metrics = {}
-        for k in final_metrics_summary:
-            if 'depth' in k.lower():
-                depth_metrics[k] = final_metrics_summary[k]
-        if depth_metrics:
-            multi_logger.log_depth(f"[验证] Epoch {epoch+1} 深度评估指标: " + 
-                                 ", ".join([f"{k}={v:.6f}" for k, v in depth_metrics.items()]))
-        
-        # 其他评估指标
-        other_metrics = {}
-        for k in final_metrics_summary:
-            if not any(term in k.lower() for term in ['psnr', 'ssim', 'lpips', 'depth']):
-                other_metrics[k] = final_metrics_summary[k]
-        if other_metrics:
-            multi_logger.log_validation(f"[验证] Epoch {epoch+1} 其他评估指标: " + 
-                                       ", ".join([f"{k}={v:.6f}" for k, v in other_metrics.items()]))
-        
-    return avg_epoch_loss, primary_metric_for_scheduler
+        if depth_loss_metrics:
+            depth_logger.info(f"[验证] Epoch {epoch+1} 深度损失: " + 
+                            ", ".join([f"{k}={v:.6f}" for k, v in depth_loss_metrics.items()]))
+    
+    val_logger.info(f"验证完成 Epoch {epoch+1}, 平均损失: {avg_loss:.6f}, 主要指标(PSNR): {avg_psnr:.2f}")
+    
+    return avg_loss, avg_psnr
 
 
 def distributed_worker(rank, world_size, config, args):
@@ -1922,6 +2038,7 @@ def main_worker(config, args):
     world_size = setup_result['world_size']
     local_rank = setup_result['local_rank']
     multi_logger = setup_result['multi_logger'] # 获取multi_logger
+    update_optimizer_fn = setup_result['update_optimizer_fn'] # 获取动态参数更新函数
     
     # 2. 准备数据
     data_loaders = prepare_data(config, args)
@@ -1985,14 +2102,24 @@ def main_worker(config, args):
             
     # 4. 训练循环
     logger.info("="*20 + " 开始训练 " + "="*20)
+    
+    # 初始化多文件日志系统，确保文件处理器被正确创建
+    if multi_logger:
+        multi_logger.log_training_start(config)
+    
     for epoch in range(start_epoch, config['train']['epochs']):
+        # 🔧 记录epoch开始，确保日志文件正确切换
+        if multi_logger:
+            multi_logger.log_epoch_start(epoch, config['train']['epochs'])
+            
         if args.distributed:
             train_sampler.set_epoch(epoch)
             
         # 训练
         train_loss = train_epoch(
             train_loader, model, criterion, optimizer, device,
-            metric_logger, epoch, config, scaler, mixed_precision, multi_logger
+            metric_logger, epoch, config, scaler, mixed_precision, multi_logger,
+            update_optimizer_fn
         )
         
         # 验证
@@ -2010,6 +2137,16 @@ def main_worker(config, args):
                 scheduler.step(val_metric) # 基于验证指标更新
             else:
                 scheduler.step() # 基于epoch更新
+        
+        # 🔧 记录epoch结束和指标汇总
+        if multi_logger:
+            epoch_metrics = {
+                'train_loss': train_loss,
+                'val_loss': val_loss,
+                'val_psnr': val_metric,
+                'lr': optimizer.param_groups[0]['lr']
+            }
+            multi_logger.log_epoch_end(epoch, epoch_metrics)
         
         # 保存检查点
         if local_rank in [-1, 0]:

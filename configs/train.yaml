@@ -34,7 +34,7 @@ train:
 gpu:
   use_gpu: true  # 是否使用GPU
   device_ids: [0]  # 使用的GPU ID列表，为空时使用所有可用GPU
-  mixed_precision: true  # 是否使用混合精度训练
+  mixed_precision: false  # 是否使用混合精度训练
   distributed: true  # 是否使用分布式训练 (优先使用DDP)
   backend: "nccl"  # 分布式后端，可选 "nccl" (GPU) 或 "gloo" (CPU)
   sync_bn: true  # 是否使用SyncBatchNorm
@@ -78,6 +78,8 @@ optimizer:
   momentum: 0.9  # 仅对SGD有效
   nesterov: true  # 仅对SGD有效
   attn_lr_scale: 0.1  # 交叉注意力模块的学习率缩放因子
+  physics_lr_scale: 1.0  # 物理参数模块的学习率缩放因子
+  clip_grad_norm: 1.0  # 🔧 添加梯度裁剪，防止梯度爆炸
 
 # 学习率调度器
 scheduler:
@@ -105,8 +107,7 @@ loss:
   lambda_smooth: 0.01  # 深度平滑损失
   lambda_decl: 0.1  # 深度边缘颜色损失权重
   lambda_cons: 0.05  # 交叉注意力一致性损失权重
-  lambda_phy_A: 0.1  # 物理一致性A损失权重（Beer-Lambert模型）
-  lambda_phy_D: 0.1  # 物理一致性D损失权重（深度条件PSF模型）
+# 物理一致性损失权重已删除
   depth_weight: 1.0  # 深度回归损失权重（用于连续深度预测）
   depth_processing:
     use_log_transform: true  # 是否使用对数变换
@@ -137,7 +138,7 @@ visualization:
   save_features: true
   save_depth_fusion: true
   max_images_per_batch: 4  # 每个批次最多保存多少图像
-  vis_freq: 100  # 每多少个batch保存一次可视化
+  vis_freq: 500  # 每多少个batch保存一次可视化
   val_vis_interval: 50  # 验证时每多少个batch记录一次TensorBoard可视化
   max_val_vis_samples: 10  # 验证时最多在TensorBoard中可视化多少个样本
   val_images:
@@ -147,7 +148,41 @@ visualization:
     save_metrics: true  # 是否在图像上标注指标
   save_model_graph: false  # 是否保存模型结构图
   plot_lr: true  # 是否绘制学习率曲线 
-  save_attention_maps: true  # 是否保存注意力图（启用以计算注意力一致性损失）
+  save_attention_maps: true  # 🔧 启用注意力图保存以计算注意力一致性损失
+  
+  # TensorBoard记录频率控制 - 影响训练速度的关键配置
+  tensorboard:
+    # 基础训练指标 (train/*, optimizer/*, gpu/*)
+    train_metrics_freq: 1  # 每N步记录一次训练指标 (1=每步记录)
+    
+    # 物理参数指标 (physics/*)
+    physics_metrics:
+      enable: true  # 是否启用物理参数记录
+      freq: 10  # 每N步记录一次物理参数 (1=每步记录)
+      save_histograms: true  # 是否保存物理参数分布直方图
+    
+    # 模型参数分布 (params/*)
+    model_params:
+      enable: false  # 是否启用参数直方图记录 (耗时，建议调试时启用)
+      freq: 500  # 每N步记录一次参数分布
+    
+    # 梯度分布 (grads/*)
+    gradients:
+      enable: false  # 是否启用梯度直方图记录 (耗时，建议调试时启用)
+      freq: 500  # 每N步记录一次梯度分布
+    
+    # 验证指标 (val/*)
+    val_metrics_freq: 1  # 验证时每N个epoch记录一次 (1=每个epoch记录)
+    
+    # 不确定性权重 (uncertainty/*)
+    uncertainty_weights:
+      enable: true  # 是否记录不确定性权重
+      freq: 10  # 每N步记录一次不确定性权重
+    
+    # 注意力图可视化 (attention/*)
+    attention_maps:
+      enable: true  # 是否保存注意力图
+      freq: 100  # 每N步保存一次注意力图
 
 
 logging:

@@ -258,8 +258,41 @@ class DepthFeatureExtractor(nn.Module):
                 nn.Conv2d(base_channels, base_channels, kernel_size=1, bias=False)
             )
         
+        # 添加通道适配器，避免在forward中动态创建
+        self.channel_adapters = nn.ModuleDict()
+        # 预先创建常见的通道配置
+        common_channels = [48, 96, 192, 384]  # 常见的特征通道数
+        for in_ch in common_channels:
+            if in_ch != base_channels:
+                adapter_key = f"adapt_{in_ch}_to_{base_channels}"
+                self.channel_adapters[adapter_key] = nn.Conv2d(in_ch, base_channels, kernel_size=1, bias=False)
+        
         logger.info(f"DepthFeatureExtractor initialized with {levels} levels, "
                    f"fixed base_channels={base_channels}")
+
+    def _get_or_create_adapter(self, in_channels: int, out_channels: int, device: torch.device) -> nn.Module:
+        """获取通道适配器，禁用动态创建以修复显存跳变"""
+        adapter_key = f"adapt_{in_channels}_to_{out_channels}"
+        
+        if adapter_key not in self.channel_adapters:
+            # 🔥 修复显存跳变：不再动态创建适配器！
+            logger.error(f"❌ Missing channel adapter {adapter_key} in DepthFeatureExtractor! "
+                        f"This should not happen with proper preprocessing. "
+                        f"Available adapters: {list(self.channel_adapters.keys())}")
+            
+            # 应急处理：如果输入输出通道数相同，返回恒等映射
+            if in_channels == out_channels:
+                logger.warning(f"⚠️ Using identity mapping for {in_channels} == {out_channels} channels in DepthFeatureExtractor")
+                if not hasattr(self, '_identity_adapter'):
+                    self._identity_adapter = nn.Identity()
+                return self._identity_adapter
+            else:
+                # 如果通道数不同，这是一个严重错误，应该停止训练
+                raise RuntimeError(f"🚨 DepthFeatureExtractor channel mismatch: {in_channels} -> {out_channels}. "
+                                 f"All depth features should have {self.base_channels} channels. "
+                                 f"Dynamic adapter creation has been disabled to fix memory jumps.")
+        
+        return self.channel_adapters[adapter_key]
 
     def forward(self, x: torch.Tensor) -> list:
         """
@@ -316,7 +349,7 @@ class DepthFeatureExtractor(nn.Module):
                 # 如果通道数不匹配，尝试修复
                 if feat.shape[1] < expected_channels:
                     logger.warning(f"DepthFeatureExtractor: Attempting to adapt channel count from {feat.shape[1]} to {expected_channels}")
-                    temp_adapter = nn.Conv2d(feat.shape[1], expected_channels, kernel_size=1).to(feat.device)
+                    temp_adapter = self._get_or_create_adapter(feat.shape[1], expected_channels, feat.device)
                     features[i] = temp_adapter(feat)
                 else:
                     # 通道数过多，截断
@@ -328,42 +361,33 @@ class DepthFeatureExtractor(nn.Module):
         return features
 
 #######################
-# DepthGate
+# DepthGate (已废弃 - 深度融合功能已被禁用)
 #######################
 
-class DepthGate(nn.Module):
-    """
-    DepthGate 模块
-    ---------------
-    输入:
-      - skip_feat: Tensor[B, C, H, W]   (来自 RGB 编码器的跳跃特征)
-      - depth_feat: Tensor[B, C_d, H, W] (来自 Depth 特征或预测深度头的门控图)
-    输出:
-      - gated_feat: Tensor[B, C, H, W]
-
-    实现细节:
-    1. 使用 1x1 卷积把 depth_feat 映射为单通道 gate_map (B×1×H×W)
-    2. Sigmoid 激活得到 [0,1] 空间权重
-    3. skip_feat * gate_map 广播相乘，实现空间选择性过滤
-    """
-    def __init__(self, in_channels_depth: int, reduction: int = 1):
-        super().__init__()
-        # depth_feat 通道映射到 1
-        self.gate_conv = nn.Conv2d(in_channels_depth, 1, kernel_size=1, bias=False)
-        self.sigmoid = nn.Sigmoid()
-
-    def forward(self, skip_feat: torch.Tensor, depth_feat: torch.Tensor) -> torch.Tensor:
-        # depth_feat: [B, C_d, H, W]
-        gate_map = self.gate_conv(depth_feat)  # [B,1,H,W]
-        gate_map = self.sigmoid(gate_map)
-        
-        # 处理空间尺寸不匹配
-        if gate_map.shape[2:] != skip_feat.shape[2:]:
-            gate_map = F.interpolate(gate_map, size=skip_feat.shape[2:], 
-                                     mode='bilinear', align_corners=False)
-        
-        # 广播乘法
-        return skip_feat * gate_map
+# class DepthGate(nn.Module):
+#     """
+#     DepthGate 模块 - 已废弃
+#     ---------------
+#     原用于深度门控的跳跃连接融合，现已被禁用
+#     """
+#     def __init__(self, in_channels_depth: int, reduction: int = 1):
+#         super().__init__()
+#         # depth_feat 通道映射到 1
+#         self.gate_conv = nn.Conv2d(in_channels_depth, 1, kernel_size=1, bias=False)
+#         self.sigmoid = nn.Sigmoid()
+# 
+#     def forward(self, skip_feat: torch.Tensor, depth_feat: torch.Tensor) -> torch.Tensor:
+#         # depth_feat: [B, C_d, H, W]
+#         gate_map = self.gate_conv(depth_feat)  # [B,1,H,W]
+#         gate_map = self.sigmoid(gate_map)
+#         
+#         # 处理空间尺寸不匹配
+#         if gate_map.shape[2:] != skip_feat.shape[2:]:
+#             gate_map = F.interpolate(gate_map, size=skip_feat.shape[2:], 
+#                                      mode='bilinear', align_corners=False)
+#         
+#         # 广播乘法
+#         return skip_feat * gate_map
 
 #######################
 # MonoDepthHead

@@ -331,3 +331,144 @@ class LocalTransformerBlock(nn.Module):
         
         return x
 
+
+# ============================================================================
+# 物理感知模块 (Physics-Aware Modules)
+# ============================================================================
+
+class PhysicsParamHead(nn.Module):
+    """
+    物理参数预测头
+    
+    输入: bottleneck 特征 [B, C_bottleneck, H/16, W/16]
+    输出:
+        beta_c     : [B, 3, 1, 1]  消光系数，取 softplus ≥0
+        B_c        : [B, 3, 1, 1]  背景光，取 sigmoid ∈[0,1] 
+        blur_scale : [B, 1, 1, 1]  模糊尺度，取 softplus ≥0
+    """
+    def __init__(self, in_channels, hidden=128):
+        super().__init__()
+        self.pool = nn.AdaptiveAvgPool2d(1)
+        self.mlp = nn.Sequential(
+            nn.Conv2d(in_channels, hidden, 1),
+            nn.GELU(),
+            nn.Conv2d(hidden, 7, 1)  # 3+3+1 = 7 个参数
+        )
+        
+        # 修改初始化策略：增加权重方差，让模型能够学习到输入相关的变化
+        with torch.no_grad():
+            # 增加权重的标准差，让模型对不同输入产生不同响应
+            self.mlp[-1].weight.normal_(0.0, 0.1)  # 从0.01增加到0.1，增加10倍变化性
+            
+            # 为不同参数设置不同的初始化策略
+            # beta_c: 消光系数，初始值约为0.5
+            self.mlp[-1].bias[0:3].fill_(-0.5)      # softplus(-0.5) ≈ 0.474
+            
+            # B_c: 背景光，增加更多随机性
+            self.mlp[-1].bias[3:6].normal_(-0.5, 0.2)  # 增加变化范围：从0.1到0.2
+            
+            # blur_scale: 模糊尺度，添加随机初始化而不是固定值
+            self.mlp[-1].bias[6:7].normal_(0.0, 0.3)   # 从固定0.0改为随机初始化
+            # 这样初始的blur_scale会在softplus(±0.3)范围内变化，约为[0.55, 1.35]
+
+    def forward(self, bottleneck):
+        """
+        Args:
+            bottleneck: [B, C, H, W] 瓶颈层特征
+            
+        Returns:
+            beta_c: [B, 3, 1, 1] 消光系数
+            B_c: [B, 3, 1, 1] 背景光  
+            blur_scale: [B, 1, 1, 1] 模糊尺度
+        """
+        x = self.pool(bottleneck)              # [B, C, 1, 1]
+        x = self.mlp(x)                        # [B, 7, 1, 1]
+        
+        beta_c = F.softplus(x[:, 0:3])         # [B, 3, 1, 1], ≥0
+        B_c = torch.sigmoid(x[:, 3:6])         # [B, 3, 1, 1], ∈[0,1]
+        blur_scale = F.softplus(x[:, 6:7])     # [B, 1, 1, 1], ≥0
+        
+        return beta_c, B_c, blur_scale
+
+
+class BeerLambertPML(nn.Module):
+    """Beer-Lambert物理调制层 (Physics Modulation Layer)"""
+    def __init__(self, C_in, hidden=64):
+        super().__init__()
+        self.fc1 = nn.Conv2d(9, hidden, 1)
+        self.fc2 = nn.Conv2d(hidden, 2 * C_in, 1)
+        
+        # 保守初始化：初始时接近恒等变换
+        with torch.no_grad():
+            self.fc2.weight.fill_(0.0)
+            self.fc2.bias.fill_(0.0)
+            self.fc2.bias[:C_in].fill_(1.0)  # gamma初始为1
+
+    def forward(self, feat, I_raw, depth, beta_c, B_c):
+        """
+        Args:
+            feat: [B, C, H, W] 输入特征
+            I_raw: [B, 3, H, W] 原始图像
+            depth: [B, 1, H, W] 深度图
+            beta_c: [B, 3, 1, 1] 消光系数
+            B_c: [B, 3, 1, 1] 背景光
+            
+        Returns:
+            [B, C, H, W] 调制后的特征
+        """
+        # 截断深度梯度，防止物理参数影响深度预测
+        depth_detached = depth.detach()
+        
+        # 计算Beer-Lambert物理量
+        depth_3ch = depth_detached.repeat(1, 3, 1, 1)  # [B, 3, H, W]
+        t = torch.exp(-beta_c * depth_3ch)    # 透射率
+        b = 1 - t                             # 后向散射
+        I_tilde = 2 * I_raw - 1               # 归一化图像到[-1,1]
+        
+        # 拼接物理特征 [B, 9, H, W]
+        m = torch.cat([t, b, I_tilde], dim=1)
+        
+        # 预测调制参数
+        u = F.relu(self.fc1(m))               # [B, hidden, H, W]
+        params = self.fc2(u)                  # [B, 2*C, H, W]
+        gamma, delta = torch.chunk(params, 2, dim=1)  # 各为 [B, C, H, W]
+        
+        # 应用仿射变换
+        return gamma * feat + delta
+
+
+class PSFPML(nn.Module):
+    """PSF物理调制层 (Point Spread Function Physics Modulation Layer)"""
+    def __init__(self, C_in, hidden=32):
+        super().__init__()
+        self.fc1 = nn.Conv2d(1, hidden, 1)
+        self.fc2 = nn.Conv2d(hidden, C_in, 1)
+        
+        # 保守初始化：初始时接近恒等变换
+        with torch.no_grad():
+            self.fc2.weight.fill_(0.0)
+            self.fc2.bias.fill_(0.0)
+
+    def forward(self, feat, depth_norm, blur_scale):
+        """
+        Args:
+            feat: [B, C, H, W] 输入特征
+            depth_norm: [B, 1, H, W] 归一化深度图
+            blur_scale: [B, 1, 1, 1] 模糊尺度参数
+            
+        Returns:
+            [B, C, H, W] 调制后的特征
+        """
+        # 截断深度梯度，防止物理参数影响深度预测
+        depth_norm_detached = depth_norm.detach()
+        
+        # 计算深度相关的模糊强度
+        sigma = blur_scale * depth_norm_detached       # [B, 1, H, W]
+        
+        # 预测调制参数
+        u = F.relu(self.fc1(sigma))           # [B, hidden, H, W]
+        delta = self.fc2(u)                   # [B, C, H, W]
+        
+        # 应用加性调制
+        return feat + delta
+

@@ -1,0 +1,150 @@
+# UnderwaterEnhanceNet 稳定训练配置
+# 修复显存跳变问题：禁用不确定性加权
+
+# 实验配置
+experiment:
+  name: underwater_enhance_stable
+  output_dir: experiments/train_stable
+  auto_naming: true
+  timestamp_format: "%Y%m%d_%H%M%S"
+
+# 模型配置
+model:
+  base_channels: 48 
+  levels: 4
+  heads: 8
+  bottleneck_blocks: 4
+  encoder_window_size: 8 
+  bottleneck_window_size: 8
+  decoder_block_window_size: 8
+  depth_processor_config:
+    double_channels: False
+    use_cross_attn: true
+
+# 训练配置
+train:
+  epochs: 100
+  val_interval: 1
+  vis_interval: 100  # 每多少个batch记录一次可视化数据
+  param_vis_interval: 500  # 每多少个batch记录一次参数直方图
+  save_best: true
+  save_interval: 10
+
+# GPU配置
+gpu:
+  use_gpu: true
+  device_ids: [0]
+  mixed_precision: false  # 🔧 禁用混合精度以修复NaN问题
+  distributed: true
+  backend: "nccl"
+  sync_bn: true
+  find_unused_parameters: false
+
+# 数据配置
+data:
+  format: "folder"
+  dataset_type: multi_degradation
+  train_root: "DATA/train"
+  val_root: "DATA/val"
+  folder_structure:
+    gt: "gt"
+    depth: "depth"
+  degradation_folders: ['raw']
+  batch_size: 1
+  num_workers: 32
+  resolution: 512
+  augment_prob: 0.1
+  augmentations:
+    random_crop: True
+    flip_h: True
+    flip_v: False
+    color_jitter: True
+
+depth_processor_config:
+  double_channels: false
+  use_cross_attn: true
+
+# 优化器配置
+optimizer:
+  name: adamw
+  lr: 0.0001
+  weight_decay: 0.01
+  beta1: 0.9
+  beta2: 0.99
+  momentum: 0.9
+  nesterov: true
+  attn_lr_scale: 0.1
+
+# 学习率调度器
+scheduler:
+  name: cosine_warmup
+  warmup_epochs: 10
+  min_lr: 0.000001
+  milestones: [60, 80]
+  gamma: 0.1
+  patience: 5
+  factor: 0.5
+
+# 损失函数权重 - 关键修复
+loss:
+  # 🔧 禁用不确定性加权以修复NaN问题
+  use_uncertainty_weighting: false  # 暂时禁用自动调参，使用静态权重
+  sigma_init:                      # 不确定性权重初始值（已禁用）
+    rgb: 0.2                       # RGB损失初始权重
+    depth: 0.2                     # 深度损失初始权重
+  lambda_img: 10.0
+  lambda_ssim: 1.0
+  lambda_perc: 1.0
+  lambda_fft: 0.1
+  lambda_grad: 0.1
+  lambda_depth: 0.1
+  lambda_smooth: 0.01
+  lambda_decl: 0.1
+  lambda_cons: 0.05
+# 物理一致性损失权重已删除
+  depth_weight: 1.0
+  
+  depth_processing:
+    use_log_transform: true
+    min_depth: 5000.0
+    max_depth: 65000.0
+    edge_weight: 0.5
+    use_edge_aware_loss: true
+    min_depth_log: 5000.0
+    max_depth_log: 65000.0
+    min_depth_linear: 5000.0
+    max_depth_linear: 65000.0
+    use_cross_attn: true
+
+  depth_edge_color:
+    w_edge: 1.0
+    w_depth: 0.5
+    
+  cross_attention:
+    norm_type: 1
+    reduction: "mean"
+    enable_saving: true
+
+# 可视化配置 - 优化频率
+visualization:
+  save_images: true
+  save_features: true
+  save_depth_fusion: true
+  max_images_per_batch: 4  # 每个批次最多保存多少图像
+  vis_freq: 500  # 每多少个batch保存一次可视化
+  val_vis_interval: 50  # 验证时每多少个batch记录一次TensorBoard可视化
+  max_val_vis_samples: 10  # 验证时最多在TensorBoard中可视化多少个样本
+  val_images:
+    save: true  # 是否保存验证集图像
+    max_samples: 8  # 最多保存多少个验证样本
+    save_comparison: true
+    save_metrics: true
+  save_model_graph: false
+  plot_lr: true
+  save_attention_maps: true  # 🔧 启用注意力图保存以计算注意力一致性损失
+
+# 日志配置
+logging:
+  console_level: "ERROR"  # 控制台日志级别："DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"
+                         # 设置为"CRITICAL"将使日志只写入文件而不显示到终端
+  file_level: "DEBUG"    # 文件日志级别，建议保持"DEBUG"以捕获所有信息 

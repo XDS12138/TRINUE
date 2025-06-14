@@ -18,7 +18,6 @@ __all__ = [
     'EdgeAwareDepthLoss',
     'DepthSmoothLoss',
     'DepthEdgeColorLoss',
-    'TeacherStudentLoss',
     'CrossAttentionConsistencyLoss',
     'DepthReconstructionLoss'
 ]
@@ -45,8 +44,8 @@ class SSIMLoss(nn.Module):
 
     def forward(self, img1: torch.Tensor, img2: torch.Tensor):
         # assume img range [-1,1] -> [0,1]
-        img1 = (img1 + 1) / 2
-        img2 = (img2 + 1) / 2
+        img1 = torch.clamp((img1 + 1) / 2, 0, 1)
+        img2 = torch.clamp((img2 + 1) / 2, 0, 1)
         
         # 确保输入为float32以避免半精度问题
         original_dtype = img1.dtype
@@ -64,7 +63,10 @@ class SSIMLoss(nn.Module):
         sigma1_sq = F.conv2d(img1 * img1, window, padding=self.window_size//2, groups=C) - mu1_sq
         sigma2_sq = F.conv2d(img2 * img2, window, padding=self.window_size//2, groups=C) - mu2_sq
         sigma12 = F.conv2d(img1 * img2, window, padding=self.window_size//2, groups=C) - mu1_mu2
-        ssim_map = ((2 * mu1_mu2 + self.C1) * (2 * sigma12 + self.C2)) / ((mu1_sq + mu2_sq + self.C1) * (sigma1_sq + sigma2_sq + self.C2))
+        
+        # 添加小的epsilon防止分母为0
+        eps = 1e-12
+        ssim_map = ((2 * mu1_mu2 + self.C1) * (2 * sigma12 + self.C2)) / ((mu1_sq + mu2_sq + self.C1) * (sigma1_sq + sigma2_sq + self.C2) + eps)
         loss = torch.clamp((1 - ssim_map) / 2, 0, 1).mean()
         
         # 恢复到原始数据类型
@@ -243,6 +245,9 @@ class EdgeAwareDepthLoss(nn.Module):
         for param in self.parameters():
             param.requires_grad = False
         
+        # 设备管理标志
+        self._device_set = False
+        
         # 添加统计计数器和调试标志
         self.debug_mode = True  # 设置为True以输出额外的调试信息
         self.calls_count = 0
@@ -255,6 +260,12 @@ class EdgeAwareDepthLoss(nn.Module):
         
     def _compute_depth_edges(self, depth):
         """计算深度图的梯度图"""
+        # 确保Sobel算子在正确的设备上
+        if not self._device_set or self.sobel_x.weight.device != depth.device:
+            self.sobel_x = self.sobel_x.to(depth.device)
+            self.sobel_y = self.sobel_y.to(depth.device)
+            self._device_set = True
+        
         # 首先归一化到[0,1]
         depth_norm = self._normalize_depths(depth)
         
@@ -401,6 +412,12 @@ class EdgeAwareDepthLoss(nn.Module):
         
     def _compute_normalized_edges(self, depth):
         """计算已归一化深度图的梯度图"""
+        # 确保Sobel算子在正确的设备上
+        if not self._device_set or self.sobel_x.weight.device != depth.device:
+            self.sobel_x = self.sobel_x.to(depth.device)
+            self.sobel_y = self.sobel_y.to(depth.device)
+            self._device_set = True
+        
         # 直接计算水平和垂直梯度
         grad_x = self.sobel_x(depth)
         grad_y = self.sobel_y(depth)
@@ -524,7 +541,12 @@ class CrossAttentionConsistencyLoss(nn.Module):
         """计算两个方向注意力图之间的对偶一致性损失"""
         if attn_d2r is None or attn_r2d is None:
             # 如果任一注意力图为空，返回零损失
-            device = attn_d2r.device if attn_d2r is not None else attn_r2d.device
+            if attn_d2r is not None:
+                device = attn_d2r.device
+            elif attn_r2d is not None:
+                device = attn_r2d.device
+            else:
+                device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
             print(f"[注意力一致性损失] 注意力图缺失: d2r={attn_d2r is not None}, r2d={attn_r2d is not None}")
             return {'total': torch.tensor(0.0, device=device)}
         
@@ -596,8 +618,10 @@ class ImageLoss(nn.Module):
             import lpips
             self.perceptual_loss = lpips.LPIPS(net='vgg').eval()
             self.has_perceptual = True
+            self._perceptual_device_set = False
         except ImportError:
             self.has_perceptual = False
+            self.perceptual_loss = None
             print("LPIPS库未安装，将不使用感知损失。可使用'pip install lpips'安装")
         
         # 存储最近的损失值
@@ -628,10 +652,17 @@ class ImageLoss(nn.Module):
         
         # 3. 感知损失（如果可用）
         if self.has_perceptual:
+            # 确保LPIPS在正确的设备上
+            if not self._perceptual_device_set or next(self.perceptual_loss.parameters()).device != pred.device:
+                self.perceptual_loss = self.perceptual_loss.to(pred.device)
+                self._perceptual_device_set = True
+            
             # LPIPS期望输入在[-1,1]范围内
             perceptual_loss = self.perceptual_loss(pred, target).mean()
             total_loss += self.lambda_perceptual * perceptual_loss
             self.last_losses['perceptual_loss'] = perceptual_loss.item()
+        else:
+            perceptual_loss = torch.tensor(0.0, device=pred.device)
         
         # 4. 频域损失
         fft_loss = self.fft_loss(pred, target)
@@ -785,10 +816,6 @@ class TotalLoss(nn.Module):
                  lambda_smooth=0.01,
                  lambda_decl=0.1,
                  lambda_cons=0.05,
-                 lambda_phy_A=0.1,
-                 lambda_phy_D=0.1,
-                 beta_c=None,
-                 B_c=None,
                  use_uncertainty_weighting=True):
         super().__init__()
         
@@ -810,12 +837,6 @@ class TotalLoss(nn.Module):
         self.lambda_smooth = lambda_smooth
         self.lambda_decl = lambda_decl
         self.lambda_cons = lambda_cons
-        self.lambda_phy_A = lambda_phy_A  # 物理一致性损失A权重
-        self.lambda_phy_D = lambda_phy_D  # 物理一致性损失D权重
-        
-        # 物理模型参数（从模型传入）
-        self.beta_c = beta_c  # Beer-Lambert 衰减系数
-        self.B_c = B_c        # 全局背景光
         
         # 组件损失
         self.image_loss = ImageLoss(
@@ -841,45 +862,49 @@ class TotalLoss(nn.Module):
         self.use_uncertainty_weighting = use_uncertainty_weighting
         
         if use_uncertainty_weighting:
-            # log(σ²) 参数初始化为0，相当于初始不确定度为1
-            self.log_var_l1 = nn.Parameter(torch.zeros(1))
-            self.log_var_ssim = nn.Parameter(torch.zeros(1))
-            self.log_var_perc = nn.Parameter(torch.zeros(1))
-            self.log_var_fft = nn.Parameter(torch.zeros(1))
-            self.log_var_grad = nn.Parameter(torch.zeros(1))
+            # 🔥 更保守的初始化策略：避免log_var变得过度负数
+            # log(σ²) 参数初始化，相当于初始不确定度适中
+            init_log_var = -0.5  # 对应精度权重 exp(0.5) ≈ 1.65，更保守
             
-            self.log_var_depth_pred = nn.Parameter(torch.zeros(1))
-            self.log_var_depth_smooth = nn.Parameter(torch.zeros(1))
-            self.log_var_depth_rec = nn.Parameter(torch.zeros(1))
+            self.log_var_l1 = nn.Parameter(torch.ones(1) * init_log_var)
+            self.log_var_ssim = nn.Parameter(torch.ones(1) * init_log_var)
+            self.log_var_perc = nn.Parameter(torch.ones(1) * init_log_var)
+            self.log_var_fft = nn.Parameter(torch.ones(1) * init_log_var)
+            self.log_var_grad = nn.Parameter(torch.ones(1) * init_log_var)
             
-            self.log_var_cons = nn.Parameter(torch.zeros(1))
-            self.log_var_phy_A = nn.Parameter(torch.zeros(1))
-            self.log_var_phy_D = nn.Parameter(torch.zeros(1))
+            # 深度相关损失使用更保守的初始值
+            depth_init_log_var = -1.0  # 对应精度权重 exp(1) ≈ 2.7，比之前更保守
+            self.log_var_depth_decoder = nn.Parameter(torch.ones(1) * depth_init_log_var)
+            self.log_var_depth_smooth = nn.Parameter(torch.ones(1) * depth_init_log_var)
+            self.log_var_depth_rec = nn.Parameter(torch.ones(1) * init_log_var)
+            
+            self.log_var_cons = nn.Parameter(torch.ones(1) * depth_init_log_var)
+            
+            # 🔥 添加参数约束，防止log_var过度变化
+            self.log_var_min = -3.0  # 最小值，防止权重过大
+            self.log_var_max = 2.0   # 最大值，防止权重过小
         
         # 记录损失值
         self.losses = {}
         self._forward_count = 0 # 内部计数器，用于控制日志频率
     
     def get_latest_losses(self):
-        return self.losses
+        return self.losses.copy()
     
-    def forward(self, pred, target, depth_gate=None, depth_gt=None, 
+    def forward(self, pred, target, depth_gt=None, 
                 student_feats=None, attention_maps=None, depth_pred=None, depth_conf_map=None,
-                J_D=None, I_A=None, raw=None):
+                raw=None):
         """
         计算总损失
         
         Args:
             pred: 预测的RGB图像 [B,3,H,W]
             target: 目标RGB图像 [B,3,H,W]
-            depth_gate: 预测的深度门控图 [B,1,H,W] or None
             depth_gt: 深度GT [B,1,H,W] or None
             student_feats: 学生特征列表 or None
             attention_maps: 注意力图元组 (depth2rgb, rgb2depth) or None
             depth_pred: DepthDecoder 输出的连续深度 [B,1,H,W] or None
             depth_conf_map: 深度置信度图 [B,1,H,W] or None (用于DECL损失)
-            J_D: D式模糊后的去模糊图 [B,3,H,W]
-            I_A: A式Beer–Lambert合成输出 [B,3,H,W]
             raw: 原始退化水下图 [B,3,H,W]
         
         Returns:
@@ -907,7 +932,7 @@ class TotalLoss(nn.Module):
             self.metrics_logger.info(f"  [Image] l1={l1_loss:.4f}, ssim={ssim_loss:.4f}, perceptual={perc_loss:.4f}, fft={fft_loss:.4f}, grad={grad_loss:.4f}")
 
         # 深度损失组：深度预测 + 深度平滑
-        depth_pred_loss = torch.tensor(0.0, device=device)
+
         depth_smooth_loss = torch.tensor(0.0, device=device)
         depth_total_loss = torch.tensor(0.0, device=device)
         
@@ -916,9 +941,20 @@ class TotalLoss(nn.Module):
         
         # 使用 DepthDecoder 输出的深度预测计算深度回归损失
         if depth_pred is not None and depth_gt is not None:
+            # 添加调试信息
+            if log_this_step:
+                self.depth_logger.info(f"  [DEBUG] depth_pred: shape={depth_pred.shape}, min={depth_pred.min().item():.6f}, max={depth_pred.max().item():.6f}, mean={depth_pred.mean().item():.6f}")
+                self.depth_logger.info(f"  [DEBUG] depth_gt: shape={depth_gt.shape}, min={depth_gt.min().item():.6f}, max={depth_gt.max().item():.6f}, mean={depth_gt.mean().item():.6f}")
+                
+                # 🔥 检查深度预测的数值范围，判断是否已归一化
+                pred_is_normalized = depth_pred.max().item() <= 1.0 and depth_pred.min().item() >= 0.0
+                gt_is_normalized = depth_gt.max().item() <= 1.0 and depth_gt.min().item() >= 0.0
+                self.depth_logger.info(f"  [DEBUG] pred_is_normalized: {pred_is_normalized}, gt_is_normalized: {gt_is_normalized}")
+            
             depth_losses = self.depth_loss(depth_pred, depth_gt)
             depth_decoder_loss = depth_losses['depth_pred']
-            depth_total_loss += depth_decoder_loss
+            depth_smooth_loss = depth_losses['depth_smooth']  # 正确提取depth_smooth损失
+            depth_total_loss += depth_decoder_loss + depth_smooth_loss  # 将两者都加入总损失
             
             # 记录额外的深度损失组件
             if 'l1' in depth_losses:
@@ -927,7 +963,15 @@ class TotalLoss(nn.Module):
                 self.losses['depth_decoder_edge'] = depth_losses['edge_weighted'].item()
             
             if log_this_step:
-                self.depth_logger.info(f"  [Depth] decoder_loss={depth_decoder_loss:.4f} (l1={self.losses.get('depth_decoder_l1', 0):.4f}, edge={self.losses.get('depth_decoder_edge', 0):.4f})")
+                self.depth_logger.info(f"  [Depth] decoder_loss={depth_decoder_loss:.4f}, smooth_loss={depth_smooth_loss:.4f} (l1={self.losses.get('depth_decoder_l1', 0):.4f}, edge={self.losses.get('depth_decoder_edge', 0):.4f})")
+        else:
+            # 添加调试信息说明为什么损失为0
+            if log_this_step:
+                self.depth_logger.info(f"  [DEBUG] depth_pred is None: {depth_pred is None}, depth_gt is None: {depth_gt is None}")
+                if depth_pred is None:
+                    self.depth_logger.info(f"  [DEBUG] depth_pred为None，跳过深度预测损失计算")
+                if depth_gt is None:
+                    self.depth_logger.info(f"  [DEBUG] depth_gt为None，跳过深度预测损失计算")
         
         # 深度边缘颜色损失 - 已完全禁用
         # DECL损失已被禁用，不参与任何计算，设置为0
@@ -977,13 +1021,23 @@ class TotalLoss(nn.Module):
             # 不确定性加权辅助函数
             def weight_loss(loss_value, log_var):
                 """根据不确定性对损失进行加权
-                loss = loss / (2*exp(log_var)) + log_var/2
+                loss = precision * loss_value + log_var/2
                 """
                 if not isinstance(loss_value, torch.Tensor):
                     loss_value = torch.tensor(loss_value, device=log_var.device)
-                # 加上小的epsilon防止数值问题
-                precision = torch.exp(-log_var) + 1e-8
-                return precision * loss_value + log_var / 2
+                
+                # 🔥 限制log_var范围，防止数值不稳定
+                log_var_clamped = torch.clamp(log_var, min=self.log_var_min, max=self.log_var_max)
+                
+                # 如果log_var超出范围，记录警告
+                if abs(log_var.item() - log_var_clamped.item()) > 1e-6:
+                    logging.getLogger('warning').warning(f"log_var被裁剪: {log_var.item():.4f} -> {log_var_clamped.item():.4f}")
+                
+                precision = torch.exp(-log_var_clamped) + 1e-8
+                weighted_loss = precision * loss_value + log_var_clamped / 2
+                
+                # 🔥 确保损失非负，这是关键！
+                return torch.clamp(weighted_loss, min=0.0)
             
             # 图像损失组
             weighted_l1_loss   = weight_loss(l1_loss,   self.log_var_l1)
@@ -993,125 +1047,71 @@ class TotalLoss(nn.Module):
             weighted_grad_loss = weight_loss(grad_loss, self.log_var_grad)
             
             # 深度损失组
-            weighted_depth_pred_loss = weight_loss(depth_pred_loss, self.log_var_depth_pred)
+
             weighted_depth_smooth_loss = weight_loss(depth_smooth_loss, self.log_var_depth_smooth)
-            weighted_depth_decoder_loss = weight_loss(depth_decoder_loss, self.log_var_depth_pred)  # 使用相同的权重
+            weighted_depth_decoder_loss = weight_loss(depth_decoder_loss, self.log_var_depth_decoder)  # 深度解码器损失
             weighted_depth_rec_loss = weight_loss(depth_rec_loss, self.log_var_depth_rec)
             
             # 其他损失
             weighted_attn_cons_loss = weight_loss(attn_cons_loss, self.log_var_cons)
             
-            # 物理一致性损失
-            L_phy_A = torch.tensor(0.0, device=device)
-            L_phy_D = torch.tensor(0.0, device=device)
-            weighted_phy_A_loss = torch.tensor(0.0, device=device)
-            weighted_phy_D_loss = torch.tensor(0.0, device=device)
-            
-            if I_A is not None and J_D is not None and raw is not None and depth_pred is not None and self.beta_c is not None and self.B_c is not None:
-                # 4.1 计算 t_c(exp) 和 B_c，这是用来重建 ˆI_D 时的 Beer–Lambert 衰减
-                depth_norm = torch.clamp(depth_pred, 0.0, 1.0)        # [B,1,H,W]
-                depth_3ch = depth_norm.repeat(1, 3, 1, 1)            # [B,3,H,W]
-                
-                # 4.2 L_phy_A: 直接让 I_A 与 raw 对齐
-                L1_A = F.l1_loss(I_A, raw)
-                Lssim_A = 1.0 - ssim(I_A, raw)  # SSIM越大越好，所以这里用1-SSIM
-                L_phy_A = L1_A + Lssim_A
-                
-                # 4.3 L_phy_D: 先让 J_D 经 Beer–Lambert，再跟 raw 对齐
-                t = torch.exp(- self.beta_c * depth_3ch)              # [B,3,H,W]
-                I_hat_D = J_D * t + self.B_c * (1.0 - t)              # [B,3,H,W]
-                I_hat_D = torch.clamp(I_hat_D, 0.0, 1.0)
-                L1_D = F.l1_loss(I_hat_D, raw)
-                Lssim_D = 1.0 - ssim(I_hat_D, raw)
-                L_phy_D = L1_D + Lssim_D
-
-                if log_this_step:
-                    self.physics_logger.info(f"  [Physics] L_phy_A={L_phy_A:.4f} (L1={L1_A:.4f}, SSIM={Lssim_A:.4f})")
-                    self.physics_logger.info(f"  [Physics] L_phy_D={L_phy_D:.4f} (L1={L1_D:.4f}, SSIM={Lssim_D:.4f})")
-                
-                # 记录物理一致性损失
-                self.losses['phy_A_L1'] = L1_A.item()
-                self.losses['phy_A_SSIM'] = Lssim_A.item()
-                self.losses['L_phy_A'] = L_phy_A.item()
-                self.losses['phy_D_L1'] = L1_D.item()
-                self.losses['phy_D_SSIM'] = Lssim_D.item()
-                self.losses['L_phy_D'] = L_phy_D.item()
-                
-                # 4.4 处理物理一致性损失
-                if self.use_uncertainty_weighting:
-                    weighted_phy_A_loss = weight_loss(L_phy_A, self.log_var_phy_A)
-                    weighted_phy_D_loss = weight_loss(L_phy_D, self.log_var_phy_D)
-                else:
-                    weighted_phy_A_loss = self.lambda_phy_A * L_phy_A
-                    weighted_phy_D_loss = self.lambda_phy_D * L_phy_D
-            
             # 计算总损失
-            if self.use_uncertainty_weighting:
-                loss = (weighted_l1_loss + weighted_ssim_loss + weighted_perc_loss
-                        + weighted_fft_loss + weighted_grad_loss
-                        + weighted_depth_pred_loss + weighted_depth_smooth_loss + weighted_depth_decoder_loss + weighted_depth_rec_loss
-                        + weighted_attn_cons_loss
-                        + weighted_phy_A_loss + weighted_phy_D_loss)
-                
-                if log_this_step:
-                    self.optimizer_logger.info(f"  [Uncertainty Weights]")
-                    self.optimizer_logger.info(f"    - Img: l1={torch.exp(-self.log_var_l1).item():.4f}, ssim={torch.exp(-self.log_var_ssim).item():.4f}, perc={torch.exp(-self.log_var_perc).item():.4f}, fft={torch.exp(-self.log_var_fft).item():.4f}, grad={torch.exp(-self.log_var_grad).item():.4f}")
-                    self.optimizer_logger.info(f"    - Dep: pred={torch.exp(-self.log_var_depth_pred).item():.4f}, smooth={torch.exp(-self.log_var_depth_smooth).item():.4f}, rec={torch.exp(-self.log_var_depth_rec).item():.4f}")
-                    self.optimizer_logger.info(f"    - Oth: cons={torch.exp(-self.log_var_cons).item():.4f}, phy_A={torch.exp(-self.log_var_phy_A).item():.4f}, phy_D={torch.exp(-self.log_var_phy_D).item():.4f}")
-                    self.metrics_logger.info(f"  [Total Loss] Weighted Sum: {loss.item():.4f}")
+            loss = (weighted_l1_loss + weighted_ssim_loss + weighted_perc_loss
+                    + weighted_fft_loss + weighted_grad_loss
+                    + weighted_depth_smooth_loss + weighted_depth_decoder_loss + weighted_depth_rec_loss
+                    + weighted_attn_cons_loss)
+            
+            if log_this_step:
+                self.optimizer_logger.info(f"  [Uncertainty Weights]")
+                self.optimizer_logger.info(f"    - Img: l1={torch.exp(-self.log_var_l1).item():.4f}, ssim={torch.exp(-self.log_var_ssim).item():.4f}, perc={torch.exp(-self.log_var_perc).item():.4f}, fft={torch.exp(-self.log_var_fft).item():.4f}, grad={torch.exp(-self.log_var_grad).item():.4f}")
+                self.optimizer_logger.info(f"    - Dep: decoder={torch.exp(-self.log_var_depth_decoder).item():.4f}, smooth={torch.exp(-self.log_var_depth_smooth).item():.4f}, rec={torch.exp(-self.log_var_depth_rec).item():.4f}")
+                self.optimizer_logger.info(f"    - Oth: cons={torch.exp(-self.log_var_cons).item():.4f}")
+                self.metrics_logger.info(f"  [Total Loss] Weighted Sum: {loss.item():.4f}")
 
-                # 记录各个不确定性权重
-                # 图像损失组
-                self.losses['uncertainty_l1'] = torch.exp(-self.log_var_l1).item()
-                self.losses['uncertainty_ssim'] = torch.exp(-self.log_var_ssim).item()
-                self.losses['uncertainty_perc'] = torch.exp(-self.log_var_perc).item()
-                self.losses['uncertainty_fft'] = torch.exp(-self.log_var_fft).item()
-                self.losses['uncertainty_grad'] = torch.exp(-self.log_var_grad).item()
-                
-                # 深度损失组
-                self.losses['uncertainty_depth_pred'] = torch.exp(-self.log_var_depth_pred).item()
-                self.losses['uncertainty_depth_smooth'] = torch.exp(-self.log_var_depth_smooth).item()
-                self.losses['uncertainty_depth_rec'] = torch.exp(-self.log_var_depth_rec).item()
-                
-                # 其他损失的不确定性权重
-                self.losses['uncertainty_cons'] = torch.exp(-self.log_var_cons).item()
-                
-                # 物理一致性损失的不确定性权重
-                if I_A is not None and J_D is not None:
-                    self.losses['uncertainty_phy_A'] = torch.exp(-self.log_var_phy_A).item()
-                    self.losses['uncertainty_phy_D'] = torch.exp(-self.log_var_phy_D).item()
-                
-                # 记录原始log_var值，便于调试
-                self.losses['log_var_l1'] = self.log_var_l1.item()
-                self.losses['log_var_ssim'] = self.log_var_ssim.item()
-                self.losses['log_var_perc'] = self.log_var_perc.item()
-                self.losses['log_var_fft'] = self.log_var_fft.item()
-                self.losses['log_var_grad'] = self.log_var_grad.item()
-                self.losses['log_var_depth_pred'] = self.log_var_depth_pred.item()
-                self.losses['log_var_depth_smooth'] = self.log_var_depth_smooth.item()
-                self.losses['log_var_depth_rec'] = self.log_var_depth_rec.item()
-                self.losses['log_var_phy_A'] = self.log_var_phy_A.item()
-                self.losses['log_var_phy_D'] = self.log_var_phy_D.item()
-                self.losses['log_var_cons'] = self.log_var_cons.item()
-            else:
-                # 手动加权
-                loss = (self.lambda_img * img_total_loss + 
-                        self.lambda_depth * depth_total_loss + 
-                        self.lambda_decl * decl_loss)
-                
-                # 加上注意力一致性损失和深度重建损失
-                loss += (self.lambda_cons * attn_cons_loss +
-                        self.lambda_depth * depth_rec_loss + 
-                        weighted_phy_A_loss + weighted_phy_D_loss)
+            # 记录各个不确定性权重
+            # 图像损失组 - 修复：记录的应该是权重值，不是exp(-log_var)
+            self.losses['uncertainty_l1'] = torch.exp(-self.log_var_l1).item()
+            self.losses['uncertainty_ssim'] = torch.exp(-self.log_var_ssim).item()
+            self.losses['uncertainty_perc'] = torch.exp(-self.log_var_perc).item()
+            self.losses['uncertainty_fft'] = torch.exp(-self.log_var_fft).item()
+            self.losses['uncertainty_grad'] = torch.exp(-self.log_var_grad).item()
+            
+            # 深度损失组
+            self.losses['uncertainty_depth_decoder'] = torch.exp(-self.log_var_depth_decoder).item()
+            self.losses['uncertainty_depth_smooth'] = torch.exp(-self.log_var_depth_smooth).item()
+            self.losses['uncertainty_depth_rec'] = torch.exp(-self.log_var_depth_rec).item()
+            
+            # 其他损失的不确定性权重
+            self.losses['uncertainty_cons'] = torch.exp(-self.log_var_cons).item()
+            
+            # 记录原始log_var值，便于调试
+            self.losses['log_var_l1'] = self.log_var_l1.item()
+            self.losses['log_var_ssim'] = self.log_var_ssim.item()
+            self.losses['log_var_perc'] = self.log_var_perc.item()
+            self.losses['log_var_fft'] = self.log_var_fft.item()
+            self.losses['log_var_grad'] = self.log_var_grad.item()
+            self.losses['log_var_depth_decoder'] = self.log_var_depth_decoder.item()
+            self.losses['log_var_depth_smooth'] = self.log_var_depth_smooth.item()
+            self.losses['log_var_depth_rec'] = self.log_var_depth_rec.item()
+            self.losses['log_var_cons'] = self.log_var_cons.item()
+            
+            # 🔥 添加调试信息，确保数值正确
+            if log_this_step:
+                self.optimizer_logger.info(f"  [Debug] Raw log_var values:")
+                self.optimizer_logger.info(f"    - log_var_l1={self.log_var_l1.item():.4f}, weight={torch.exp(-self.log_var_l1).item():.4f}")
+                self.optimizer_logger.info(f"    - log_var_cons={self.log_var_cons.item():.4f}, weight={torch.exp(-self.log_var_cons).item():.4f}")
+                self.optimizer_logger.info(f"    - log_var_depth_decoder={self.log_var_depth_decoder.item():.4f}, weight={torch.exp(-self.log_var_depth_decoder).item():.4f}")
         else:
             # 手动加权
             loss = (self.lambda_img * img_total_loss + 
                     self.lambda_depth * depth_total_loss + 
-                    self.lambda_decl * decl_loss)
+                    self.lambda_decl * decl_loss + 
+                    self.lambda_cons * attn_cons_loss)
             
-            # 加上注意力一致性损失和深度重建损失
-            loss += (self.lambda_cons * attn_cons_loss +
-                    self.lambda_depth * depth_rec_loss)
+            if log_this_step:
+                self.metrics_logger.info(f"  [Manual Weights] Total Loss: {loss.item():.4f}")
+        
+        # 物理一致性损失计算已删除
         
         # 记录总损失和组件损失
         self.losses['l1_loss'] = l1_loss.item()
@@ -1121,9 +1121,9 @@ class TotalLoss(nn.Module):
         self.losses['grad_loss'] = grad_loss.item()
         self.losses['img_total_loss'] = img_total_loss.item()
         
-        self.losses['depth_pred_loss'] = depth_pred_loss.item()
+
         self.losses['depth_smooth_loss'] = depth_smooth_loss.item()
-        self.losses['depth_decoder_loss'] = depth_decoder_loss.item()  # 添加对 depth_pred 的监督损失
+        self.losses['depth_decoder_loss'] = depth_decoder_loss.item()  # DepthDecoder 深度预测损失
         self.losses['depth_rec_loss'] = depth_rec_loss.item()
         self.losses['depth_total_loss'] = depth_total_loss.item()
         
@@ -1134,9 +1134,39 @@ class TotalLoss(nn.Module):
         
         self.losses['total_loss'] = loss.item()
         
+        # 🔥 验证所有损失值都是有效的数值（log_var可以为负数）
+        for loss_name, loss_value in self.losses.items():
+            # log_var参数可以为负数，所以不检查它们的符号
+            is_log_var = loss_name.startswith('log_var_')
+            
+            if not isinstance(loss_value, (int, float)) or not torch.isfinite(torch.tensor(loss_value)):
+                self.warning_logger.warning(f"Invalid loss value detected: {loss_name}={loss_value}")
+                # 将无效值设为0（对于log_var，设为合理的默认值）
+                if is_log_var:
+                    self.losses[loss_name] = -1.0  # log_var的合理默认值
+                else:
+                    self.losses[loss_name] = 0.0
+            elif not is_log_var and loss_value < 0:
+                # 只对非log_var的损失检查负值
+                self.warning_logger.warning(f"Negative loss value detected: {loss_name}={loss_value}")
+                self.losses[loss_name] = 0.0
+        
         if log_this_step:
             self.metrics_logger.info(f"--- [End Loss Calculation Step {self._forward_count}] ---")
             
+        # 🔥 约束不确定性权重参数，防止数值不稳定
+        if self.use_uncertainty_weighting:
+            with torch.no_grad():
+                self.log_var_l1.data.clamp_(self.log_var_min, self.log_var_max)
+                self.log_var_ssim.data.clamp_(self.log_var_min, self.log_var_max)
+                self.log_var_perc.data.clamp_(self.log_var_min, self.log_var_max)
+                self.log_var_fft.data.clamp_(self.log_var_min, self.log_var_max)
+                self.log_var_grad.data.clamp_(self.log_var_min, self.log_var_max)
+                self.log_var_depth_decoder.data.clamp_(self.log_var_min, self.log_var_max)
+                self.log_var_depth_smooth.data.clamp_(self.log_var_min, self.log_var_max)
+                self.log_var_depth_rec.data.clamp_(self.log_var_min, self.log_var_max)
+                self.log_var_cons.data.clamp_(self.log_var_min, self.log_var_max)
+        
         return loss
     
 # 实现SSIM函数，用于DepthReconstructionLoss
