@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from .sfe import ShallowFeatureExtractor
-from .depth import DepthFeatureExtractor, MonoDepthHead, ensure_normalized_depth, get_depth_config_params
+from .depth import DepthFeatureExtractor,ensure_normalized_depth, get_depth_config_params
 from .encoder import RawEncoder
 from .blocks import RestormerBlock
 from .decoder import MultiTaskDecoder
@@ -30,9 +30,17 @@ class ModelOutput:
     depth_conf_map: Optional[torch.Tensor] = None         # 深度置信度图
     attention_maps: Optional[Tuple[torch.Tensor, torch.Tensor]] = None  # 注意力图元组 (depth2rgb, rgb2depth)
     
+    # 🔥 多输入一致性学习新增属性
+    multi_enhanced: Optional[torch.Tensor] = None          # 多输入增强结果 [B, N, 3, H, W]
+    multi_depth_pred: Optional[torch.Tensor] = None        # 多输入深度预测 [B, N, 1, H, W]
+    multi_res_d: Optional[torch.Tensor] = None             # 多输入去模糊残差 [B, N, 3, H, W]
+    multi_res_c: Optional[torch.Tensor] = None             # 多输入颜色校正残差 [B, N, 3, H, W]
+
+    is_multi_input: bool = False                           # 是否为多输入模式
+    
     def to_dict(self) -> Dict[str, Any]:
         """转换为字典格式（兼容旧代码）"""
-        return {
+        result = {
             'enhanced': self.enhanced,
             'pred_gate': self.pred_gate,
             'depth_pred': self.depth_pred,
@@ -40,6 +48,19 @@ class ModelOutput:
             'depth_conf_map': self.depth_conf_map,
             'attention_maps': self.attention_maps
         }
+        
+        # 添加多输入属性
+        if self.is_multi_input:
+            result.update({
+                'multi_enhanced': self.multi_enhanced,
+                'multi_depth_pred': self.multi_depth_pred,
+                'multi_res_d': self.multi_res_d,
+                'multi_res_c': self.multi_res_c,
+
+                'is_multi_input': self.is_multi_input
+            })
+        
+        return result
 
 
 class UnderwaterEnhanceNet(nn.Module):
@@ -48,7 +69,7 @@ class UnderwaterEnhanceNet(nn.Module):
     --------------------------------
     架构流程：
       1. Shallow Feature Extractor (SFE)
-      2. DepthFeatureExtractor (训练期) + MonoDepthHead (蒸馏 & 推理)
+      2. DepthFeatureExtractor (训练期)
       3. RawEncoder (RGB + Depth 真值 + GT) -> student_feats, teacher_feats
       4. Joint Bottleneck (Restormer Blocks)
       5. MultiTaskDecoder (Deblur & Color 分支，支持 Dense Skip + 自适应深度融合)
@@ -62,7 +83,6 @@ class UnderwaterEnhanceNet(nn.Module):
       - out: Tensor[B,3,H,W]       (增强图)
       - pred_gate: Tensor[B,1,H,W] (预测门控图)
       - student_feats: list of Tensor (多尺度 RGB 特征)
-      - teacher_feats: list of Tensor or None (多尺度 GT 特征)
       - attention_maps: tuple of Tensor or None (depth2rgb, rgb2depth 注意力图)
     """
     def __init__(self, 
@@ -187,7 +207,7 @@ class UnderwaterEnhanceNet(nn.Module):
                 else:
                     # 否则维持基础通道数
                     expected_depth_channels.append(base_channels)
-
+        
         # 打印调试信息
         self.arch_logger.info(f"  - Initializing depth projection layers with expected channels: {expected_depth_channels}")
 
@@ -220,6 +240,10 @@ class UnderwaterEnhanceNet(nn.Module):
         
         # 启动时进行一次dummy forward检查，确保通道匹配
         self._perform_channel_validation_check()
+        
+        # 删除：多输出融合模块（已简化为仅使用一致性损失）
+        
+        self.arch_logger.info("  - Multi-Output Fusion: disabled (using consistency loss only)")
         
         self.arch_logger.info(f"--- UnderwaterEnhanceNet Initialized ---")
         
@@ -324,15 +348,40 @@ class UnderwaterEnhanceNet(nn.Module):
     def forward(self,
                 raw: torch.Tensor,
                 depth_gt: torch.Tensor = None,
-                gt: torch.Tensor = None) -> Union[ModelOutput, Dict[str, Any]]:
+                gt: torch.Tensor = None,
+                enable_multi_input_consistency: bool = False) -> Union[ModelOutput, Dict[str, Any]]:
         
         self._forward_count += 1
         # 只在每个epoch的第一个batch记录详细日志
         log_this_step = self._forward_count == 1 
 
+        # 检查是否为多输入模式
+        is_multi_input = raw.dim() == 5  # [B, N, C, H, W]
+        
+        if is_multi_input and enable_multi_input_consistency:
+            # 🔥 多输入一致性学习模式
+            return self._forward_multi_input_consistency(raw, depth_gt, gt, log_this_step)
+        elif is_multi_input:
+            # 传统模式：展平多输入为批次，取第一个退化
+            B, N, C, H, W = raw.shape
+            raw = raw[:, 0]  # [B, C, H, W] - 取第一个退化
+            
+            # 处理GT和depth_gt
+            if depth_gt is not None:
+                if depth_gt.dim() == 5:  # [B, N, 1, H, W]
+                    depth_gt = depth_gt[:, 0]  # [B, 1, H, W]
+                # 否则保持原样 [B, 1, H, W]
+            
+            if gt is not None:
+                if gt.dim() == 5:  # [B, N, C, H, W]
+                    gt = gt[:, 0]  # [B, C, H, W]
+                # 否则保持原样 [B, C, H, W]
+
         if log_this_step:
             self.logger.info(f"--- [Forward Pass Start] ---")
             self.logger.info(f"Input shapes: raw={raw.shape}, depth_gt={depth_gt.shape if depth_gt is not None else 'None'}, gt={gt.shape if gt is not None else 'None'}")
+            if is_multi_input:
+                self.logger.info(f"Multi-input mode: {'Consistency Learning' if enable_multi_input_consistency else 'First Degradation Only'}")
 
         # 混合精度训练兼容性：确保输入数据类型一致
         if depth_gt is not None and raw.dtype != depth_gt.dtype:
@@ -402,9 +451,6 @@ class UnderwaterEnhanceNet(nn.Module):
             pred_gate = self.depth_head(depth_feats[0])                                                         
             if log_this_step: self.logger.info(f"  - pred_gate shape: {pred_gate.shape}")
 
-            # 计算深度置信度图 - 禁用用于调试DECL损失
-            depth_conf_map = None
-            if log_this_step: self.logger.info(f"  - depth_conf_map disabled for DECL debugging")
 
             # ——— Pass-2: 用预测的 depth_feats + raw + gt 做 RGB 分支（与推理时第二次前向一致） ———
             if log_this_step: self.logger.info("--- Pass-2: RGB Enhancement ---")
@@ -500,9 +546,9 @@ class UnderwaterEnhanceNet(nn.Module):
 
             # 4) 用第 0 级深度特征生成门控图 pred_gate；禁用置信度图用于调试DECL损失
             pred_gate = self.depth_head(depth_feats[0])
-            depth_conf_map = None  # 禁用深度置信度图
+
             if log_this_step: self.logger.info(f"  - pred_gate shape: {pred_gate.shape}")
-            if log_this_step: self.logger.info(f"  - depth_conf_map disabled for DECL debugging (inference)")
+
 
             # 5) Pass-2：将 raw + depth_feats → RGB 编码器 → 解码 → ReconHead → 输出增强图
             if log_this_step: self.logger.info("--- Pass-2: RGB Enhancement ---")
@@ -789,3 +835,148 @@ class UnderwaterEnhanceNet(nn.Module):
                                  f"Dynamic adapter creation has been disabled to fix memory jumps.")
         
         return self.depth_feature_adapters[adapter_key]
+
+    def _forward_multi_input_consistency(self, raw, depth_gt, gt, log_this_step):
+        """
+        🔥 多输入一致性学习前向传播 - 所有候选都参与损失计算
+        实现方案：展平多输入为批次维度，然后用 repeat_interleave 处理 GT
+        所有N个候选输出都保留用于损失计算，而不仅仅是融合后的单一输出
+        
+        Args:
+            raw: [B, N, C, H, W] - N个不同退化的输入
+            depth_gt: [B, 1, H, W] 或 [B, N, 1, H, W]
+            gt: [B, C, H, W] 或 [B, N, C, H, W]
+        Returns:
+            ModelOutput with:
+            - 主输出: 所有候选的集成平均结果 (用于可视化)
+            - 多候选: 所有N个原始候选 (用于全面的损失计算)
+            - 一致性: CMCL损失约束多候选之间的一致性
+        """
+        B, N, C, H, W = raw.shape
+        
+        if log_this_step:
+            self.logger.info(f"--- Multi-Input Consistency Learning (Decoder Fusion Level) ---")
+            self.logger.info(f"Input shape: [B={B}, N={N}, C={C}, H={H}, W={W}]")
+        
+        # 🔥 方案：展平 + repeat_interleave（如用户建议）
+        # 将 [B, N, C, H, W] 展平为 [B*N, C, H, W]
+        raw_flat = raw.reshape(B * N, C, H, W)
+        
+        # 处理 GT 数据 - 使用 repeat_interleave
+        if depth_gt is not None:
+            if depth_gt.dim() == 4:  # [B, 1, H, W] 
+                # 每个样本的深度重复 N 次：[B, 1, H, W] -> [B*N, 1, H, W]
+                depth_gt_flat = depth_gt.repeat_interleave(N, dim=0)
+            elif depth_gt.dim() == 5:  # [B, N, 1, H, W]
+                depth_gt_flat = depth_gt.reshape(B * N, 1, H, W)
+            else:
+                depth_gt_flat = depth_gt
+        else:
+            depth_gt_flat = None
+        
+        if gt is not None:
+            if gt.dim() == 4:  # [B, C, H, W]
+                # 每个样本的 GT 重复 N 次：[B, C, H, W] -> [B*N, C, H, W]
+                gt_flat = gt.repeat_interleave(N, dim=0)
+            elif gt.dim() == 5:  # [B, N, C, H, W]
+                gt_flat = gt.reshape(B * N, C, H, W)
+            else:
+                gt_flat = gt
+        else:
+            gt_flat = None
+        
+        if log_this_step:
+            self.logger.info(f"Flattened shapes: raw_flat={raw_flat.shape}, "
+                           f"depth_gt_flat={depth_gt_flat.shape if depth_gt_flat is not None else 'None'}, "
+                           f"gt_flat={gt_flat.shape if gt_flat is not None else 'None'}")
+        
+        # 🔥 修改前向传播以记录残差
+        # === Pass-1: 深度预测 ===
+        x = self.sfe(raw_flat)
+        student_feats_pass1, bottleneck_pass1 = self._encode(raw_flat, depth_feats=None, gt=None)
+        depth_pred_flat, depth_feats = self.depth_decoder(bottleneck_pass1, student_feats_pass1)
+        
+        # 投影深度特征
+        projected_depth_feats = []
+        for i, feat in enumerate(depth_feats[:self.levels]):
+            if i < len(self.depth_projection_layers):
+                if feat.shape[1] != self.depth_projection_layers[i].in_channels:
+                    adapter = self._get_or_create_adapter(feat.shape[1], self.depth_projection_layers[i].in_channels, feat.device)
+                    feat = adapter(feat)
+                projected_feat = self.depth_projection_layers[i](feat)
+                projected_depth_feats.append(projected_feat)
+            else:
+                projected_depth_feats.append(feat)
+        depth_feats = projected_depth_feats
+        
+        pred_gate_flat = self.depth_head(depth_feats[0])
+        
+        # === Pass-2: RGB增强 ===
+        training_mode = self.training or depth_gt_flat is not None
+        if training_mode:
+            student_feats_flat, _ = self.encoder(x, depth_feats=depth_feats, gt=gt_flat)
+        else:
+            student_feats_flat, _ = self.encoder(x, depth_feats=depth_feats, gt=None)
+            
+        bottleneck_flat = self.bottleneck(student_feats_flat[-1])
+        
+        # 物理参数预测
+        beta_c, B_c, blur_scale = self.physics_head(bottleneck_flat)
+        
+        # === 解码阶段：获取残差 ===
+        res_d_flat, res_c_flat = self.decoder(
+            bottleneck_flat, student_feats_flat[:-1], depth_feats, raw_flat,
+            depth_pred=depth_pred_flat, beta_c=beta_c, B_c=B_c, blur_scale=blur_scale
+        )
+        
+        # 重建
+        enhanced_flat, depth_pred_refine_flat = self.recon(raw_flat, res_d_flat, res_c_flat, student_feats_flat[0])
+        
+        # 🔥 重新组织输出为多输入格式
+        enhanced = enhanced_flat.reshape(B, N, C, H, W)  # [B, N, C, H, W]
+        depth_pred = depth_pred_refine_flat.reshape(B, N, 1, H, W)  # [B, N, 1, H, W]
+        pred_gate = pred_gate_flat.reshape(B, N, 1, H, W)  # [B, N, 1, H, W]
+        
+        # 🔥 关键：重新组织残差用于一致性计算
+        res_d = res_d_flat.reshape(B, N, C, H, W)  # [B, N, C, H, W] - 去模糊残差
+        res_c = res_c_flat.reshape(B, N, C, H, W)  # [B, N, C, H, W] - 颜色校正残差
+        
+        # 🔥 新策略：使用所有候选的平均作为主输出，但保留完整的多候选信息
+        # 这样既有单一输出用于可视化，又有完整信息用于损失计算
+        primary_enhanced = torch.mean(enhanced, dim=1)  # [B, C, H, W] - 所有候选的平均
+        primary_depth_pred = torch.mean(depth_pred, dim=1)  # [B, 1, H, W] - 所有候选的平均
+        primary_pred_gate = torch.mean(pred_gate, dim=1)  # [B, 1, H, W] - 所有候选的平均
+        
+        if log_this_step:
+            self.logger.info("Using ensemble average as primary output, all candidates available for loss calculation")
+        
+        if log_this_step:
+            self.logger.info(f"Multi-input results (All Candidates):")
+            self.logger.info(f"  - enhanced: {enhanced.shape} (all {N} candidates)")
+            self.logger.info(f"  - depth_pred: {depth_pred.shape} (all {N} candidates)")
+            self.logger.info(f"  - res_d (deblur): {res_d.shape} (all {N} candidates)")
+            self.logger.info(f"  - res_c (color): {res_c.shape} (all {N} candidates)")
+            self.logger.info(f"  - primary outputs (ensemble): enhanced={primary_enhanced.shape}")
+        
+        # 🔥 获取注意力图用于损失计算
+        attention_maps = self.get_attention_maps() if self.save_attention_maps else None
+        
+        # 特征一致性已删除，只保留输出层面的CMCL一致性约束
+        
+        # 🔥 创建多输入模式的输出（包含所有候选用于损失计算）
+        result = ModelOutput(
+            enhanced=primary_enhanced,
+            pred_gate=primary_pred_gate,
+            depth_pred=primary_depth_pred,
+            student_feats=student_feats_flat,  # 保持原始特征格式 [B*N, ...]
+            depth_conf_map=None,  # 简化
+            attention_maps=attention_maps,    # 🔥 正确传递注意力图
+            # 多输入特有属性 - 🔥 所有候选都可用于损失计算
+            multi_enhanced=enhanced,         # [B, N, C, H, W] - 所有N个增强候选
+            multi_depth_pred=depth_pred,     # [B, N, 1, H, W] - 所有N个深度候选  
+            multi_res_d=res_d,              # [B, N, C, H, W] - 所有N个去模糊残差
+            multi_res_c=res_c,              # [B, N, C, H, W] - 所有N个颜色校正残差
+            is_multi_input=True
+        )
+        
+        return result

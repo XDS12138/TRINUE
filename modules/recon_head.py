@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 def default_activation(x: torch.Tensor) -> torch.Tensor:
     """
@@ -31,6 +32,17 @@ class ReconHead(nn.Module):
                 raw: torch.Tensor,
                 res_d: torch.Tensor,
                 res_c: torch.Tensor) -> torch.Tensor:
+        # 🔥 修复尺寸不匹配问题：确保残差与原图尺寸一致
+        target_size = raw.shape[-2:]  # (H, W)
+        
+        # 检查并调整去模糊残差尺寸
+        if res_d.shape[-2:] != target_size:
+            res_d = F.interpolate(res_d, size=target_size, mode='bilinear', align_corners=False)
+            
+        # 检查并调整颜色残差尺寸  
+        if res_c.shape[-2:] != target_size:
+            res_c = F.interpolate(res_c, size=target_size, mode='bilinear', align_corners=False)
+        
         # 合成 residuals
         x = raw + res_d + res_c
         # 激活到 [-1,1]
@@ -72,12 +84,26 @@ class MultiTaskHead(nn.Module):
                 res_d: torch.Tensor,
                 res_c: torch.Tensor,
                 feat: torch.Tensor = None) -> tuple[torch.Tensor, torch.Tensor]:
-        # 增强图像重建（保持原有逻辑）
+        # 🔥 修复尺寸不匹配问题：确保残差与原图尺寸一致
+        target_size = raw.shape[-2:]  # (H, W)
+        
+        # 检查并调整去模糊残差尺寸
+        if res_d.shape[-2:] != target_size:
+            res_d = F.interpolate(res_d, size=target_size, mode='bilinear', align_corners=False)
+            
+        # 检查并调整颜色残差尺寸  
+        if res_c.shape[-2:] != target_size:
+            res_c = F.interpolate(res_c, size=target_size, mode='bilinear', align_corners=False)
+        
+        # 增强图像重建
         enhanced = raw + res_d + res_c
         enhanced = self.activation(enhanced)
         
         # 深度预测
         if feat is not None:
+            # 确保特征图也与原图尺寸一致
+            if feat.shape[-2:] != target_size:
+                feat = F.interpolate(feat, size=target_size, mode='bilinear', align_corners=False)
             depth_pred = self.depth_head(feat)
         else:
             # 如果没有特征图，返回零深度图

@@ -13,12 +13,29 @@ model:
   levels: 4
   heads: 8
   bottleneck_blocks: 4
-  encoder_window_size: 8 
-  bottleneck_window_size: 8  # 启用瓶颈窗口
-  decoder_block_window_size: 8
+  encoder_window_size: 4 
+  bottleneck_window_size: 4  # 启用瓶颈窗口
+  decoder_block_window_size: 4
   depth_processor_config:
-    double_channels: False
+    double_channels: True
     use_cross_attn: true
+
+# 🔥 多输入一致性学习配置（解码器融合级别约束）
+multi_input_consistency:
+  enable: true                    # 是否启用多输入一致性学习
+  
+  # 🔥 多输出融合配置
+  fusion:
+    strategy: "confidence_weighted"  # 融合策略：'first_only', 'mean', 'confidence_weighted'
+    temperature: 1.0                # 置信度权重温度参数，控制权重分布尖锐程度
+
+  # 🔥 跨退化一致性损失 (CMCL) 配置
+  cmcl:
+    enable: true                    # 是否启用CMCL损失
+    lambda_var: 1.0                # 方差损失权重
+    lambda_rgb: 1.0                # RGB一致性损失权重
+    lambda_depth: 1.0              # 深度一致性损失权重
+    k_decay: 1.0                   # 深度置信权重衰减系数
 
 # 训练配置
 train:
@@ -50,13 +67,13 @@ data:
     gt: "gt"        # 目标图像文件夹名
     depth: "depth"  # 深度图文件夹名
   # 退化图像文件夹列表 - 用于控制输入数据
-  degradation_folders: ['raw']  # which folders to use
+  degradation_folders: ['raw', 'raw1']  # which folders to use
   lmdb_paths:  # LMDB路径，仅在format="lmdb"时有效
-    train: DATA/train.lmdb"
+    train: "DATA/train.lmdb"
     val: "DATA/val.lmdb"
   batch_size: 1
   num_workers: 32
-  resolution: 512  # 训练分辨率，可以是单值或[h, w]格式
+  resolution: 384  # 训练分辨率，可以是单值或[h, w]格式
   augment_prob: 0.1
   augmentations:
     random_crop: True
@@ -64,10 +81,6 @@ data:
     flip_v: False
     color_jitter: True
 
-
-depth_processor_config:
-  double_channels: false
-  use_cross_attn: true
 # 优化器配置
 optimizer:
   name: adamw  # adam, adamw, sgd
@@ -77,8 +90,8 @@ optimizer:
   beta2: 0.99
   momentum: 0.9  # 仅对SGD有效
   nesterov: true  # 仅对SGD有效
-  attn_lr_scale: 0.1  # 交叉注意力模块的学习率缩放因子
-  physics_lr_scale: 1.0  # 物理参数模块的学习率缩放因子
+  attn_lr_scale: 0.5  # 交叉注意力模块的学习率缩放因子
+  physics_lr_scale: 0.8 # 物理参数模块的学习率缩放因子
   clip_grad_norm: 1.0  # 🔧 添加梯度裁剪，防止梯度爆炸
 
 # 学习率调度器
@@ -96,17 +109,24 @@ loss:
   # 自动调参设置
   use_uncertainty_weighting: true  # 是否使用自动调参（不确定性加权）。设为false时使用下面的静态权重
   sigma_init:                      # 不确定性权重初始值
-    rgb: 0.2                       # RGB损失初始权重
+    rgb: 0.5                       # RGB损失初始权重
     depth: 0.2                     # 深度损失初始权重
-  lambda_img: 10.0    # L1 像素损失
+  lambda_img: 3.0    # L1 像素损失
   lambda_ssim: 1.0   # 结构相似度损失
   lambda_perc: 1.0   # 感知损失
   lambda_fft: 0.1   # 频域损失
   lambda_grad: 0.1   # 梯度损失
-  lambda_depth: 0.1  # 深度预测损失
+  lambda_depth: 1  # 深度预测损失
   lambda_smooth: 0.01  # 深度平滑损失
-  lambda_decl: 0.1  # 深度边缘颜色损失权重
   lambda_cons: 0.05  # 交叉注意力一致性损失权重
+
+  
+  # 🔥 跨退化一致性损失 (CMCL) 权重
+  lambda_cmcl: 0.1         # CMCL总权重
+  lambda_cmcl_var: 1.0     # 方差损失权重
+  lambda_cmcl_rgb: 1.0     # RGB一致性权重  
+  lambda_cmcl_depth: 1.0   # 深度一致性权重
+  cmcl_k_decay: 1.0        # 深度衰减系数
 # 物理一致性损失权重已删除
   depth_weight: 1.0  # 深度回归损失权重（用于连续深度预测）
   depth_processing:
@@ -186,6 +206,6 @@ visualization:
 
 
 logging:
-  console_level: "ERROR"  # 控制台日志级别："DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"
+  console_level: "WARNING"  # 控制台日志级别："DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"
                          # 设置为"CRITICAL"将使日志只写入文件而不显示到终端
   file_level: "DEBUG"    # 文件日志级别，建议保持"DEBUG"以捕获所有信息

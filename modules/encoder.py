@@ -125,13 +125,20 @@ class RawEncoder(nn.Module):
                 nn.Parameter(torch.zeros(1), requires_grad=True) for _ in range(levels)
             ])
 
+        # === 五、新增：增强深度特征返回选项 ===
+        # 是否返回增强后的深度特征 (默认False保持向后兼容)
+        self.return_enhanced_depth = depth_processor_config.get('return_enhanced_depth', False) if depth_processor_config else False
+        logger.info(f"RawEncoder: return_enhanced_depth = {self.return_enhanced_depth}")
+
 
     def forward(
         self,
         x: torch.Tensor,
         depth_gt: torch.Tensor = None,
         gt: torch.Tensor = None,
-        depth_feats: list = None
+        depth_feats: list = None,
+        return_enhanced_depth: bool = None,
+        attention_mode: str = "both"  # 新增：控制注意力方向 "both", "d2r_only", "r2d_only"
     ) -> tuple:
         """
         前向传播，获取编码器特征
@@ -140,17 +147,31 @@ class RawEncoder(nn.Module):
             depth_gt: [B, 1, H, W] 原始深度图 (未使用)
             gt: [B, 3, H, W]  清晰图 ground truth (未使用，仅 API 兼容)
             depth_feats: list 多尺度深度特征（推理时可能用双次前向提供）
+            return_enhanced_depth: bool 是否返回增强深度特征 (None时使用初始化配置)
+            attention_mode: str 注意力方向控制
+                - "both": 双向注意力 (默认，保持向后兼容)
+                - "d2r_only": 仅Depth→RGB注意力 (Pass-2模式)
+                - "r2d_only": 仅RGB→Depth注意力 (Pass-1模式，需要在DepthDecoder后调用)
         Returns:
             student_feats: List[Tensor[B, C_i, H/2^i, W/2^i]] - RGB / 图像各级特征
-            None: 占位符，保持 API 兼容
+            enhanced_depth_feats: List[Tensor] 或 None - 增强后的深度特征 (可选)
         """
+
+        # 确定是否返回增强深度特征
+        should_return_enhanced_depth = (
+            return_enhanced_depth if return_enhanced_depth is not None 
+            else self.return_enhanced_depth
+        )
 
         batch_size, _, height, width = x.shape
         device = x.device
 
         student_feats = []
+        enhanced_depth_feats = [] if should_return_enhanced_depth else None
         current_x = x
         current_depth = None
+
+        logger.debug(f"RawEncoder: attention_mode = {attention_mode}")
 
         # === 处理 depth_feats 或 depth_gt ===
         if depth_feats is not None:
@@ -180,12 +201,12 @@ class RawEncoder(nn.Module):
         #     # 3) 提取深度特征：从 1 通道映射到 base_channels
         #     current_depth = self.depth_feature_extractor(normalized_depth)
 
-        # === 主循环：依次经过每一层 student_block，然后做双向跨模态注意力（若 depth 可用） ===
+        # === 主循环：依次经过每一层 student_block，然后做定向跨模态注意力（若 depth 可用） ===
         for i, block in enumerate(self.student_blocks):
             # —— 1）通过 ConvBlock + RestormerBlock ——  
             current_x = block(current_x)  # [B, C_i, H_i, W_i]
 
-            # —— 2）如果 depth 特征可用，则进行双向 Cross-Attention ——  
+            # —— 2）如果 depth 特征可用，则进行定向 Cross-Attention ——  
             if current_depth is not None:
                 # 如果 depth_feats 存在且提供了多级特征，使用 depth_feats[i]
                 if depth_feats is not None and i < len(depth_feats):
@@ -220,27 +241,44 @@ class RawEncoder(nn.Module):
                     # 万一 projection 数量不够，用 interpolate 保持不变
                     current_depth_projected = current_depth
 
-                # —— 2.3) Depth -> RGB 交叉注意力 + 门控 γ_d2r ——  
-                fused_rgb = self.depth2rgb_attn_blocks[i](current_x, current_depth_projected)
-                gamma_d2r = self.d2r_gamma[i]       # 可学习标量
-                gated_rgb = gamma_d2r * fused_rgb
-                current_x = current_x + gated_rgb
-                logger.debug(f"RawEncoder: Level {i} γ_d2r={gamma_d2r.item():.4f}")
+                # —— 2.3) 根据attention_mode进行定向注意力 ——
 
-                # —— 2.4) RGB -> Depth 交叉注意力 + 门控 γ_r2d ——  
-                fused_depth = self.rgb2depth_attn_blocks[i](current_depth_projected, current_x)
-                gamma_r2d = self.r2d_gamma[i]
-                gated_depth = gamma_r2d * fused_depth
-                current_depth = current_depth_projected + gated_depth
-                logger.debug(f"RawEncoder: Level {i} γ_r2d={gamma_r2d.item():.4f}")
+                # Depth -> RGB 交叉注意力 (Pass-2或both模式)
+                if attention_mode in ["both", "d2r_only"]:
+                    fused_rgb = self.depth2rgb_attn_blocks[i](current_x, current_depth_projected)
+                    gamma_d2r = self.d2r_gamma[i]       # 可学习标量
+                    gated_rgb = gamma_d2r * fused_rgb
+                    current_x = current_x + gated_rgb
+                    logger.debug(f"RawEncoder: Level {i} Applied D2R attention, γ_d2r={gamma_d2r.item():.4f}")
+
+                # RGB -> Depth 交叉注意力 (Pass-1后处理或both模式)
+                if attention_mode in ["both", "r2d_only"]:
+                    fused_depth = self.rgb2depth_attn_blocks[i](current_depth_projected, current_x)
+                    gamma_r2d = self.r2d_gamma[i]
+                    gated_depth = gamma_r2d * fused_depth
+                    current_depth = current_depth_projected + gated_depth
+                    logger.debug(f"RawEncoder: Level {i} Applied R2D attention, γ_r2d={gamma_r2d.item():.4f}")
+                else:
+                    # 如果不应用R2D注意力，保持原始投影深度特征
+                    current_depth = current_depth_projected
+
+                # —— 2.4) 保存增强后的深度特征 (如果需要) ——
+                if should_return_enhanced_depth:
+                    enhanced_depth_feats.append(current_depth.clone())
+                    logger.debug(f"RawEncoder: Level {i} saved enhanced depth feat shape: {current_depth.shape}")
 
                 # —— 2.5) 如果不是最后一层、且不是外部 depth_feats 模式，则下采样 depth 传递给下一层 ——  
                 if i < self.levels - 1 and depth_feats is None:
-                    # 对投影后的深度特征下采样
-                    next_depth = F.avg_pool2d(current_depth_projected, kernel_size=2, stride=2)
+                    # 对当前深度特征下采样
+                    next_depth = F.avg_pool2d(current_depth, kernel_size=2, stride=2)
                     if i == 0:
                         logger.debug(f"RawEncoder: Depth downsampled for next level {i+1}, shape: {next_depth.shape}")
                     current_depth = next_depth
+
+            else:
+                # 如果没有深度特征但需要返回增强深度特征列表，添加None占位
+                if should_return_enhanced_depth:
+                    enhanced_depth_feats.append(None)
 
             # —— 3）存储当前层的 RGB 特征 ——  
             student_feats.append(current_x)
@@ -253,5 +291,10 @@ class RawEncoder(nn.Module):
                     f"Expected: {exp_ch}, Got: {current_x.shape[1]}"
                 )
 
-        # 返回所有级别的 RGB 特征和 None（保持 API 兼容）
-        return student_feats, None
+        # 打印增强深度特征信息 (如果启用)
+        if should_return_enhanced_depth and enhanced_depth_feats is not None:
+            valid_feats = [f for f in enhanced_depth_feats if f is not None]
+            logger.debug(f"RawEncoder: Returning {len(valid_feats)} enhanced depth features")
+
+        # 返回所有级别的 RGB 特征和增强深度特征（可选）
+        return student_feats, enhanced_depth_feats

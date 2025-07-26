@@ -5,8 +5,8 @@ import math
 
 class CrossAttention(nn.Module):
     """
-    Cross-Attention 模块 (RGB←Depth fusion)
-    ---------------------------------------
+    Cross-Attention 模块 (RGB←Depth fusion) with Memory Optimization
+    ----------------------------------------------------------------
     将深度特征作为 Key/Value，引导 RGB 特征的注意力分布。
 
     输入:
@@ -18,17 +18,20 @@ class CrossAttention(nn.Module):
     实现细节:
     1. 使用 1×1 卷积分别生成 Q (从 rgb)、K、V (从 depth)
     2. 按头切分，展开空间维度 N=H×W
-    3. 计算注意力 weights = softmax(Q·Kᵀ / sqrt(d_k))
-    4. 输出 = weights · V, reshape 回 (B,C,H,W)
-    5. 1×1 卷积融合通道
+    3. **内存优化**: 使用分块计算避免显存爆炸
+    4. 计算注意力 weights = softmax(Q·Kᵀ / sqrt(d_k))
+    5. 输出 = weights · V, reshape 回 (B,C,H,W)
+    6. 1×1 卷积融合通道
     """
-    def __init__(self, dim: int, heads: int = 8, window_size: int = 0):
+    def __init__(self, dim: int, heads: int = 8, window_size: int = 0, chunk_size: int = 1024):
         super().__init__()
         assert dim % heads == 0, 'dim must be divisible by heads'
         self.dim = dim
         self.heads = heads
         self.d_k = dim // heads
         self.window_size = window_size                # 0 = 全局
+        self.chunk_size = chunk_size                  # 分块大小，用于内存优化
+        
         # 生成 Q, K, V
         self.to_q = nn.Conv2d(dim, dim, kernel_size=1, bias=False)
         self.to_k = nn.Conv2d(dim, dim, kernel_size=1, bias=False)
@@ -79,12 +82,62 @@ class CrossAttention(nn.Module):
         """获取最近一次计算的注意力图"""
         return self.last_attn
 
+    def _chunked_attention(self, q, k, v):
+        """分块计算注意力，减少内存使用"""
+        B_, heads, d_k, N = q.shape
+        chunk_size = min(self.chunk_size, N)
+        
+        # 输出张量
+        out = torch.zeros_like(q)
+        attn_weights = None
+        
+        # 保存注意力权重用于可视化（仅保存第一个chunk）
+        if self.save_attention:
+            first_chunk_size = min(chunk_size, N)
+            attn_weights = torch.zeros(B_, heads, first_chunk_size, N, 
+                                     device=q.device, dtype=q.dtype)
+        
+        # 分块处理
+        for i in range(0, N, chunk_size):
+            end_i = min(i + chunk_size, N)
+            q_chunk = q[:, :, :, i:end_i]  # [B_, heads, d_k, chunk_size]
+            
+            # 计算当前chunk的注意力
+            attn_chunk = torch.einsum('bhcI,bhcJ->bhIJ', q_chunk, k) / math.sqrt(d_k)
+            attn_chunk = torch.softmax(attn_chunk, dim=-1)
+            
+            # 保存第一个chunk的注意力权重
+            if self.save_attention and i == 0:
+                attn_weights[:, :, :, :] = attn_chunk
+            
+            # 计算输出
+            out_chunk = torch.einsum('bhIJ,bhcJ->bhcI', attn_chunk, v)
+            out[:, :, :, i:end_i] = out_chunk
+            
+            # 清理中间变量
+            del attn_chunk, out_chunk
+        
+        return out, attn_weights
+
     def forward(self, rgb_feat: torch.Tensor, dep_feat: torch.Tensor) -> torch.Tensor:
         B, C, H, W = rgb_feat.shape
 
         # 清理之前的注意力图引用
         if hasattr(self, 'last_attn'):
             self.last_attn = None
+
+        # -- 检查输入尺寸，如果太大使用窗口注意力 --
+        total_pixels = H * W
+        memory_threshold = 64 * 64  # 超过64x64使用窗口注意力
+        
+        if total_pixels > memory_threshold and self.window_size == 0:
+            # 自动启用窗口注意力
+            adaptive_window_size = min(32, max(8, int(math.sqrt(memory_threshold))))
+            print(f"[CrossAttention] 自动启用窗口注意力: window_size={adaptive_window_size}, input_size={H}x{W}")
+            original_window_size = self.window_size
+            self.window_size = adaptive_window_size
+        else:
+            original_window_size = None
 
         # -- 1×1 conv 先做，再按需打窗 --
         q = self.to_q(rgb_feat)
@@ -108,25 +161,22 @@ class CrossAttention(nn.Module):
         k = k.view(B_, self.heads, self.d_k, H_*W_)
         v = v.view(B_, self.heads, self.d_k, H_*W_)
         
-        # 计算注意力
-        attn = torch.einsum('bhcN,bhcM->bhNM', q, k) / math.sqrt(self.d_k)
-        attn = torch.softmax(attn, dim=-1)
-        out = torch.einsum('bhNM,bhcM->bhcN', attn, v)
+        # 使用分块计算注意力
+        out, attn_weights = self._chunked_attention(q, k, v)
         
         # 保存注意力图（如果启用）
-        if self.save_attention:
-            # 如果使用窗口，需要将窗口注意力合并回原始图像尺寸
+        if self.save_attention and attn_weights is not None:
             if pad_hw is not None:
-                # 这里实现窗口注意力的合并比较复杂，简化为仅保存第一个窗口的注意力
-                # 在实际实现中可能需要更复杂的合并逻辑
-                self.last_attn = attn[:B, :, :, :].detach().clone()
+                # 窗口注意力情况
+                self.last_attn = attn_weights[:B, :, :, :].detach().clone()
                 print(f"[CrossAttention] 保存窗口注意力图: shape={self.last_attn.shape}")
             else:
-                self.last_attn = attn.detach().clone()
+                self.last_attn = attn_weights.detach().clone()
                 print(f"[CrossAttention] 保存全局注意力图: shape={self.last_attn.shape}")
         
             # 立即断开与原始计算图的所有连接
             self.last_attn.requires_grad_(False)
+            
         # 恢复形状: [B, C, H, W]
         out = out.contiguous().view(B_, C, H_, W_)
 
@@ -134,12 +184,16 @@ class CrossAttention(nn.Module):
         if pad_hw is not None:
             out = self._window_reverse(out, pad_hw, B)
 
+        # 恢复原始窗口大小设置
+        if original_window_size is not None:
+            self.window_size = original_window_size
+
         # 通道融合
         fused = self.proj(out)
         return fused
 
 # 示例:
-# ca = CrossAttention(dim=48, heads=8, window_size=8)
+# ca = CrossAttention(dim=48, heads=8, window_size=8, chunk_size=512)
 # fused_feat = ca(rgb_feat, depth_feat)  # Tensor[B,48,H,W]
 # ca.enable_attention_saving(True)  # 启用注意力图保存
 # attn_map = ca.get_last_attn()  # 获取注意力图

@@ -62,7 +62,7 @@ logger.debug(f"sys.path before 'from modules.depth_utils': {sys.path}")
 
 
 from modules.model import UnderwaterEnhanceNet
-from modules.loss_fn import TotalLoss, DepthEdgeColorLoss
+from modules.loss_fn import TotalLoss
 from modules.depth import get_depth_config_params, ensure_normalized_depth
 from utils.checkpoint import save_checkpoint
 from utils.lr_scheduler import get_scheduler
@@ -134,25 +134,82 @@ def set_seed(seed):
     torch.backends.cudnn.benchmark = False
 
 
-def setup_experiment_dir(config):
-    """设置实验目录并保存配置，支持自动添加时间戳或序号避免覆盖"""
-    exp_name = config['experiment']['name']
+def find_latest_experiment_with_checkpoints(output_dir, base_name):
+    """
+    在输出目录中查找最新的包含检查点的实验目录
     
-    # 如果启用自动命名，添加时间戳
+    Args:
+        output_dir: 实验输出根目录
+        base_name: 实验基础名称 (如 'underwater_enhance_run')
+        
+    Returns:
+        str or None: 找到的最新实验目录路径，如果没有找到返回None
+    """
+    if not os.path.exists(output_dir):
+        return None
+    
+    # 查找所有匹配的实验目录
+    matching_dirs = []
+    for item in os.listdir(output_dir):
+        item_path = os.path.join(output_dir, item)
+        if os.path.isdir(item_path) and item.startswith(base_name):
+            # 检查是否有检查点目录且不为空
+            checkpoint_dir = os.path.join(item_path, 'checkpoints')
+            if os.path.exists(checkpoint_dir):
+                checkpoints = [f for f in os.listdir(checkpoint_dir) if f.endswith(('.pth', '.pth.tar'))]
+                if checkpoints:
+                    # 记录目录修改时间用于排序
+                    mtime = os.path.getmtime(item_path)
+                    matching_dirs.append((item_path, mtime))
+    
+    # 按修改时间排序，返回最新的
+    if matching_dirs:
+        matching_dirs.sort(key=lambda x: x[1], reverse=True)
+        latest_dir = matching_dirs[0][0]
+        return latest_dir
+    
+    return None
+
+
+def setup_experiment_dir(config, resume_mode=False):
+    """
+    设置实验目录并保存配置，支持自动添加时间戳或序号避免覆盖
+    
+    Args:
+        config: 配置字典
+        resume_mode: 是否为恢复训练模式
+        
+    Returns:
+        str: 实验目录路径
+    """
+    exp_name = config['experiment']['name']
+    output_dir = config['experiment']['output_dir']
+    
+    # 🔥 智能恢复逻辑：如果是恢复模式，优先查找现有实验
+    if resume_mode:
+        latest_exp_dir = find_latest_experiment_with_checkpoints(output_dir, exp_name)
+        if latest_exp_dir:
+            print(f"[智能恢复] 找到包含检查点的最新实验目录: {latest_exp_dir}")
+            print(f"[智能恢复] 将恢复训练而不是创建新目录")
+            return latest_exp_dir
+        else:
+            print(f"[智能恢复] 未找到包含检查点的实验目录，将创建新实验")
+    
+    # 原有逻辑：创建新实验目录
     if config['experiment'].get('auto_naming', True):
         timestamp_format = config['experiment'].get('timestamp_format', "%Y%m%d_%H%M%S")
         timestamp = datetime.now().strftime(timestamp_format)
         exp_name = f"{exp_name}_{timestamp}"
     else:
         # 检查是否已存在相同名称的实验目录，如果存在则添加序号
-        base_dir = os.path.join(config['experiment']['output_dir'], exp_name)
+        base_dir = os.path.join(output_dir, exp_name)
         if os.path.exists(base_dir):
             i = 1
-            while os.path.exists(os.path.join(config['experiment']['output_dir'], f"{exp_name}_{i}")):
+            while os.path.exists(os.path.join(output_dir, f"{exp_name}_{i}")):
                 i += 1
             exp_name = f"{exp_name}_{i}"
     
-    exp_dir = os.path.join(config['experiment']['output_dir'], exp_name)
+    exp_dir = os.path.join(output_dir, exp_name)
     os.makedirs(exp_dir, exist_ok=True)
     
     # 保存配置
@@ -279,47 +336,26 @@ def setup_training(args, config, local_rank):
         lambda_grad=config['loss']['lambda_grad'],
         lambda_depth=config['loss']['lambda_depth'],
         lambda_smooth=config['loss']['lambda_smooth'],
-        lambda_decl=config['loss'].get('lambda_decl', 0.1),  # 深度边缘颜色损失权重
-        lambda_cons=config['loss'].get('lambda_cons', 0.1),  # 注意力一致性损失权重
-        use_uncertainty_weighting=config['loss'].get('use_uncertainty_weighting', True)  # 从配置中读取是否使用自动调参
+        # lambda_cons=config['loss'].get('lambda_cons', 0.1),  # 注意力一致性损失权重
+        
+        # 🔥 CMCL相关参数
+        lambda_cmcl=config['loss'].get('lambda_cmcl', 0.1),
+        lambda_cmcl_var=config['loss'].get('lambda_cmcl_var', 1.0),
+        lambda_cmcl_rgb=config['loss'].get('lambda_cmcl_rgb', 1.0),
+        lambda_cmcl_depth=config['loss'].get('lambda_cmcl_depth', 1.0),
+        cmcl_k_decay=config['loss'].get('cmcl_k_decay', 1.0),
+
+        use_uncertainty_weighting=config['loss'].get('use_uncertainty_weighting', True),  # 从配置中读取是否使用自动调参
+        sigma_init=config['loss'].get('sigma_init', None),  # 从配置中读取不确定性初始值
+        min_depth=config['loss']['depth_processing'].get('min_depth', 5000.0),  # 从配置中读取深度范围
+        max_depth=config['loss']['depth_processing'].get('max_depth', 65000.0)  # 从配置中读取深度范围
     )
     criterion = criterion.to(device)
     
     # 5. 优化器
     optimizer_name = config['optimizer'].get('name', 'adamw').lower()
     
-    # 9. 创建实验目录
-    exp_dir = setup_experiment_dir(config)
-    
-    # 10. 设置日志
-    # 从配置文件中获取日志配置
-    logging_config = config.get('logging', {})
-    console_log_level_str = logging_config.get('console_level', args.log_level.upper())
-    console_log_level = getattr(logging, console_log_level_str, logging.INFO)
-    
-    # 如果设置为CRITICAL或"CRITICAL"，则不在控制台输出日志
-    if console_log_level_str == "CRITICAL" or console_log_level >= logging.CRITICAL:
-        console_log_level = logging.CRITICAL
-    
-    # 获取文件日志级别
-    file_log_level_str = logging_config.get('file_level', 'DEBUG')
-    file_log_level = getattr(logging, file_log_level_str, logging.DEBUG)
-    
-    # 使用多文件日志系统
-    multi_logger, metric_logger, tb_writer = setup_logging_system(exp_dir, config)
-    
-    # 获取不同分类的日志记录器
-    logger_instance = multi_logger.get_logger('train')  # 主训练日志
-    debug_logger_instance = multi_logger.get_logger('debug')  # 调试日志
-    model_logger = multi_logger.get_logger('model')  # 模型相关日志
-    arch_logger = multi_logger.get_logger('architecture')  # 模型架构日志
-    data_logger = multi_logger.get_logger('data')  # 数据相关日志
-    metrics_logger = multi_logger.get_logger('metrics')  # 性能指标日志
-    optimizer_logger = multi_logger.get_logger('optimizer')  # 优化器日志
-    scheduler_logger = multi_logger.get_logger('scheduler')  # 学习率调度器日志
-    checkpoint_logger = multi_logger.get_logger('checkpoint')  # 检查点日志
-    experiment_logger = multi_logger.get_logger('experiment')  # 实验配置日志
-    gpu_logger = multi_logger.get_logger('gpu')  # GPU使用日志
+    # 9. 实验目录将在main_worker中创建，日志系统也将在那里初始化
     
     # 参数分组，将交叉注意力参数、物理参数和其他参数分开，应用不同的学习率
     base_params, attn_params, physics_params = [], [], []
@@ -335,12 +371,10 @@ def setup_training(args, config, local_rank):
     attn_lr_scale = config['optimizer'].get('attn_lr_scale', 0.1)
     physics_lr_scale = config['optimizer'].get('physics_lr_scale', 1.0)  # 物理参数默认使用相同学习率
     
-    msg = (
-        f"使用差异化学习率: 主干 {config['optimizer']['lr']}, "
-        f"注意力模块 {config['optimizer']['lr'] * attn_lr_scale}, "
-        f"物理模块 {config['optimizer']['lr'] * physics_lr_scale}"
-    )
-    optimizer_logger.info(msg)
+    # 差异化学习率设置（详细日志将在main_worker中记录）
+    print(f"使用差异化学习率: 主干 {config['optimizer']['lr']}, "
+          f"注意力模块 {config['optimizer']['lr'] * attn_lr_scale}, "
+          f"物理模块 {config['optimizer']['lr'] * physics_lr_scale}")
     
     # 添加损失函数中的不确定性权重参数到优化器中
     uncertainty_params = []
@@ -351,11 +385,10 @@ def setup_training(args, config, local_rank):
                 uncertainty_params.append(p)
         
         if uncertainty_params:
-            msg = f"将 {len(uncertainty_params)} 个不确定性权重参数添加到优化器中"
-            optimizer_logger.info(msg)
+            print(f"将 {len(uncertainty_params)} 个不确定性权重参数添加到优化器中")
             # 输出每个不确定性权重参数的名称
             param_names = [name for name, p in criterion.named_parameters() if 'log_var' in name]
-            optimizer_logger.info(f"不确定性权重参数列表: {param_names}")
+            print(f"不确定性权重参数列表: {param_names}")
     
     param_groups = [
         {'params': base_params, 'lr': config['optimizer']['lr']},
@@ -377,24 +410,19 @@ def setup_training(args, config, local_rank):
     uncertainty_param_count = sum(p.numel() for p in uncertainty_params) if uncertainty_params else 0
     total_param_count = base_param_count + attn_param_count + physics_param_count + uncertainty_param_count
         
-    optimizer_logger.info("优化器参数统计:")
-    msg_main = f"  主干参数: {base_param_count:,} ({base_param_count/total_param_count*100:.2f}%)"
-    optimizer_logger.info(msg_main)
-    msg_attn = f"  注意力参数: {attn_param_count:,} ({attn_param_count/total_param_count*100:.2f}%)"
-    optimizer_logger.info(msg_attn)
+    print("优化器参数统计:")
+    print(f"  主干参数: {base_param_count:,} ({base_param_count/total_param_count*100:.2f}%)")
+    print(f"  注意力参数: {attn_param_count:,} ({attn_param_count/total_param_count*100:.2f}%)")
     if physics_param_count > 0:
-        msg_physics = f"  物理参数: {physics_param_count:,} ({physics_param_count/total_param_count*100:.2f}%)"
-        optimizer_logger.info(msg_physics)
+        print(f"  物理参数: {physics_param_count:,} ({physics_param_count/total_param_count*100:.2f}%)")
     if uncertainty_param_count > 0:
-        msg_unc = f"  不确定性权重参数: {uncertainty_param_count:,} ({uncertainty_param_count/total_param_count*100:.2f}%)"
-        optimizer_logger.info(msg_unc)
-        msg_total = f"  总参数数量: {total_param_count:,}"
-        optimizer_logger.info(msg_total)
+        print(f"  不确定性权重参数: {uncertainty_param_count:,} ({uncertainty_param_count/total_param_count*100:.2f}%)")
+    print(f"  总参数数量: {total_param_count:,}")
     
     # 记录模型架构信息
-    arch_logger.info(f"模型类型: {type(model).__name__}")
+    print(f"模型类型: {type(model).__name__}")
     if hasattr(model, 'encoder') and hasattr(model.encoder, 'channels'):
-        arch_logger.info(f"编码器通道数: {model.encoder.channels}")
+        print(f"编码器通道数: {model.encoder.channels}")
     
     # 添加动态参数管理功能
     def update_optimizer_with_new_params(model, optimizer):
@@ -410,12 +438,12 @@ def setup_training(args, config, local_rank):
         for name, param in model.named_parameters():
             if id(param) not in current_param_ids:
                 new_params.append(param)
-                optimizer_logger.warning(f"发现新参数: {name}")
+                print(f"发现新参数: {name}")
         
         # 如果有新参数，添加到优化器的第一个参数组中
         if new_params:
             optimizer.param_groups[0]['params'].extend(new_params)
-            optimizer_logger.info(f"向优化器添加了 {len(new_params)} 个新参数")
+            print(f"向优化器添加了 {len(new_params)} 个新参数")
             return True
         return False
     
@@ -425,14 +453,14 @@ def setup_training(args, config, local_rank):
             betas=(config['optimizer'].get('beta1', 0.9), config['optimizer'].get('beta2', 0.999)),
             weight_decay=config['optimizer'].get('weight_decay', 0)
         )
-        optimizer_logger.info(f"使用Adam优化器，权重衰减: {config['optimizer'].get('weight_decay', 0)}")
+        print(f"使用Adam优化器，权重衰减: {config['optimizer'].get('weight_decay', 0)}")
     elif optimizer_name == 'adamw':
         optimizer = optim.AdamW(
             param_groups,
             weight_decay=config['optimizer'].get('weight_decay', 0.01),
             betas=(config['optimizer'].get('beta1', 0.9), config['optimizer'].get('beta2', 0.999))
         )
-        optimizer_logger.info(f"使用AdamW优化器，权重衰减: {config['optimizer'].get('weight_decay', 0.01)}")
+        print(f"使用AdamW优化器，权重衰减: {config['optimizer'].get('weight_decay', 0.01)}")
     elif optimizer_name == 'sgd':
         optimizer = optim.SGD(
             param_groups,
@@ -440,9 +468,9 @@ def setup_training(args, config, local_rank):
             weight_decay=config['optimizer'].get('weight_decay', 0.0001),
             nesterov=config['optimizer'].get('nesterov', False)
         )
-        optimizer_logger.info(f"使用SGD优化器，动量: {config['optimizer'].get('momentum', 0.9)}, "
-                             f"权重衰减: {config['optimizer'].get('weight_decay', 0.0001)}, "
-                             f"Nesterov: {config['optimizer'].get('nesterov', False)}")
+        print(f"使用SGD优化器，动量: {config['optimizer'].get('momentum', 0.9)}, "
+              f"权重衰减: {config['optimizer'].get('weight_decay', 0.0001)}, "
+              f"Nesterov: {config['optimizer'].get('nesterov', False)}")
     else:
         raise ValueError(f"不支持的优化器: {optimizer_name}")
     
@@ -459,11 +487,11 @@ def setup_training(args, config, local_rank):
         factor=config['scheduler'].get('factor', 0.5)
     )
     
-    scheduler_logger.info(f"使用学习率调度器: {config['scheduler']['name']}")
-    scheduler_logger.info(f"  总训练轮次: {config['train']['epochs']}")
+    print(f"使用学习率调度器: {config['scheduler']['name']}")
+    print(f"  总训练轮次: {config['train']['epochs']}")
     if config['scheduler'].get('warmup_epochs', 0) > 0:
-        scheduler_logger.info(f"  预热轮次: {config['scheduler'].get('warmup_epochs', 0)}")
-    scheduler_logger.info(f"  最小学习率: {config['scheduler'].get('min_lr', 0)}")
+        print(f"  预热轮次: {config['scheduler'].get('warmup_epochs', 0)}")
+    print(f"  最小学习率: {config['scheduler'].get('min_lr', 0)}")
     
     # 7. 混合精度设置
     scaler = None
@@ -489,50 +517,12 @@ def setup_training(args, config, local_rank):
         experiment_logger.info(f"使用DistributedDataParallel进行分布式训练, local_rank={local_rank}, world_size={world_size}")
     elif use_gpu and torch.cuda.device_count() > 1 and not distributed:
         # 如果无法使用DDP但有多个GPU，使用DataParallel (不推荐)
-        multi_logger.log_warning("使用DataParallel进行多GPU训练，这比DDP效率低。建议使用 --distributed 参数启用DDP。")
+        print("使用DataParallel进行多GPU训练，这比DDP效率低。建议使用 --distributed 参数启用DDP。")
         device_ids = gpu_config.get('device_ids', None)
         model = nn.DataParallel(model, device_ids=device_ids)
-        experiment_logger.info(f"使用DataParallel进行多GPU训练, device_ids={device_ids}")
+        print(f"使用DataParallel进行多GPU训练, device_ids={device_ids}")
     
-    # 设置TensorBoard
-    tb_log_dir = os.path.join(exp_dir, 'tensorboard', datetime.now().strftime("%Y%m%d-%H%M%S"))
-    os.makedirs(tb_log_dir, exist_ok=True)
-    try:
-        from torch.utils.tensorboard import SummaryWriter
-        tb_writer = SummaryWriter(log_dir=tb_log_dir)
-        # 测试写入以确保目录可写
-        tb_writer.add_scalar('setup/tensorboard_test', 1, 0)
-        tb_writer.flush()
-        experiment_logger.info(f"TensorBoard日志将写入目录: {tb_log_dir}")
-        experiment_logger.info("TensorBoard初始化测试写入成功")
-    except ImportError:
-        multi_logger.log_warning("TensorBoard未安装，部分可视化功能将不可用。请运行 `pip install tensorboard` 安装。")
-        tb_writer = None
-    except Exception as e:
-        multi_logger.log_error(f"TensorBoard初始化失败: {str(e)}. 请检查路径权限和磁盘空间。", exc_info=True)
-        tb_writer = None
-    
-    # metric_logger已经在setup_logging_system中创建了，无需重复创建
-    
-    # 记录训练配置
-    config_text = yaml.dump(config, default_flow_style=False)
-    metric_logger.log_text('config', config_text, step=0)
-    
-    # 记录GPU信息
-    if use_gpu:
-        gpu_info = [f"GPU {i}: {torch.cuda.get_device_name(i)}" for i in range(torch.cuda.device_count())]
-        metric_logger.log_text('gpu_info', "\n".join(gpu_info), step=0)
-        gpu_logger.info(f"使用GPU: {', '.join(gpu_info)}")
-        
-        if distributed:
-            experiment_logger.info(f"分布式训练已启用，使用 {backend} 后端, 世界大小: {world_size}")
-            if gpu_config.get('sync_bn', False):
-                model_logger.info("SyncBatchNorm 已启用")
-    else:
-        experiment_logger.info("使用CPU进行训练")
-    
-    if mixed_precision:
-        experiment_logger.info("启用混合精度训练")
+    # 日志记录将在main_worker中处理，setup_training只负责基础组件初始化
     
     return {
         'model': model,
@@ -540,17 +530,12 @@ def setup_training(args, config, local_rank):
         'optimizer': optimizer,
         'scheduler': scheduler,
         'device': device,
-        'exp_dir': exp_dir,
-        'logger': logger_instance,
-        'metric_logger': metric_logger,
         'scaler': scaler,
         'mixed_precision': mixed_precision,
         'world_size': world_size,
         'local_world_size': local_world_size,
         'distributed': distributed,
         'local_rank': local_rank,
-        'debug_logger': debug_logger_instance,
-        'multi_logger': multi_logger,
         'update_optimizer_fn': update_optimizer_with_new_params
     }
 
@@ -807,11 +792,6 @@ def train_epoch(train_loader, model, criterion, optimizer, device, metric_logger
     # 在训练前检查并记录关键配置
     train_logger.info(f"======== [Epoch {epoch+1}/{config['train']['epochs']}] 开始 ========")
     
-    # 记录DECL损失的状态
-    lambda_decl = config.get('loss', {}).get('lambda_decl', 0)
-    if lambda_decl > 0:
-        warning_logger.warning(f"Epoch {epoch+1}: 配置文件中DECL损失权重 (lambda_decl) 为 {lambda_decl}，但代码已禁用此损失。将忽略此权重。")
-
     # 定义性能记录器
     epoch_loss = 0.0
     step_count = 0
@@ -855,18 +835,33 @@ def train_epoch(train_loader, model, criterion, optimizer, device, metric_logger
 
         current_step = epoch * len(train_loader) + i
         
+        # 新增：检查是否启用多输入一致性学习
+        enable_multi_input_consistency = config.get('multi_input_consistency', {}).get('enable', False)
+        
         if isinstance(batch, dict):
             raw_imgs = batch['raw_imgs'].to(device)  # Shape: [B, N, C, H, W]
             depth_gt = batch['depth'].to(device) if 'depth' in batch else None
             gt = batch['gt'].to(device) if 'gt' in batch else None
             
-            # MultiDegradationDataset returns 5D tensor [B, N, C, H, W], squeeze N dimension
-            if raw_imgs.dim() == 5 and raw_imgs.shape[1] == 1:
-                raw_imgs = raw_imgs.squeeze(1)  # [B, N, C, H, W] -> [B, C, H, W]
-            elif raw_imgs.dim() == 5:
-                # If multiple degradations, use the first one
-                raw_imgs = raw_imgs[:, 0]  # [B, N, C, H, W] -> [B, C, H, W]
-            B = raw_imgs.shape[0]
+                    # 🔥 多输入处理逻辑更新
+        is_multi_input = raw_imgs.dim() == 5 and raw_imgs.shape[1] > 1
+        
+        if enable_multi_input_consistency and is_multi_input:
+            # 🔥 多输入一致性学习模式：保持5D张量，传递给模型
+            if data_logger and i % 100 == 0:
+                data_logger.info(f"多输入一致性学习模式: raw_imgs.shape={raw_imgs.shape}")
+            # 不修改raw_imgs，保持[B, N, C, H, W]格式
+            # depth_gt和gt也保持原有维度或适当调整
+        elif not enable_multi_input_consistency and is_multi_input:
+            # 传统模式：取第一个退化
+            raw_imgs = raw_imgs[:, 0]  # [B, N, C, H, W] -> [B, C, H, W]
+            if depth_gt is not None and depth_gt.dim() == 5:
+                depth_gt = depth_gt[:, 0]
+            if gt is not None and gt.dim() == 5:
+                gt = gt[:, 0]
+        elif raw_imgs.dim() == 5 and raw_imgs.shape[1] == 1:
+            # 单退化情况
+            raw_imgs = raw_imgs.squeeze(1)
         else:
             raw, depth_gt_tuple, gt_tuple = batch[:3] # Renamed to avoid conflict
             raw_imgs = raw.to(device)
@@ -877,7 +872,9 @@ def train_epoch(train_loader, model, criterion, optimizer, device, metric_logger
                 raw_imgs = raw_imgs.squeeze(1)  # [B, N, C, H, W] -> [B, C, H, W]
             elif raw_imgs.dim() == 5:
                 raw_imgs = raw_imgs[:, 0]  # Use first degradation
-            B = raw_imgs.shape[0]
+        
+        # 🔥 确保B变量在所有分支中都被定义
+        B = raw_imgs.shape[0]
         
         # 记录输入数据
         log_input_data(raw_imgs, "raw_imgs", current_step)
@@ -901,8 +898,22 @@ def train_epoch(train_loader, model, criterion, optimizer, device, metric_logger
         
         if mixed_precision and scaler is not None:
             with torch.amp.autocast(device_type='cuda'):
-                # 混合精度训练 - 使用原始的multi_forward处理整个批次
-                outputs = model.multi_forward(raw_imgs, depth_gt, gt)
+                # 🔥 使用新的前向传播，支持多输入一致性
+                if enable_multi_input_consistency and is_multi_input:
+                    outputs = model(raw_imgs, depth_gt, gt, enable_multi_input_consistency=True)
+                    consistency_features = getattr(outputs, 'consistency_features', None)
+                    # 对于损失计算，如果是多输入模式，需要处理GT的维度
+                    if gt is not None and gt.dim() == 4:  # [B, C, H, W]
+                        # GT需要与多输入的第一个退化对应
+                        gt_for_loss = gt  # 使用原始GT
+                    elif gt is not None and gt.dim() == 5:  # [B, N, C, H, W]
+                        gt_for_loss = gt[:, 0]  # 取第一个作为主要GT
+                    else:
+                        gt_for_loss = gt
+                else:
+                    outputs = model.multi_forward(raw_imgs, depth_gt, gt)
+                    consistency_features = None
+                    gt_for_loss = gt
                     
                 enhanced = outputs.enhanced
                 pred_gate = outputs.pred_gate
@@ -911,15 +922,16 @@ def train_epoch(train_loader, model, criterion, optimizer, device, metric_logger
                 attention_maps = outputs.attention_maps
                 depth_pred = outputs.depth_pred
                 
-                # 计算损失（对整个批次）
+                # 🔥 计算损失（处理多输入一致性）
                 loss = criterion(
-                    outputs.enhanced, gt, 
-                    depth_gt=depth_gt,
+                    outputs.enhanced, gt_for_loss, 
+                    depth_gt=depth_gt if not is_multi_input or not enable_multi_input_consistency else (depth_gt[:, 0] if depth_gt is not None and depth_gt.dim() == 5 else depth_gt),
                     student_feats=student_feats,
                     attention_maps=attention_maps,
                     depth_pred=depth_pred,
                     depth_conf_map=depth_conf_map,
-                    raw=raw_imgs
+                    raw=raw_imgs if not is_multi_input or not enable_multi_input_consistency else raw_imgs[:, 0],
+
                 )
             
             # 反向传播
@@ -940,8 +952,13 @@ def train_epoch(train_loader, model, criterion, optimizer, device, metric_logger
             # 清理梯度和计算图
             optimizer.zero_grad()
         else:
-            # 常规训练 - 使用原始的multi_forward处理整个批次
-            outputs = model.multi_forward(raw_imgs, depth_gt, gt)
+            # 🔥 常规训练，支持多输入一致性
+            if enable_multi_input_consistency and is_multi_input:
+                outputs = model(raw_imgs, depth_gt, gt, enable_multi_input_consistency=True)
+                consistency_features = getattr(outputs, 'consistency_features', None)
+            else:
+                outputs = model.multi_forward(raw_imgs, depth_gt, gt)
+                consistency_features = None
                 
             enhanced = outputs.enhanced
             pred_gate = outputs.pred_gate
@@ -951,6 +968,11 @@ def train_epoch(train_loader, model, criterion, optimizer, device, metric_logger
             depth_pred = outputs.depth_pred
             
             # 计算损失（对整个批次）
+            # 🔥 支持残差级别一致性损失
+            multi_enhanced = getattr(outputs, 'multi_enhanced', None)
+            multi_res_d = getattr(outputs, 'multi_res_d', None)
+            multi_res_c = getattr(outputs, 'multi_res_c', None)
+            
             loss = criterion(
                 outputs.enhanced, gt, 
                 depth_gt=depth_gt,
@@ -958,7 +980,11 @@ def train_epoch(train_loader, model, criterion, optimizer, device, metric_logger
                 attention_maps=attention_maps,
                 depth_pred=depth_pred,
                 depth_conf_map=depth_conf_map,
-                raw=raw_imgs
+                raw=raw_imgs,
+
+                multi_enhanced=multi_enhanced,              # 🔥 多输入增强结果
+                multi_res_d=multi_res_d,                    # 🔥 多输入去模糊残差
+                multi_res_c=multi_res_c                     # 🔥 多输入颜色校正残差
             )
             
             # 反向传播
@@ -1145,7 +1171,7 @@ def train_epoch(train_loader, model, criterion, optimizer, device, metric_logger
                 
                 # 深度相关损失
                 depth_metrics = {}
-                for k in ['depth_pred_loss', 'depth_smooth_loss', 'depth_decoder_loss', 'depth_rec_loss', 'depth_total_loss']:
+                for k in ['depth_pred_loss', 'depth_smooth_loss', 'depth_decoder_loss', 'depth_rec_loss', 'multi_candidate_depth_rec_loss', 'depth_total_loss']:
                     if k in loss_components:
                         depth_metrics[k] = loss_components[k]
                 if depth_metrics:
@@ -1486,9 +1512,9 @@ def train_epoch(train_loader, model, criterion, optimizer, device, metric_logger
         metrics = criterion.get_latest_losses()  # 获取损失函数记录的最新损失值
         
         # 深度相关指标记录
-        if outputs.depth_pred is not None:
+        if outputs.depth_pred is not None and depth_gt is not None:
             try:
-                depth_stats = calculate_depth_statistics(outputs.depth_pred)
+                depth_stats = calculate_depth_statistics(outputs.depth_pred, depth_gt)
                 for stat_key, stat_value in depth_stats.items():
                     metrics[f"depth/{stat_key}"] = stat_value
                 
@@ -1496,6 +1522,22 @@ def train_epoch(train_loader, model, criterion, optimizer, device, metric_logger
                     multi_logger.get_logger('depth').info(f"Depth stats: {depth_stats}")
             except Exception as e:
                 multi_logger.get_logger('warning').warning(f"Error computing depth statistics: {e}")
+        elif outputs.depth_pred is not None:
+            # 如果只有深度预测但没有GT，记录深度预测的基本统计信息
+            try:
+                depth_pred_stats = {
+                    'pred_min': outputs.depth_pred.min().item(),
+                    'pred_max': outputs.depth_pred.max().item(),
+                    'pred_mean': outputs.depth_pred.mean().item(),
+                    'pred_std': outputs.depth_pred.std().item()
+                }
+                for stat_key, stat_value in depth_pred_stats.items():
+                    metrics[f"depth/{stat_key}"] = stat_value
+                    
+                if current_step % 100 == 0:
+                    multi_logger.get_logger('depth').info(f"Depth prediction stats: {depth_pred_stats}")
+            except Exception as e:
+                multi_logger.get_logger('warning').warning(f"Error computing depth prediction statistics: {e}")
         
         # 物理参数记录已删除
         
@@ -1540,11 +1582,11 @@ def train_epoch(train_loader, model, criterion, optimizer, device, metric_logger
                 
                 # 深度相关损失
                 depth_metrics = {}
-                for k in ['depth_pred_loss', 'depth_smooth_loss', 'depth_decoder_loss', 'depth_rec_loss', 'depth_total_loss']:
+                for k in ['depth_pred_loss', 'depth_smooth_loss', 'depth_decoder_loss', 'depth_rec_loss', 'multi_candidate_depth_rec_loss', 'depth_total_loss']:
                     if k in loss_components:
                         depth_metrics[k] = loss_components[k]
                 if depth_metrics:
-                    depth_logger.info(f"[训练] Step {current_step} 深度损失: " + 
+                    depth_logger.info(f"[验证] Step {current_step} 深度损失: " + 
                                     ", ".join([f"{k}={v:.6f}" for k, v in depth_metrics.items()]))
                 
                 # 物理模型相关损失已删除
@@ -1657,7 +1699,8 @@ def validate(val_loader, model, criterion, device, metric_logger, epoch, config,
                 depth_gt = batch['depth'].to(device) if batch['depth'] is not None else None
                 gt = batch['gt'].to(device) if batch['gt'] is not None else None
                 
-                # 处理5D张量 - 选择第一个退化级别
+                # 🔥 处理5D张量 - 验证时暂时还是选择第一个退化级别
+                # 未来可以扩展为验证所有退化级别
                 if raw_imgs.dim() == 5:
                     raw_imgs = raw_imgs[:, 0]  # [B, C, H, W]
                     
@@ -1689,6 +1732,12 @@ def validate(val_loader, model, criterion, device, metric_logger, epoch, config,
             if mixed_precision:
                 with torch.amp.autocast(device_type='cuda'):
                     outputs = model.multi_forward(raw_imgs, depth_gt, gt)
+                    
+                    # 🔥 支持残差级别一致性损失
+                    multi_enhanced = getattr(outputs, 'multi_enhanced', None)
+                    multi_res_d = getattr(outputs, 'multi_res_d', None)
+                    multi_res_c = getattr(outputs, 'multi_res_c', None)
+                    
                     loss = criterion(
                         outputs.enhanced, gt,
                         depth_gt=depth_gt,
@@ -1696,10 +1745,19 @@ def validate(val_loader, model, criterion, device, metric_logger, epoch, config,
                         attention_maps=outputs.attention_maps,
                         depth_pred=outputs.depth_pred,
                         depth_conf_map=outputs.depth_conf_map,
-                        raw=raw_imgs
+                        raw=raw_imgs,
+                        multi_enhanced=multi_enhanced,              # 🔥 多输入增强结果
+                        multi_res_d=multi_res_d,                    # 🔥 多输入去模糊残差
+                        multi_res_c=multi_res_c                     # 🔥 多输入颜色校正残差
                     )
             else:
                 outputs = model.multi_forward(raw_imgs, depth_gt, gt)
+                
+                # 🔥 支持残差级别一致性损失
+                multi_enhanced = getattr(outputs, 'multi_enhanced', None)
+                multi_res_d = getattr(outputs, 'multi_res_d', None)
+                multi_res_c = getattr(outputs, 'multi_res_c', None)
+                
                 loss = criterion(
                     outputs.enhanced, gt,
                     depth_gt=depth_gt,
@@ -1707,7 +1765,10 @@ def validate(val_loader, model, criterion, device, metric_logger, epoch, config,
                     attention_maps=outputs.attention_maps,
                     depth_pred=outputs.depth_pred,
                     depth_conf_map=outputs.depth_conf_map,
-                    raw=raw_imgs
+                    raw=raw_imgs,
+                    multi_enhanced=multi_enhanced,              # 🔥 多输入增强结果
+                    multi_res_d=multi_res_d,                    # 🔥 多输入去模糊残差
+                    multi_res_c=multi_res_c                     # 🔥 多输入颜色校正残差
                 )
             
             total_loss += loss.item()
@@ -1829,6 +1890,12 @@ def validate(val_loader, model, criterion, device, metric_logger, epoch, config,
                 "Loss": f"{loss.item():.4f}",
                 "PSNR": f"{psnr:.2f}" if 'psnr' in locals() else "N/A"
             })
+    
+    # 检查是否有验证数据
+    if num_batches == 0:
+        val_logger.warning(f"⚠️  验证数据加载器为空！跳过验证阶段 Epoch {epoch+1}")
+        # 返回默认值，避免除零错误
+        return 0.0, 0.0
     
     # 计算平均指标
     avg_loss = total_loss / num_batches
@@ -1959,7 +2026,7 @@ def resume_from_checkpoint(checkpoint_dir: str,
 
     try:
         # 加载检查点
-        checkpoint = torch.load(latest_checkpoint_path, map_location=device)
+        checkpoint = torch.load(latest_checkpoint_path, map_location=device, weights_only=False)
         
         # 恢复模型权重
         # 兼容DDP和非DDP模型
@@ -2017,6 +2084,14 @@ def resume_from_checkpoint(checkpoint_dir: str,
 def main_worker(config, args):
     """主工作函数，负责训练和验证"""
     
+    # 🔥 智能恢复逻辑：在设置训练环境之前处理实验目录
+    if args.resume:
+        print(f"[智能恢复] 检测到 --resume 参数，正在搜索现有实验...")
+        exp_dir = setup_experiment_dir(config, resume_mode=True)
+    else:
+        print(f"[新训练] 创建新的实验目录...")
+        exp_dir = setup_experiment_dir(config, resume_mode=False)
+    
     # 1. 设置训练环境
     setup_result = setup_training(args, config, args.local_rank)
     
@@ -2030,15 +2105,18 @@ def main_worker(config, args):
     optimizer = setup_result['optimizer']
     scheduler = setup_result['scheduler']
     device = setup_result['device']
-    exp_dir = setup_result['exp_dir']
-    logger = setup_result['logger']
-    metric_logger = setup_result['metric_logger']
+    # 使用我们智能选择的实验目录
     scaler = setup_result['scaler']
     mixed_precision = setup_result['mixed_precision']
     world_size = setup_result['world_size']
     local_rank = setup_result['local_rank']
-    multi_logger = setup_result['multi_logger'] # 获取multi_logger
     update_optimizer_fn = setup_result['update_optimizer_fn'] # 获取动态参数更新函数
+    
+    # 🔥 现在初始化日志系统，使用正确的exp_dir
+    multi_logger, metric_logger, tb_writer = setup_logging_system(exp_dir, config)
+    
+    # 获取不同分类的日志记录器
+    logger = multi_logger.get_logger('train')  # 主训练日志
     
     # 2. 准备数据
     data_loaders = prepare_data(config, args)

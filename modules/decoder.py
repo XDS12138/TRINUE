@@ -127,20 +127,36 @@ class MultiTaskDecoder(nn.Module):
         
         # 🔥 修复显存跳变：在__init__中预先创建所有可能的投影层
         # 扩展的通道配置，覆盖更多可能的组合
-        common_channel_configs = [
+        common_channel_configs = []
+        
+        # 基于base_channels动态生成常见配置
+        base_variants = [base_channels, base_channels*2, base_channels*4, base_channels*8]
+        for in_ch in base_variants:
+            for out_ch in base_variants:
+                common_channel_configs.append((in_ch, out_ch))
+        
+        # 添加默认配置以保证兼容性
+        default_configs = [
             # 基础配置
             (48, 48), (96, 48), (192, 48), (384, 48),
             # 额外的常见配置
             (32, 48), (64, 48), (128, 48), (256, 48), (512, 48),
             # 反向配置（如果需要）
             (48, 32), (48, 64), (48, 96), (48, 128), (48, 192), (48, 256),
+            # 常见的2的幂次组合
+            (16, 16), (16, 32), (16, 64), (16, 128),
+            (32, 16), (32, 32), (32, 64), (32, 128),
+            (64, 16), (64, 32), (64, 64), (64, 128),
+            (128, 16), (128, 32), (128, 64), (128, 128),
             # 其他可能的组合
             (24, 48), (72, 48), (144, 48), (288, 48), (576, 48),
             # 2的幂次配置
-            (16, 48), (32, 48), (64, 48), (128, 48), (256, 48), (512, 48), (1024, 48),
+            (16, 48), (1024, 48),
             # 特殊情况
             (1, 48), (3, 48), (6, 48), (12, 48),
         ]
+        
+        common_channel_configs.extend(default_configs)
         
         self.skip_feature_projections = nn.ModuleDict()
         self.depth_channel_projections = nn.ModuleDict()
@@ -198,19 +214,20 @@ class MultiTaskDecoder(nn.Module):
         return proj_dict[layer_key]
 
     def forward(self, fused_feat, skip_feats, depth_feats, raw, 
-                depth_pred=None, beta_c=None, B_c=None, blur_scale=None):
+                depth_pred=None, beta_c=None, B_c=None, blur_scale=None, enhanced_depth_feats=None):
         """
         前向传播
         
         Args:
             fused_feat: 瓶颈层融合特征 [B, input_channels_bottleneck, H_bot, W_bot]
             skip_feats: 编码器跳连特征列表，从高分辨率到低分辨率
-            depth_feats: 深度分支特征列表
+            depth_feats: 深度分支特征列表 (原始depth特征)
             raw: 原始输入图像 [B, 3, H, W]（用于计算残差）
             depth_pred: 预测深度图 [B, 1, H, W]（用于物理调制）
             beta_c: 消光系数 [B, 3, 1, 1]（用于Beer-Lambert调制）
             B_c: 背景光 [B, 3, 1, 1]（用于Beer-Lambert调制） 
             blur_scale: 模糊尺度 [B, 1, 1, 1]（用于PSF调制）
+            enhanced_depth_feats: 增强深度特征列表 (可选，优先使用)
             
         Returns:
             res_d: 去模糊残差 [B, 3, H, W]
@@ -219,13 +236,34 @@ class MultiTaskDecoder(nn.Module):
         logger = logging.getLogger('decoder')
         current_device = fused_feat.device
         
-        # 跳连数量验证
-        if len(skip_feats) != self.num_encoder_feature_levels:
-            logger.warning(f"跳连特征数量不匹配: 预期 {self.num_encoder_feature_levels}, 实际 {len(skip_feats)}")
+        # 🔥 决定使用哪种深度特征：优先使用增强深度特征
+        actual_depth_feats = enhanced_depth_feats if enhanced_depth_feats is not None else depth_feats
+        if enhanced_depth_feats is not None:
+            logger.debug(f"Decoder: Using enhanced depth features ({len(enhanced_depth_feats)} levels)")
+        elif depth_feats is not None:
+            logger.debug(f"Decoder: Using original depth features ({len(depth_feats)} levels)")
+        else:
+            logger.debug("Decoder: No depth features available")
         
-        # 深度特征数量验证（如果提供）
-        if depth_feats is not None and len(depth_feats) != len(skip_feats):
-            logger.warning(f"深度特征数量与跳连特征不匹配: 深度 {len(depth_feats)}, 跳连 {len(skip_feats)}")
+        # 跳连数量自动适配
+        if len(skip_feats) != self.num_encoder_feature_levels:
+            # 自动调整跳连特征数量以匹配期望
+            if len(skip_feats) > self.num_encoder_feature_levels:
+                # 截断多余的特征
+                skip_feats = skip_feats[:self.num_encoder_feature_levels]
+            else:
+                # 补足缺少的特征（复制最后一个特征）
+                while len(skip_feats) < self.num_encoder_feature_levels:
+                    skip_feats.append(skip_feats[-1])
+        
+        # 深度特征数量自动适配（如果提供）
+        if actual_depth_feats is not None and len(actual_depth_feats) != len(skip_feats):
+            # 自动调整深度特征数量以匹配跳连特征
+            if len(actual_depth_feats) > len(skip_feats):
+                actual_depth_feats = actual_depth_feats[:len(skip_feats)]
+            else:
+                while len(actual_depth_feats) < len(skip_feats):
+                    actual_depth_feats.append(actual_depth_feats[-1])
             
         # ----- 去模糊分支 -----
         x = fused_feat  # 从瓶颈层开始

@@ -235,3 +235,115 @@ Transformer 善于捕捉全局上下文，但若缺乏足够数据或预训练�
 
 总的来说，**深度信息**（无论来自传感器、双目图像，还是由算法估计）对于水下图像增强极为重要。它能将一个病态的图像恢复问题变成物理上可求解的问题。我们可以看到两种极端路径：一种是如 Sea-thru 等基于物理的深度驱动方法，尽管对输入要求高，但效果极佳；另一种是深度学习驱动的自我估计方式，逐渐获得了广泛应用。随着深度估计网络的持续进步，这一趋势还将进一步发展。而我们将在后续介绍的 **UnderwaterEnhanceNet** 网络中看到，这一框架正是沿着此路线前行，通过将深度线索直接集成到图像增强过程中，实现了对图像中每个位置的深度感知增强。
 
+
+
+明白了。我将为你整理当前公认最具代表性的10种水下图像增强方法，涵盖传统方法、深度学习方法以及Transformer架构方法，并确保它们广泛用于UIEB数据集、支持全参考和无参考指标评估，以便用于高水平论文对比。
+
+我完成后会提供每种方法的简介、类别、论文出处以及适用评价指标。
+
+
+# 典型水下图像增强方法综述
+
+水下图像增强（UIE）领域涌现了多种主流或最新的增强方法。为了在高水平论文中进行对比实验，本文选择了**10种具有代表性**的水下图像增强方法，涵盖传统物理模型方法、先验驱动方法、深度学习方法（包括CNN和GAN）以及Transformer方法。这些方法在UIEB等数据集上均有评价记录，可支持采用PSNR、SSIM等全参考指标和UIQM、UCIQE等无参考指标进行评估。下面分别介绍每种方法的简介、方法类别、主要特点、发表来源、适用评价指标范围以及开源情况。
+
+## 1. 基于融合的传统增强方法（Fusion，TIP 2017）
+
+**类别**：非物理模型的传统图像融合方法（无需学习）。
+**简介及特点**：Ancuti等人提出了一种**单幅图像**的水下增强技术，利用*多尺度融合*策略将原始水下图像的不同校正版本融合。具体而言，方法对原图进行**颜色补偿**和**白平衡**预处理，得到两张增强图像，然后设计相应的**权重图**，以突出图像的边缘细节和色彩对比，将两路图像融合输出。采用Laplace金字塔的多尺度融合可避免直接融合带来的低频伪影。增强后图像整体亮度提升，暗区域曝光更充分，对比度和清晰度显著改善。此外，该算法对相机参数不敏感，在**无需任何水下环境先验**或额外设备的情况下即可有效增强水下图像。实验表明融合方法在主观和客观上均显著提升了图像质量。
+**发表来源**：IEEE TIP 2017，《Color Balance and Fusion for Underwater Image Enhancement》，引用超过千次。
+**评价指标**：融合方法产生增强结果，可在有参考图像时计算PSNR、SSIM等全参考指标，在无参考情形下亦可评估UIQM、UCIQE等指标。文献中通过定性和定量实验验证了其在多数据集上的有效性。
+**开源情况**：作者提供了算法细节，社区有第三方实现；没有官方代码，但该方法简单易于复现。
+
+## 2. 基于物理模型与统计先验的方法（SMBL，T‐Broadcast 2020）
+
+**类别**：物理成像模型驱动的方法，结合统计先验和图像复原。
+**简介及特点**：Song等人提出了**基于背景光统计模型和透射图优化**的水下图像增强方法。该方法利用经典的水下成像散射模型，通过**估计背景光（BL）和透射率（TM）**来复原图像。主要贡献包括：1）构建**人工标注背景光数据库**，统计不同水下图像直方图与背景光的关系，建立**鲁棒的背景光估计统计模型**；2）提出改进的**水下暗通道先验**（NUDCP）估计红色通道粗略透射图，并结合**水下光衰减先验**（ULAP）和**调整的反向饱和度图**（ARSM）细化红色通道透射图；3）推导绿色和蓝色通道透射率，与红色通道的衰减差异关联；4）最后应用**改进的白平衡**后处理，纠正色偏提升对比，使复原图像更加自然。实验表明，与其它SOTA方法相比，该方法的背景光估计更准确，计算效率更高，增强结果在信息保真度上更佳。
+**发表来源**：IEEE Trans. Broadcasting 2020，《Enhancement of Underwater Images With Statistical Model of Background Light and Optimization of Transmission Map》，提出者包括宋巍等。
+**评价指标**：由于引入了参考数据库，该方法可在有无参考情况下评估。作者通过充分的消融实验讨论关键参数（如BL和TM）的影响，并与多种SOTA方法比较PSNR、颜色保真等指标，证明了该方法整体性能和信息保真度的优势。在UIEB含参考子集中可计算PSNR/SSIM，在无参考子集上可报告UIQM/UIQE等，均有优秀表现。
+**开源情况**：有论文附录提供部分伪代码。未提供官方源码，但算法细节公开明确，已有学者基于文献实现了该方法。
+
+## 3. **先验驱动的传统增强方法**（MLLE，TIP 2022）
+
+**类别**：非深度学习的先验驱动方法（图像处理算法）。
+**简介及特点**：Zhang等人提出了高效鲁棒的水下图像增强算法**MLLE**（Minimal Color Loss and Locally Adaptive Contrast Enhancement）。该方法分两个阶段：首先依据**最小颜色损失原则**和**最大衰减地图引导融合策略**对输入图像进行**局部色彩和细节调整**。具体地，通过估计局部区域的**最大光强衰减**，补偿颜色偏差并融合细节，从而尽量保持色彩真实而不过饱和。接着，利用积分图和平方积分图计算局部块的均值和方差，**自适应地调整图像对比度**，并在此过程中引入**颜色平衡策略**来平衡CIELAB颜色空间中a、b通道的色差。增强结果呈现**色彩鲜艳、对比度提升、细节增强**的特点。大量实验表明MLLE在多个UIE数据集上优于当时的SOTA方法，并且算法**速度快**，在CPU上处理一张图像约1秒。此外，MLLE的增强结果有助于提高水下图像的分割、特征点检测和显著性检测等高层任务性能。
+**发表来源**：IEEE TIP 2022，《Underwater Image Enhancement via Minimal Color Loss and Locally Adaptive Contrast Enhancement》。
+**评价指标**：MLLE在公开数据集（如UIEB等）的有参考测试集上，作者报告了PSNR、SSIM等指标显著优于以往方法；在无参考场景下，可结合UIQM、UCIQE等指标和主观评价说明其在色彩真实性和清晰度上的优势。由于其无监督特性，无论有无参考图像均可应用。
+**开源情况**：作者提供了MATLAB代码。GitHub上有公开的MLLE代码仓库，方便研究者复现实验。
+
+## 4. **UWCNN：水下场景先验驱动的深度CNN方法**（PR 2019）
+
+**类别**：有监督深度学习方法（卷积神经网络，使用物理先验合成数据训练）。
+**简介及特点**：Li等人提出了**UWCNN**（Underwater Scene Prior Inspired CNN），这是早期将深度学习应用于水下增强的代表方法之一。UWCNN的核心思想是利用**水下成像先验**合成大规模训练数据，并训练轻量级CNN直接**端到端复原**清晰水下图像。具体而言，作者基于物理成像模型和不同水质的光学参数，使用带深度的NYU-V2室内数据集合成了**10种水体类型**、不同浑浊度和距离条件下的大规模水下退化图像数据集。然后，为每类水下场景训练一个**小型卷积网络**专门增强对应类型的图像。网络并不显式估计物理模型参数，而是**直接学习从退化图像重建清晰图像**的映射。UWCNN结构精简且训练有素，可方便地逐帧扩展用于水下视频增强。在真实和合成水下图像上的实验表明，UWCNN对多种水下场景具有良好的泛化能力。
+**发表来源**：Pattern Recognition 2019（2020出版），《Underwater Scene Prior Inspired Deep Underwater Image and Video Enhancement》。作者包括Chongyi Li、Saeed Anwar、Fatih Porikli等。
+**评价指标**：UWCNN通过合成数据训练，在合成测试集上获得高PSNR、SSIM，且在UIEB等真实数据集上通过UIQM、UCIQE等无参考指标评价显示出优于传统方法的综合质量。在UIEB含参考图像的T90子集上，其PSNR/SSIM等亦达到较高水平。由于其以参考图像监督训练，适用于全参考评价；同时增强结果视觉质量提升也可通过无参考指标体现。
+**开源情况**：官方提供了代码和合成数据集（GitHub: *saeed-anwar/UWCNN*）。研究者可以直接使用预训练模型测试，方便复现论文结果。
+
+## 5. **Water-Net：融合多版本预处理的CNN方法**（TIP 2019）
+
+**类别**：有监督深度学习方法（多分支卷积网络，融合图像增强先验）。
+**简介及特点**：Chongyi Li等人在构建UIEB数据集的同时提出了**Water-Net**，作为该数据集上的基线增强网络。Water-Net采用**门控融合**的思路，利用多个图像预处理结果来提升增强效果。具体来说，Water-Net会对输入的水下图像进行多种传统增强预处理（例如**白平衡**校正、**直方图拉伸/对比度增强**，Gamma校正等），将这些版本与原始图像一起作为网络的多路输入。网络通过卷积层**学习融合不同输入通道的信息**，自适应地强调有助于恢复清晰图像的成分。可以理解为网络在端到端训练中**学习了最佳的增强组合策略**，因此相比单一路输入的网络具有更强的稳健性。Water-Net在UIEB 890对训练数据上训练，并以UIEB提供的参考增强图像作为监督信号。增强结果在保留细节的同时有效纠正了色偏、提升亮度，对UIEB挑战集也有良好泛化。Water-Net的提出验证了UIEB数据集用于训练CNN的价值。
+**发表来源**：IEEE TIP 2019，《An Underwater Image Enhancement Benchmark Dataset and Beyond》（Li等）。
+**评价指标**：作为基线网络，Water-Net在UIEB测试集上取得了较好的参考指标成绩。例如据报告，其在UIEB-T90上PSNR接近20 dB，SSIM约0.86；无参考指标如UIQM等也优于多数传统算法。该网络输出可直接用于全参考评价（有GT时）或无参考评价（无GT时）。在实时性上，Water-Net推理速度较快，参数量适中。
+**开源情况**：官方提供了**TensorFlow和PyTorch代码**以及训练好的模型，可以方便地在UIEB或其他数据上测试和微调。
+
+## 6. **Ucolor：物理引导的多颜色空间CNN方法**（TIP 2021）
+
+**类别**：有监督深度学习方法（卷积网络融合物理先验和多颜色空间）。
+**简介及特点**：Li等人提出了**Ucolor**，一种结合**多颜色空间嵌入**和**介质透射率先验**的水下图像增强网络。Ucolor的创新在于：网络包含一个**多颜色空间编码器**，将输入图像在**RGB、HSV、Lab等不同颜色空间**下提取的特征融合同步学习。借助引入的**注意力机制**，网络能够自适应突出不同颜色空间中最辨别力强的特征，从而丰富表征。与此同时，受水下成像物理模型启发，Ucolor设计了一个**以介质透射率为引导**的解码器分支。所谓介质透射率可理解为场景辐射到达相机的百分比（类似于透射图），用于指示图像中哪些区域受到的退化更严重。通过在解码阶段融入该物理量引导，网络对质量较差的区域给予更多关注，**更有针对性地恢复能见度**。综合而言，Ucolor融合了**物理模型先验和数据驱动方法**的优势，在纠正色偏和去雾增强方面都表现出色。大量实验表明，Ucolor在视觉质量和定量指标上均**超越**已有方法。
+**发表来源**：IEEE TIP 2021，《Underwater Image Enhancement via Medium Transmission-Guided Multi-Color Space Embedding》。
+**评价指标**：作者在多个基准上验证了Ucolor的性能提升。在UIEB参考集上，其PSNR、SSIM均排名领先；在无参考指标方面，对比其他方法的UIQM、UCIQE亦有竞争力。值得注意的是，Ucolor在一定程度上兼顾了参考和无参考场景，因为其引入物理量辅助，无需严格依赖GT即可提升主观质量。因此可用PSNR/SSIM评估有参考增强效果，也可通过UIQM/UCIQE度量无参考场景下的改进。
+**开源情况**：作者提供了论文附录和部分代码说明，一般可在作者主页或GitHub找到Ucolor的开源实现。训练所需的UIEB数据和预训练模型也已公开，使研究者能够方便地复现结果。
+
+## 7. **PUIE-Net：不确定性驱动的概率增强方法**（ECCV 2022）
+
+**类别**：有监督深度学习方法（**基于条件变分自编码器**的概率模型）。
+**简介及特点**：Fu等人提出了**PUIE-Net**（Probabilistic UIE），首个将**不确定性建模**引入水下图像增强的框架。传统深度UIE通常输出单一确定结果，而PUIE-Net试图**学习增强结果的分布**，以解决水下增强缺乏唯一“真实”参考的难题。具体而言，PUIE-Net采用了**条件VAE**结构，利用两个并行的**增强风格属性**编码器，从输入图像中随机采样不同的风格潜变量，从而生成多样化的增强结果。这种方法能够显式刻画水下图像增强结果的不确定性分布。为了获得最终输出，作者引入了**共识过程（consensus）**：对多个采样增强结果进行整合，得到稳健的融合输出。该共识增强图像在视觉质量上与确定性方法相当甚至更佳，同时PUIE-Net还能生成一系列合理的备选增强结果。另外，PUIE-Net在训练中结合了**颜色差异度量（如ΔE2000）**和**NIQE无参考评价**等多种损失，兼顾参考和无参考优化。该方法有效缓解了增强结果观偏差问题。
+**发表来源**：ECCV 2022，《Uncertainty Inspired Underwater Image Enhancement (PUIE-Net)》，Zhenqi Fu等，提出了UIEBD新数据集和该不确定性方法。
+**评价指标**：PUIE-Net在作者构建的**UIEBD数据集**上，以SSIM、PSNR和ΔE（颜色差异）等参考指标评估，相较传统方法取得了显著提升；同时在人眼主观评价（MOS）中也表现突出。在没有参考的RUIE数据集上，采用NIQE和用户调研，同样证明了其增强结果更受偏好。因此，该方法既适用于有参考场景下的PSNR/SSIM等量化比较，也适用于无参考场景下的UIQM/NIQE及主观评价。
+**开源情况**：作者提供了开源的Pytorch实现代码和模型（GitHub: *zhenqifu/PUIE-Net*）。UIEBD数据集也在论文中公开，便于社区使用和比较。
+
+## 8. **TACL：面向检测任务的对抗式增强方法**（TIP 2022）
+
+**类别**：有监督深度学习方法（**GAN结合对比学习**，任务驱动）。
+**简介及特点**：Liu等人提出了**TACL**（Twin Adversarial Contrastive Learning）框架，旨在实现“**视觉友好**且**任务友好**”的水下图像增强。该方法关注到，仅优化图像视觉质量的增强结果有时**不利于水下目标检测**，甚至降低检测性能。为此，TACL引入了**目标引导（object-guided）**的双重对抗训练机制。首先，设计一个**双约束闭环GAN模块**：通过无监督的循环一致对抗过程学习从原始图像到增强图像的映射，以及逆向映射，构成双向约束以减少对成对训练数据的依赖。这种**双生成器-判别器**结构确保增强过程保留更多关键信息（利用**孪生逆映射**保留特征）。其次，在训练中融入**对比学习线索**，引导生成图像更加真实自然。更重要的是，TACL增加了一个**任务感知反馈模块**：将预先训练好的检测网络嵌入增强过程中，利用检测器的梯度信息作为反馈信号，指导增强网络朝着**有利于检测**的方向调整。通过这种方式，增强结果不仅在视觉上清晰自然，还能提高后续检测算法的准确率。实验表明，TACL增强后的图像质量显著改善，多种目标检测器在增强图像上的检测精度**大幅提升**。该方法还对语义分割进行了验证，证明**任务引导**的增强对高层视觉任务有积极作用。
+**发表来源**：IEEE TIP 2022，《Twin Adversarial Contrastive Learning for Underwater Image Enhancement and Beyond》，作者Liu Risheng等。
+**评价指标**：TACL的评估分为两方面：图像质量方面，使用PSNR、SSIM和主观评价证明增强图像更接近真实清晰图像；任务性能方面，通过在增强前后对比目标检测(AP值)或分割mIOU来验证提升。在UIEB等增强数据集上，TACL的图像增强指标达到SOTA水平，同时在水下COCO-URPC等检测集上，大幅提高了检测精度。无参考指标如UIQM/UCIQE在视觉增强评价中也有报告（略低于某些专注视觉的方法，但综合考虑检测性能具有优势）。
+**开源情况**：官方提供了开源代码（GitHub: *Jzy2017/TACL*）和预训练模型。代码包含增强模块及示例检测模块配置，方便他人复现论文提出的训练流程。
+
+## 9. **NU2Net：基于排序学习的增强网络**（AAAI 2023）
+
+**类别**：有监督深度学习方法（轻量级U形CNN，结合无参考质量评估模型训练）。
+**简介及特点**：Wu等人在AAAI 2023提出了**Underwater Ranker框架**，其中包含一个简单高效的增强网络**NU2Net**和一个水下图像质量评估网络**URanker**。NU2Net本身是一个**U型结构**的卷积网络，参数量小但具备基本的全局局部特征提取能力。其独特之处在于训练策略：作者预训练了一个无参考的UIQA模型URanker，用于判别两张水下图像谁质量更高。在增强网络训练时，不使用传统的MSE或感知损失，而是采用URanker的评价作为**附加监督信号**，即让NU2Net输出的增强图像在URanker评分中优于原图。这种**排序监督**有效避免了对“绝对”参考图像的依赖，解决了水下增强缺乏高质量GT的问题。换言之，NU2Net+URanker框架通过学习\*\*“哪种增强更好”\*\*来优化自身。实验证明，引入URanker后，NU2Net能够取得出色的增强性能。例如，在UIEB-T90基准上，其PSNR达到22.82 dB，SSIM达0.893，位居前列。同时，NU2Net保持了非常高的推理效率，参数仅9K，在CPU/GPU上均可实时运行。
+**发表来源**：AAAI 2023（Oral），《Underwater Ranker: Learn Which Is Better and How to Be Better》，作者Ruoqiao Wu等。
+**评价指标**：NU2Net在训练和评价中都充分考虑了无参考和有参考指标的结合。在UIEB有GT的90张测试上取得了与Transformer等复杂模型相当的PSNR/SSIM；在UIEB无GT的60张挑战集中，通过URanker/UIQM/UCIQE等指标证明其增强结果质量优于以往方法。由于有URanker参与，NU2Net特别擅长提高UIQM等无参考指标，同时兼顾视觉主观质量。可见，该方法能够在无参考情境下训练，但在有参考评测中同样表现优秀。
+**开源情况**：官方开源了代码和模型（GitHub: *RQ-Wu/UnderwaterRanker*），包括URanker和NU2Net的实现。研究者可以方便地使用开源项目对自己的水下图像进行增强，并利用URanker评估质量。
+
+## 10. **U-Shape Transformer：Transformer架构的水下增强**（TIP 2023）
+
+**类别**：有监督深度学习方法（Transformer架构，专为UIE设计）。
+**简介及特点**：Peng等人首次将**Transformer模型**引入水下图像增强任务，提出了**U-Shape Transformer网络**。同时，他们构建了大规模水下图像数据集**LSUI**，包含4279对真实水下图像及高质量参考，提高了训练数据的多样性。U-Shape Transformer采用U形编码-解码架构，其中设计了两大模块以针对水下退化特性：一是**通道级多尺度特征融合Transformer模块（CMSFFT）**，注重不同颜色通道的不均匀衰减，增强网络对**色彩通道**的关注；二是**空间级全局特征建模Transformer模块（SGFMT）**，注重**空间区域**的全局依赖关系，强化对退化严重区域的处理。这两个模块嵌入到Transformer块中，有针对性地提升了网络处理**颜色失真和空间雾霾**的能力。此外，作者设计了结合**RGB、Lab和LCH颜色空间**的**新型复合损失函数**，符合人眼视觉原理，用于提升增强图像的对比度和饱和度。在多个数据集上的实验表明，U-Shape Transformer取得了**最先进的增强性能**，在UIEB等基准上PSNR较已有最好方法提升超过2 dB。
+**发表来源**：IEEE TIP 2023，《U-shape Transformer for Underwater Image Enhancement》，作者Lintao Peng等。
+**评价指标**：U-Shape Transformer在有大规模参考的LSUI数据集上训练，在UIEB、LSUI等测试集上取得了最高的PSNR、SSIM值；无参考指标UCIQE等也领先其它方法。尤其在UIEB-T90上，PSNR达到22+ dB，SSIM约0.893，几乎刷新纪录。该网络生成的高质量结果也验证了其在UIQM等指标上的竞争力。因此，不论采用全参考还是无参考评价标准，Transformer方案均展现了出色的增强效果和**跨数据集的泛化性**。
+**开源情况**：作者公开了**LSUI数据集和演示代码**。部分源码和模型在作者主页提供（如BianLab网站），供研究者试用和进一步研究。此外，社区已有实现（例如CSDN和GitHub上出现了U-Transformer的复现项目），方便复现论文结果。
+
+**参考文献：**
+
+1. Ancuti C.O. et al. *“Color Balance and Fusion for Underwater Image Enhancement,”* **IEEE TIP**, 2017.
+
+2. Song W. et al. *“Enhancement of Underwater Images With Statistical Model of Background Light and Optimization of Transmission Map,”* **IEEE TBC**, 2020.
+
+3. Zhang W. et al. *“Underwater Image Enhancement via Minimal Color Loss and Locally Adaptive Contrast Enhancement,”* **IEEE TIP**, 2022.
+
+4. Li C. et al. *“Underwater Scene Prior Inspired Deep Underwater Image and Video Enhancement,”* **Pattern Recognition**, 2019.
+
+5. Li C. et al. *“An Underwater Image Enhancement Benchmark Dataset and Beyond (Water-Net),”* **IEEE TIP**, 2019.
+
+6. Li C. et al. *“Underwater Image Enhancement via Medium Transmission-Guided Multi-Color Space Embedding (Ucolor),”* **IEEE TIP**, 2021.
+
+7. Fu Z. et al. *“Uncertainty Inspired Underwater Image Enhancement (PUIE-Net),”* **ECCV**, 2022.
+
+8. Liu R. et al. *“Twin Adversarial Contrastive Learning for Underwater Image Enhancement and Beyond,”* **IEEE TIP**, 2022.
+
+9. Wu R. et al. *“Underwater Ranker: Learn Which Is Better and How to Be Better (NU2Net),”* **AAAI**, 2023.
+
+10. Peng L. et al. *“U-shape Transformer for Underwater Image Enhancement,”* **IEEE TIP**, 2023.
