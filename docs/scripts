@@ -11,7 +11,7 @@ git push -u origin main
 置信度引导损失
 这个文件重新写，双向交叉注意力，请阅读我现在的项目文件进行书写，我需要这样绘制，根据代码可以得出，
 
-git add .
+
 git commit -m "your message"
 git push
 

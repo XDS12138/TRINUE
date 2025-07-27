@@ -27,7 +27,6 @@ class ModelOutput:
     pred_gate: torch.Tensor                         # 预测的门控图 [B, 1, H, W]
     depth_pred: torch.Tensor                        # 预测的连续深度图 [B, 1, H, W]
     student_feats: Optional[List[torch.Tensor]] = None    # 编码器特征列表
-    depth_conf_map: Optional[torch.Tensor] = None         # 深度置信度图
     attention_maps: Optional[Tuple[torch.Tensor, torch.Tensor]] = None  # 注意力图元组 (depth2rgb, rgb2depth)
     
     # 🔥 多输入一致性学习新增属性
@@ -45,7 +44,6 @@ class ModelOutput:
             'pred_gate': self.pred_gate,
             'depth_pred': self.depth_pred,
             'student_feats': self.student_feats,
-            'depth_conf_map': self.depth_conf_map,
             'attention_maps': self.attention_maps
         }
         
@@ -56,7 +54,6 @@ class ModelOutput:
                 'multi_depth_pred': self.multi_depth_pred,
                 'multi_res_d': self.multi_res_d,
                 'multi_res_c': self.multi_res_c,
-
                 'is_multi_input': self.is_multi_input
             })
         
