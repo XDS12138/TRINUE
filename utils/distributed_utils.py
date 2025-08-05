@@ -46,7 +46,7 @@ def distributed_worker(rank, world_size, config, args):
     
     # 确保每个进程有不同的随机种子
     from utils.arg_parser import set_seed
-    set_seed(args.seed + rank)
+    set_seed(args.seed + rank, config.get('gpu', {}))
     
     # 每个进程都运行主工作函数
     from scripts.train import main_worker

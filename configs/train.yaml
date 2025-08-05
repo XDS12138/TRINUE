@@ -58,6 +58,12 @@ gpu:
   backend: "nccl"  # 分布式后端，可选 "nccl" (GPU) 或 "gloo" (CPU)
   sync_bn: true  # 是否使用SyncBatchNorm
   find_unused_parameters: false  # 是否在DDP中查找未使用参数
+  
+  # 🚀 性能优化配置
+  optimization:
+    tf32_enabled: true  # 启用TF32加速(支持Ampere+架构)
+    cudnn_benchmark: false  # 是否启用CUDNN自动调优
+    cudnn_deterministic: true  # 是否使用确定性算法
 
 # 数据配置
 data:

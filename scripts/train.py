@@ -563,8 +563,8 @@ def main():
     with open(args.config, 'r') as f:
         config = yaml.safe_load(f)
     
-    # 设置随机种子
-    set_seed(args.seed)
+    # 设置随机种子和GPU优化配置
+    set_seed(args.seed, config.get('gpu', {}))
     
     # 分布式训练处理
     if setup_for_distributed_launch(config, args):

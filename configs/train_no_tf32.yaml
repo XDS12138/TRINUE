@@ -1,0 +1,165 @@
+# 禁用TF32的配置文件示例 - 用于性能对比测试
+# 这个配置适用于需要严格数值精度的实验或对比TF32性能差异
+
+# 基础配置继承自train.yaml，仅修改GPU优化部分
+# 使用方法: python scripts/train.py --config configs/train_no_tf32.yaml
+
+# 实验配置
+experiment:
+  name: underwater_enhance_no_tf32
+  output_dir: ~/autodl-fs/experiments/train_no_tf32
+  auto_naming: true
+  timestamp_format: "%Y%m%d_%H%M%S"
+
+# 模型配置（与主配置相同）
+model:
+  base_channels: 48
+  levels: 4
+  heads: 8
+  bottleneck_blocks: 8
+  encoder_window_size: 8
+  bottleneck_window_size: 8
+  decoder_block_window_size: 8
+  depth_processor_config:
+    double_channels: True
+    use_cross_attn: true
+  use_loop_consistency: true
+
+# 多输入一致性学习配置
+multi_input_consistency:
+  enable: true
+  fusion:
+    strategy: "confidence_weighted"
+    temperature: 1.0
+  cmcl:
+    enable: true
+    lambda_var: 1.0
+    lambda_rgb: 1.0
+    lambda_depth: 1.0
+    k_decay: 1.0
+
+# 训练配置
+train:
+  epochs: 100
+  val_interval: 1
+  vis_interval: 4000
+  param_vis_interval: 5000
+  save_best: true
+  save_interval: 10
+  validation_start_epoch: 20
+
+# GPU配置 - 🔒 禁用TF32版本
+gpu:
+  use_gpu: true
+  device_ids: [0]
+  mixed_precision: true
+  distributed: false
+  backend: "nccl"
+  sync_bn: true
+  find_unused_parameters: false
+  
+  # 🔒 严格精度配置 - 禁用所有近似优化
+  optimization:
+    tf32_enabled: false  # 禁用TF32，使用严格FP32
+    cudnn_benchmark: false  # 禁用自动调优以确保一致性
+    cudnn_deterministic: true  # 启用确定性算法
+
+# 数据配置
+data:
+  format: "folder"
+  dataset_type: multi_degradation
+  train_root: "DATA/train"
+  val_root: null
+  folder_structure:
+    gt: "gt"
+    depth: "depth"
+    degraded:
+      bluish_green: "bluish_green"
+      blue_green: "blue_green"
+      hazy_bluish: "hazy_bluish"
+      lowlight_blue: "lowlight_blue"
+      contrast_mix: "contrast_mix"
+      fog_dark: "fog_dark"
+      algae_low: "algae_low"
+      dirty_lowlight: "dirty_lowlight"
+      greenish_hazy: "greenish_hazy"
+      underwater_hazy: "underwater_hazy"
+      low_lighting: "low_lighting"
+      blue_lowlight: "blue_lowlight"
+      lowlight_greenish: "lowlight_greenish"
+      blue: "blue"
+      underwater: "underwater"
+
+# 多验证集配置
+multi_validation_sets:
+  enable: true
+  validation_sets:
+    - name: "UIEB"
+      description: "UIEB underwater image dataset"
+      root_dir: "DATA/val/UIEB"
+      degraded_dir: "input_256"
+      gt_dir: "target_256"
+      depth_dir: "depth_256"
+      enabled: true
+      eval_underwater_hazy: true
+      
+    - name: "EUVP"
+      description: "EUVP underwater image pairs dataset"
+      root_dir: "DATA/val/EUVP"
+      degraded_dir: "trainA_256"
+      gt_dir: "trainB_256"
+      depth_dir: "depth_256"
+      enabled: true
+      eval_underwater: true
+
+# 优化器配置
+optimizer:
+  lr: 0.0002
+  weight_decay: 1e-4
+  betas: [0.9, 0.99]
+  eps: 1e-8
+
+# 学习率调度器配置
+lr_scheduler:
+  type: cosine_annealing
+  cosine_annealing:
+    T_max: 100
+    eta_min: 1e-6
+
+# 损失函数配置
+loss:
+  l1_lambda: 1.0
+  ssim_lambda: 0.3
+  perceptual_lambda: 0.5
+  depth_lambda: 0.1
+  feature_lambda: 0.1
+  adversarial_lambda: 0.01
+  hdr_lambda: 0.1
+  gradient_lambda: 0.05
+  local_structure_lambda: 0.2
+  pyramid_lambda: 0.1
+
+# 数据加载配置
+dataloader:
+  batch_size: 1
+  num_workers: 4
+  shuffle: true
+  pin_memory: true
+  drop_last: true
+
+# 数据增强配置
+transforms:
+  resize_size: 256
+  crop_size: 256
+  flip_prob: 0.5
+
+# 说明:
+# 使用说明:
+# 1. 运行普通训练（启用TF32）: python scripts/train.py --config configs/train.yaml
+# 2. 运行精确训练（禁用TF32）: python scripts/train.py --config configs/train_no_tf32.yaml
+# 3. 对比两次训练的结果，观察性能差异
+
+# 预期结果:
+# - tf32_enabled: false -> 使用严格的FP32精度，训练速度较慢但数值精度最高
+# - tf32_enabled: true  -> 使用TF32加速，训练速度快2-8倍，精度损失很小
+# - 适用于科学计算或需要严格可重现性的实验 
