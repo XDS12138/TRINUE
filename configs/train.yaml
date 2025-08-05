@@ -53,7 +53,7 @@ train:
 gpu:
   use_gpu: true  # 是否使用GPU
   device_ids: [0]  # 使用的GPU ID列表，恢复双GPU
-  mixed_precision: false  # 保持关闭混合精度训练
+  mixed_precision: true # 保持关闭混合精度训练
   distributed: false  # 禁用分布式训练（单卡）
   backend: "nccl"  # 分布式后端，可选 "nccl" (GPU) 或 "gloo" (CPU)
   sync_bn: true  # 是否使用SyncBatchNorm

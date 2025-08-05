@@ -305,12 +305,17 @@ def _setup_mixed_precision(mixed_precision, use_gpu):
     scaler = None
     if mixed_precision and use_gpu:
         try:
-            from torch.amp import GradScaler
+            from torch.cuda.amp import GradScaler
             scaler = GradScaler()
-            print("启用混合精度训练")
+            print("启用混合精度训练 (CUDA AMP)")
         except ImportError:
-            print("混合精度训练需要PyTorch 1.6+，已禁用混合精度训练。")
-            mixed_precision = False
+            try:
+                from torch.amp import GradScaler
+                scaler = GradScaler()
+                print("启用混合精度训练 (Generic AMP)")
+            except ImportError:
+                print("混合精度训练需要PyTorch 1.6+，已禁用混合精度训练。")
+                mixed_precision = False
     
     return scaler
 

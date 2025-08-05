@@ -9,16 +9,17 @@ experiment:
 
 # 模型配置
 model:
-  base_channels: 48 
-  levels: 4
-  heads: 8
-  bottleneck_blocks: 8
+  base_channels: 48  # 恢复原始参数
+  levels: 4  # 恢复原始参数
+  heads: 8  # 恢复原始参数
+  bottleneck_blocks: 8  # 恢复原始参数
   encoder_window_size: 8  # 🔧 修复264错误：12无法整除256，改为8 
   bottleneck_window_size: 8  # 启用瓶颈窗口
   decoder_block_window_size: 8
   depth_processor_config:
-    double_channels: True
+    double_channels: True  # 恢复原始参数
     use_cross_attn: true
+  use_loop_consistency: true  # 🚀 启用循环计算（显存友好）
 
 # 🔥 多输入一致性学习配置（解码器融合级别约束）
 multi_input_consistency:
@@ -41,7 +42,7 @@ multi_input_consistency:
 train:
   epochs: 100
   val_interval: 1
-  vis_interval: 1000  # 🔧 临时禁用可视化以排查Tensor+str错误
+  vis_interval: 4000  # 🔧 临时禁用可视化以排查Tensor+str错误
   param_vis_interval: 5000  # 每多少个batch记录一次参数直方图
   save_best: true  # 是否保存最佳模型
   save_interval: 10  # 每多少个epoch保存一次模型
@@ -52,7 +53,7 @@ train:
 gpu:
   use_gpu: true  # 是否使用GPU
   device_ids: [0]  # 使用的GPU ID列表，恢复双GPU
-  mixed_precision: false  # 是否使用混合精度训练
+  mixed_precision: true # 保持关闭混合精度训练
   distributed: false  # 禁用分布式训练（单卡）
   backend: "nccl"  # 分布式后端，可选 "nccl" (GPU) 或 "gloo" (CPU)
   sync_bn: true  # 是否使用SyncBatchNorm
@@ -67,17 +68,17 @@ data:
   folder_structure:  # 固定文件夹结构，仅在format="folder"时有效
     gt: "gt"        # 目标图像文件夹名
     depth: "depth"  # 深度图文件夹名
-  # 退化图像文件夹列表 - 用于控制输入数据
-  degradation_folders: ['color_B_1', 'color_B_2','color_B_3','color_BG_1', 'color_BG_2','color_BG_3','color_G_1', 'color_G_2','color_G_3','color_Y_1', 'color_Y_2','color_Y_3','color_YG_1', 'color_YG_2','color_YG_3']  # which folders to use
+  # 退化图像文件夹列表 - 恢复完整列表
+  degradation_folders: ['color_B_1', 'color_B_2','color_B_3','color_BG_1', 'color_BG_2','color_BG_3','color_G_1', 'color_G_2','color_G_3','color_Y_1', 'color_Y_2','color_Y_3','color_YG_1', 'color_YG_2','color_YG_3']  # 恢复完整15个退化类型
   lmdb_paths:  # LMDB路径，仅在format="lmdb"时有效
     train: "DATA/train.lmdb"
     val: "DATA/val.lmdb"
-  batch_size: 6  # 进一步降低内存使用
-  num_workers: 48  # 保持原有的高并行度
+  batch_size: 1  # 最小batch size
+  num_workers: 48  # 恢复原始worker数量
   persistent_workers: true  # 持久化worker，避免重复fork
-  prefetch_factor: 4  # 每个worker预取批次数
+  prefetch_factor: 8  # 恢复原始预取数量
   pin_memory: true  # 加速GPU数据传输
-  resolution: 256  # 🔥 提升训练分辨率以保留更多细节
+  resolution: 256  # 恢复原始分辨率
   augment_prob: 0.1  # 🔥 适当增加数据增强概率
   augmentations:
     random_crop: True
@@ -341,15 +342,15 @@ loss:
   depth_weight: 1.0  # 深度回归损失权重（用于连续深度预测）
   depth_processing:
     use_log_transform: true  # 是否使用对数变换
-    min_depth: 5000.0  # 最小有效深度值
-    max_depth: 65000.0  # 最大有效深度值
+    min_depth: 2000.0  # 实际像素值最小深度
+    max_depth: 65535.0  # 实际像素值最大深度
     edge_weight: 0.5  # 边缘感知损失权重
     use_edge_aware_loss: true  # 是否使用边缘感知损失
     # 添加对数和线性变换的独立深度范围
-    min_depth_log: 5000.0  # 对数变换时的最小深度
-    max_depth_log: 65000.0  # 对数变换时的最大深度
-    min_depth_linear: 5000.0  # 线性变换时的最小深度
-    max_depth_linear: 65000.0  # 线性变换时的最大深度
+    min_depth_log: 2000.0  # 对数变换时的最小深度像素值
+    max_depth_log: 65535.0  # 对数变换时的最大深度像素值
+    min_depth_linear: 2000.0  # 线性变换时的最小深度像素值
+    max_depth_linear: 65535.0  # 线性变换时的最大深度像素值
     use_cross_attn: true
 
   # 深度边缘颜色损失配置
@@ -369,7 +370,7 @@ visualization:
   save_features: true
   save_depth_fusion: true
   max_images_per_batch: 4  # 每个批次最多保存多少图像
-  vis_freq: 500  # 每多少个batch保存一次可视化
+  vis_freq: 2000  # 每多少个batch保存一次可视化
   val_vis_interval: 50  # 验证时每多少个batch记录一次TensorBoard可视化
   max_val_vis_samples: 10  # 验证时最多在TensorBoard中可视化多少个样本
   val_images:
@@ -421,7 +422,7 @@ visualization:
     # 注意力图可视化 (attention/*)
     attention_maps:
       enable: true  # 是否保存注意力图
-      freq: 1000  # 每N步保存一次注意力图
+      freq: 2000  # 每N步保存一次注意力图
 
 
 logging:

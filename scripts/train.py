@@ -15,7 +15,11 @@ import torch.optim as optim
 from collections import defaultdict
 from tqdm import tqdm
 from torchvision.utils import save_image
-from torch.cuda.amp import autocast
+try:
+    from torch.cuda.amp import autocast, GradScaler
+except ImportError:
+    # For newer PyTorch versions
+    from torch.amp import autocast, GradScaler
 
 # 添加项目根目录到Python路径
 root_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
@@ -89,20 +93,10 @@ def train_epoch(train_loader, model, criterion, optimizer, device, metric_logger
                     # 启用多输入一致性学习（如果配置中启用）
                     enable_consistency = config.get('multi_input_consistency', {}).get('enable', False)
                     
-                    # 🔥 添加调试信息
-                    if step < 3:
-                        print(f"[TRAIN DEBUG] Step {step}: hasattr(model, 'forward'): {hasattr(model, 'forward')}")
-                        print(f"[TRAIN DEBUG] Step {step}: raw_imgs.dim(): {raw_imgs.dim()}")
-                        print(f"[TRAIN DEBUG] Step {step}: enable_consistency: {enable_consistency}")
-                        print(f"[TRAIN DEBUG] Step {step}: condition: {hasattr(model, 'forward') and raw_imgs.dim() == 5}")
-                    
+                    # 前向传播选择逻辑
                     if hasattr(model, 'forward') and raw_imgs.dim() == 5:
-                        if step < 3:
-                            print(f"[TRAIN DEBUG] Step {step}: 调用 model.forward() 方法")
                         outputs = model.forward(raw_imgs, depth_gt, gt, enable_multi_input_consistency=enable_consistency)
                     else:
-                        if step < 3:
-                            print(f"[TRAIN DEBUG] Step {step}: 调用 model.multi_forward() 方法")
                         outputs = model.multi_forward(raw_imgs, depth_gt, gt)
                     loss = criterion(
                         outputs.enhanced, gt,
@@ -156,11 +150,10 @@ def train_epoch(train_loader, model, criterion, optimizer, device, metric_logger
             
         except Exception as e:
             error_logger.error(f"训练步骤 {current_step} 出错: {e}")
-            # 🔧 添加详细的错误跟踪
-            if "unsupported operand type(s) for +: 'Tensor' and 'str'" in str(e):
-                import traceback
-                error_logger.error("🎯 捕获到Tensor+str错误的完整堆栈跟踪:")
-                error_logger.error(traceback.format_exc())
+            # 添加详细的错误跟踪
+            import traceback
+            error_logger.error("详细错误堆栈:")
+            error_logger.error(traceback.format_exc())
             continue
         
         current_loss = loss.item()
@@ -444,10 +437,10 @@ def _parse_batch_data(batch, device, config):
         depth_gt = batch['depth'].to(device) if 'depth' in batch and batch['depth'] is not None else None
         gt = batch['gt'].to(device) if 'gt' in batch and batch['gt'] is not None else None
         
-        # 🔥 添加调试信息
-        print(f"[DEBUG] _parse_batch_data: raw_imgs.shape={raw_imgs.shape}, dim={raw_imgs.dim()}")
-        print(f"[DEBUG] _parse_batch_data: depth_gt.shape={depth_gt.shape if depth_gt is not None else None}")
-        print(f"[DEBUG] _parse_batch_data: gt.shape={gt.shape if gt is not None else None}")
+        # 数据形状验证（可选）
+        # print(f"[DEBUG] _parse_batch_data: raw_imgs.shape={raw_imgs.shape}, dim={raw_imgs.dim()}")
+        # print(f"[DEBUG] _parse_batch_data: depth_gt.shape={depth_gt.shape if depth_gt is not None else None}")
+        # print(f"[DEBUG] _parse_batch_data: gt.shape={gt.shape if gt is not None else None}")
         
         # 保持5D张量用于多输入处理
         # raw_imgs形状应该是 [B, N, C, H, W] 其中N是退化类型数量
@@ -484,11 +477,17 @@ def _log_training_metrics(criterion, step, config, metric_logger, multi_logger):
         
         for loss_name, loss_value in loss_components.items():
             if loss_name != 'total_loss':
-                # 🔧 确保所有值都是Python数值，避免Tensor+str错误
+                # 确保所有值都是Python数值，避免Tensor+str错误
                 if hasattr(loss_value, 'item'):
                     loss_value = loss_value.item()
                 elif isinstance(loss_value, torch.Tensor):
                     loss_value = float(loss_value.cpu().detach())
+                elif not isinstance(loss_value, (int, float)):
+                    # 如果不是数字类型，尝试转换或跳过
+                    try:
+                        loss_value = float(loss_value)
+                    except (ValueError, TypeError):
+                        continue
                 
                 if not (loss_name.startswith('loss_') or loss_name.endswith('_loss')):
                     metrics[f"loss_{loss_name}"] = loss_value
