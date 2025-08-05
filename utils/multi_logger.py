@@ -42,44 +42,21 @@ class MultiFileLogger:
         
         # 更新分类名称和描述
         self.categories = {
-            # 训练过程相关
-            'train': '训练主流程日志（整体进度、epoch、迭代等）',
-            'validation': '验证过程相关日志',
+            # 训练核心类别（高频使用）
+            'train': '核心训练过程（进度、批次处理、学习率等）',
+            'metrics': '所有指标（PSNR、SSIM、损失等）',
+            'validation': '验证过程（多验证集结果、计算指标等）',
+            'depth': '深度预测相关（深度估计、误差计算、尺度对齐）',
             
-            # 性能指标相关
-            'loss': '损失函数相关日志（所有损失组件的详细信息）',
-            'metrics': '评估指标相关日志（PSNR、SSIM等）',
+            # 系统和错误类别（必要的）
+            'error': '错误和异常（模型、数据、计算等各种错误）',
+            'warning': '警告信息（潜在问题、配置冲突等）',
+            'checkpoint': '模型保存、加载、恢复训练（权重、优化器状态等）',
             
-            # 模型相关
-            'model': '模型结构、参数、前向传播等信息',
-            'architecture': '模型架构特定信息（网络层、特征等）',
-            
-            # 数据相关
-            'data': '数据集、数据加载、预处理等信息',
-            'dataloader': '数据加载器详细日志（批量大小、迭代次数等）',
-            
-            # 优化相关
-            'optimizer': '优化器配置、学习率、权重衰减等',
-            'gradient': '梯度信息、梯度裁剪等',
-            'scheduler': '学习率调度器相关日志',
-            
-            # 模型特定功能
-            'depth': '深度预测相关日志（深度损失、预测结果等）',
-            'physics': '物理模型相关日志（Beer-Lambert、深度条件PSF等）',
-            'attention': '注意力机制相关日志（交叉注意力、自注意力等）',
-            
-            # 系统相关
-            'checkpoint': '模型保存和加载相关信息',
-            'memory': '内存使用、CUDA内存等系统资源',
-            'gpu': 'GPU使用情况、利用率等',
-            
-            # 其他
-            'error': '错误信息和异常日志',
-            'warning': '警告信息',
-            'debug': '调试信息',
-            'experiment': '实验配置和环境信息',
-            'visualization': '可视化相关日志',
-            'uncertainty': '不确定性权重相关日志（自动加权训练）'
+            # 其他实用类别
+            'system': '系统资源（GPU、内存、磁盘使用）',
+            'experiment': '实验配置和环境（超参、架构、设备等）',
+            'visualization': '可视化相关（图像保存、TensorBoard等）'
         }
 
         # 控制台显示的日志类别（其他只写入文件）
@@ -168,6 +145,7 @@ class MultiFileLogger:
 
         self.current_epoch = epoch
 
+        # 更新为新定义的日志类别
         target_categories = list(self.categories.keys()) + ['general']
 
         for cat in target_categories:
@@ -279,12 +257,13 @@ class MultiFileLogger:
     
     def log_loss(self, losses: dict, step: int, prefix: str = "train"):
         """记录损失值"""
-        loss_logger = self.loggers['loss']
+        # 将loss日志整合到metrics日志中
+        metrics_logger = self.loggers['metrics']
         
         # 记录总损失
         if 'total' in losses or 'loss' in losses:
             total_loss = losses.get('total', losses.get('loss', 0))
-            loss_logger.info(f"[{prefix}] Step {step}: Total Loss = {total_loss:.6f}")
+            metrics_logger.info(f"[{prefix}] Step {step}: Total Loss = {total_loss:.6f}")
         
         # 记录各个损失组件
         components = []
@@ -293,7 +272,7 @@ class MultiFileLogger:
                 components.append(f"{k}={v:.6f}")
         
         if components:
-            loss_logger.info(f"[{prefix}] Step {step}: Components - {', '.join(components)}")
+            metrics_logger.info(f"[{prefix}] Step {step}: Components - {', '.join(components)}")
     
     def log_metrics(self, metrics: dict, step: int, prefix: str = "val"):
         """记录评估指标"""
@@ -312,45 +291,38 @@ class MultiFileLogger:
     
     def log_model_info(self, message: str, level: str = "info"):
         """记录模型相关信息"""
-        model_logger = self.loggers['model']
-        log_func = getattr(model_logger, level.lower(), model_logger.info)
-        log_func(message)
+        # 重定向到系统日志
+        self.loggers['system'].info(f"[MODEL] {message}")
     
     def log_architecture(self, message: str, level: str = "info"):
         """记录模型架构相关信息"""
-        arch_logger = self.loggers['architecture']
-        log_func = getattr(arch_logger, level.lower(), arch_logger.info)
-        log_func(message)
+        # 重定向到系统日志
+        self.loggers['system'].info(f"[ARCH] {message}")
     
     def log_data_info(self, message: str, level: str = "info"):
         """记录数据相关信息"""
-        data_logger = self.loggers['data']
-        log_func = getattr(data_logger, level.lower(), data_logger.info)
-        log_func(message)
+        # 重定向到训练日志
+        self.loggers['train'].info(f"[DATA] {message}")
     
     def log_dataloader(self, message: str, level: str = "info"):
         """记录数据加载器信息"""
-        loader_logger = self.loggers['dataloader']
-        log_func = getattr(loader_logger, level.lower(), loader_logger.info)
-        log_func(message)
+        # 重定向到训练日志
+        self.loggers['train'].info(f"[LOADER] {message}")
 
     def log_optimizer(self, message: str, level: str = "info"):
         """记录优化器相关信息"""
-        opt_logger = self.loggers['optimizer']
-        log_func = getattr(opt_logger, level.lower(), opt_logger.info)
-        log_func(message)
+        # 重定向到训练日志
+        self.loggers['train'].info(f"[OPTIM] {message}")
     
     def log_scheduler(self, message: str, level: str = "info"):
         """记录学习率调度器信息"""
-        scheduler_logger = self.loggers['scheduler']
-        log_func = getattr(scheduler_logger, level.lower(), scheduler_logger.info)
-        log_func(message)
+        # 重定向到训练日志
+        self.loggers['train'].info(f"[SCHED] {message}")
     
     def log_gradient(self, message: str, level: str = "info"):
         """记录梯度相关信息"""
-        grad_logger = self.loggers['gradient']
-        log_func = getattr(grad_logger, level.lower(), grad_logger.info)
-        log_func(message)
+        # 重定向到训练日志
+        self.loggers['train'].info(f"[GRAD] {message}")
 
     def log_checkpoint(self, message: str, level: str = "info"):
         """记录检查点保存和加载信息"""
@@ -360,15 +332,13 @@ class MultiFileLogger:
     
     def log_memory(self, message: str, level: str = "info"):
         """记录内存使用情况"""
-        mem_logger = self.loggers['memory']
-        log_func = getattr(mem_logger, level.lower(), mem_logger.info)
-        log_func(message)
+        # 重定向到系统日志
+        self.loggers['system'].info(f"[MEM] {message}")
     
     def log_gpu(self, message: str, level: str = "info"):
         """记录GPU使用情况"""
-        gpu_logger = self.loggers['gpu']
-        log_func = getattr(gpu_logger, level.lower(), gpu_logger.info)
-        log_func(message)
+        # 重定向到系统日志
+        self.loggers['system'].info(f"[GPU] {message}")
     
     def log_visualization(self, message: str, level: str = "info"):
         """记录可视化相关信息"""
@@ -386,7 +356,8 @@ class MultiFileLogger:
     
     def log_debug(self, message: str):
         """记录调试信息"""
-        self.loggers['debug'].debug(message)
+        # 重定向到训练日志
+        self.loggers['train'].debug(message)
     
     def log_experiment(self, message: str, level: str = "info"):
         """记录实验配置和环境信息"""
@@ -402,26 +373,29 @@ class MultiFileLogger:
     
     def log_physics(self, message: str, level: str = "info"):
         """记录物理模型相关信息"""
-        physics_logger = self.loggers['physics']
-        log_func = getattr(physics_logger, level.lower(), physics_logger.info)
-        log_func(message)
+        # 重定向到深度日志
+        self.loggers['depth'].info(f"[PHYSICS] {message}")
     
     def log_attention(self, message: str, level: str = "info"):
         """记录注意力机制相关信息"""
-        attn_logger = self.loggers['attention']
-        log_func = getattr(attn_logger, level.lower(), attn_logger.info)
-        log_func(message)
+        # 重定向到系统日志
+        self.loggers['system'].info(f"[ATTN] {message}")
     
     def log_uncertainty(self, message: str, level: str = "info"):
         """记录不确定性权重相关信息"""
-        uncertainty_logger = self.loggers['uncertainty']
-        log_func = getattr(uncertainty_logger, level.lower(), uncertainty_logger.info)
-        log_func(message)
+        # 重定向到metrics日志
+        self.loggers['metrics'].info(f"[UNCERT] {message}")
     
     def log_validation(self, message: str, level: str = "info"):
         """记录验证相关日志"""
         validation_logger = self.loggers['validation']
         log_func = getattr(validation_logger, level.lower(), validation_logger.info)
+        log_func(message)
+
+    def log_system(self, message: str, level: str = "info"):
+        """记录系统资源相关信息"""
+        system_logger = self.loggers['system']
+        log_func = getattr(system_logger, level.lower(), system_logger.info)
         log_func(message)
     
     def close(self):

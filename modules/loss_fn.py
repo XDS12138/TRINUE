@@ -1015,8 +1015,8 @@ class TotalLoss(nn.Module):
         if attention_maps is not None:
             depth2rgb_attn, rgb2depth_attn = attention_maps
             if depth2rgb_attn is not None and rgb2depth_attn is not None:
-                attn_cons_losses = self.attention_consistency_loss(depth2rgb_attn, rgb2depth_attn)
-                attn_cons_loss = attn_cons_losses['total']
+                # 🔥 修复：attention_consistency_loss直接返回张量，不是字典
+                attn_cons_loss = self.attention_consistency_loss(depth2rgb_attn, rgb2depth_attn)
                 
                 if log_this_step:
                     self.attention_logger.info(f"  [Attention] consistency_loss={attn_cons_loss:.4f}")

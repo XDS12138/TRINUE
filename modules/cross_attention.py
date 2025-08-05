@@ -76,7 +76,7 @@ class CrossAttention(nn.Module):
     def enable_attention_saving(self, enable=True):
         """启用或禁用注意力图保存功能"""
         self.save_attention = enable
-        print(f"[CrossAttention] 设置 save_attention = {enable}, dim={self.dim}, heads={self.heads}")
+        # print(f"[CrossAttention] 设置 save_attention = {enable}, dim={self.dim}, heads={self.heads}")
         
     def get_last_attn(self):
         """获取最近一次计算的注意力图"""
@@ -169,10 +169,10 @@ class CrossAttention(nn.Module):
             if pad_hw is not None:
                 # 窗口注意力情况
                 self.last_attn = attn_weights[:B, :, :, :].detach().clone()
-                print(f"[CrossAttention] 保存窗口注意力图: shape={self.last_attn.shape}")
+                # print(f"[CrossAttention] 保存窗口注意力图: shape={self.last_attn.shape}")
             else:
                 self.last_attn = attn_weights.detach().clone()
-                print(f"[CrossAttention] 保存全局注意力图: shape={self.last_attn.shape}")
+                # print(f"[CrossAttention] 保存全局注意力图: shape={self.last_attn.shape}")
         
             # 立即断开与原始计算图的所有连接
             self.last_attn.requires_grad_(False)

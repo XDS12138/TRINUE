@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from .sfe import ShallowFeatureExtractor
-from .depth import DepthFeatureExtractor,ensure_normalized_depth, get_depth_config_params
+from .depth import DepthFeatureExtractor, ensure_normalized_depth, get_depth_config_params, MonoDepthHead
 from .encoder import RawEncoder
 from .blocks import RestormerBlock
 from .decoder import MultiTaskDecoder
@@ -105,7 +105,7 @@ class UnderwaterEnhanceNet(nn.Module):
         self.arch_logger.info(f"  - Bottleneck Blocks: {bottleneck_blocks}")
         self.arch_logger.info(f"  - Window Sizes | Encoder: {encoder_window_size}, Bottleneck: {bottleneck_window_size}, Decoder: {decoder_block_window_size}")
         self.arch_logger.info(f"  - Save Attention Maps: {save_attention_maps}, Double Forward: {double_forward}")
-
+        
         self.depth_params = depth_processor_config or {}
         self.raw_depth_processor_config = depth_processor_config if depth_processor_config else {}
         # Use get_depth_config_params to get typed parameters for depth processing
@@ -190,34 +190,18 @@ class UnderwaterEnhanceNet(nn.Module):
         
         self.depth_fusion_weights = None
         
-        # 计算每级深度特征的预期通道数 - 修复通道数计算
-        expected_depth_channels = []
-        for i in range(levels):
-            if i == 0:
-                # 第0级是预测的深度图，用base_channels表示
-                expected_depth_channels.append(base_channels)
-            else:
-                # 根据深度解码器的特性，特征通道数可能会增加
-                if self.depth_params.get('double_channels', True):
-                    # 如果启用了通道翻倍，与编码器保持一致
-                    expected_depth_channels.append(base_channels * (2**i))
-                else:
-                    # 否则维持基础通道数
-                    expected_depth_channels.append(base_channels)
-        
-        # 打印调试信息
-        self.arch_logger.info(f"  - Initializing depth projection layers with expected channels: {expected_depth_channels}")
+        # 计算每级深度特征的预期通道数 - 基于DepthFeatureExtractor的实际输出
+        # 编码器和DepthDecoder通道数配置
+        self.arch_logger.info(f"  - 编码器期望通道数: {self.encoder_channels}")
 
-        self.depth_projection_layers = nn.ModuleList([
-            nn.Conv2d(expected_depth_channels[i], self.encoder_channels[i], kernel_size=1, bias=False)
-            for i in range(levels)
-        ])
+        # 🔥 动态投影层：根据实际输入通道数创建适配器，而不是预先固定通道数
+        # 我们将使用动态适配器而不是固定的投影层
+        self.depth_projection_layers = None  # 将在forward中动态创建
         
-        self.arch_logger.info(f"  - Depth Projection Layers: Input channels: {[layer.in_channels for layer in self.depth_projection_layers]}, Output channels: {[layer.out_channels for layer in self.depth_projection_layers]}")
+        self.arch_logger.info(f"  - 使用动态深度特征投影层，将根据实际输入通道数自动适配")
         
-        # 修复：将深度特征通道适配逻辑移到这里统一管理
-        # 为DepthDecoder提供正确的期望通道数，避免运行时通道不匹配
-        self.arch_logger.info(f"  - Setting DepthDecoder expected channels to match encoder: {expected_depth_channels}")
+        # 修复：通道匹配问题改为动态解决方案
+        self.arch_logger.info(f"  - ✅ 深度特征通道匹配改为动态适配")
         
         # 添加动态通道适配层，避免在forward中创建临时层
         self.depth_feature_adapters = nn.ModuleDict()
@@ -235,8 +219,10 @@ class UnderwaterEnhanceNet(nn.Module):
         
         self.arch_logger.info(f"  - Pre-created {len(self.depth_feature_adapters)} depth feature adapters")
         
-        # 启动时进行一次dummy forward检查，确保通道匹配
-        self._perform_channel_validation_check()
+        # 启动时进行一次dummy forward检查，确保通道匹配（仅在主进程中）
+        import torch.distributed as dist
+        if not dist.is_available() or not dist.is_initialized() or dist.get_rank() == 0:
+            self._perform_channel_validation_check()  # 只在主进程中运行验证
         
         # 删除：多输出融合模块（已简化为仅使用一致性损失）
         
@@ -355,8 +341,15 @@ class UnderwaterEnhanceNet(nn.Module):
         # 检查是否为多输入模式
         is_multi_input = raw.dim() == 5  # [B, N, C, H, W]
         
+        # 🔥 添加调试信息 - 强制打印前几次
+        if self._forward_count <= 3:
+            print(f"[DEBUG] Forward #{self._forward_count}: Input shape: {raw.shape}, is_multi_input: {is_multi_input}")
+            print(f"[DEBUG] Forward #{self._forward_count}: enable_multi_input_consistency: {enable_multi_input_consistency}")
+        
         if is_multi_input and enable_multi_input_consistency:
             # 🔥 多输入一致性学习模式
+            if self._forward_count <= 3:
+                print(f"[DEBUG] Forward #{self._forward_count}: 进入多输入一致性学习模式")
             return self._forward_multi_input_consistency(raw, depth_gt, gt, log_this_step)
         elif is_multi_input:
             # 传统模式：展平多输入为批次，取第一个退化
@@ -421,21 +414,19 @@ class UnderwaterEnhanceNet(nn.Module):
 
             # ——— 监督深度：将 depth_pred 与 depth_gt 传给 Loss 函数 —— 在 train.py / loss_fn.py 中完成
 
-            # 1.4) 多尺度深度特征投影到 RGB 编码器对应通道数
+            # 1.4) 多尺度深度特征动态投影到 RGB 编码器对应通道数
             projected_depth_feats = []
             for i, feat in enumerate(depth_feats):
-                if i < len(self.depth_projection_layers):
-                    # 检查通道数不匹配的情况
-                    if feat.shape[1] != self.depth_projection_layers[i].in_channels:
-                        self.logger.warning(f"通道不匹配：深度特征 {i} 有 {feat.shape[1]} 通道，但投影层期望 {self.depth_projection_layers[i].in_channels} 通道")
-                        # 使用预先创建的适配层处理通道数不匹配
-                        original_channels = feat.shape[1]
-                        adapter = self._get_or_create_adapter(feat.shape[1], self.depth_projection_layers[i].in_channels, feat.device)
-                        feat = adapter(feat)
-                        self.logger.info(f"已将深度特征 {i} 的通道从 {original_channels} 适配到 {self.depth_projection_layers[i].in_channels}")
-                    
-                    # 投影：1x1 卷积将深度特征通道数转换成与 RGB 编码器第 i 级相同
-                    projected_feat = self.depth_projection_layers[i](feat)
+                if i < len(self.encoder_channels):
+                    target_channels = self.encoder_channels[i]
+                    if feat.shape[1] != target_channels:
+                        # 使用动态适配器直接投影到目标通道数
+                        adapter = self._get_or_create_adapter(feat.shape[1], target_channels, feat.device)
+                        projected_feat = adapter(feat)
+                        if log_this_step:
+                            self.logger.info(f"深度特征 {i}: {feat.shape[1]} → {target_channels} 通道")
+                    else:
+                        projected_feat = feat
                     projected_depth_feats.append(projected_feat)
                 else:
                     projected_depth_feats.append(feat)
@@ -521,20 +512,17 @@ class UnderwaterEnhanceNet(nn.Module):
             depth_pred, depth_feats = self.depth_decoder(bottleneck_pass1, student_feats_pass1)
             if log_this_step: self.logger.info(f"  - DepthDecoder shapes: depth_pred={depth_pred.shape}")
 
-            # 3) 投影深度特征到 RGB 分支对应通道
+            # 3) 动态投影深度特征到 RGB 分支对应通道
             projected_depth_feats = []
             for i, feat in enumerate(depth_feats):
-                if i < len(self.depth_projection_layers):
-                    # 检查通道数不匹配的情况
-                    if feat.shape[1] != self.depth_projection_layers[i].in_channels:
-                        self.logger.warning(f"通道不匹配：深度特征 {i} 有 {feat.shape[1]} 通道，但投影层期望 {self.depth_projection_layers[i].in_channels} 通道")
-                        # 使用预先创建的适配层处理通道数不匹配
-                        original_channels = feat.shape[1]
-                        adapter = self._get_or_create_adapter(feat.shape[1], self.depth_projection_layers[i].in_channels, feat.device)
-                        feat = adapter(feat)
-                        self.logger.info(f"已将深度特征 {i} 的通道从 {original_channels} 适配到 {self.depth_projection_layers[i].in_channels}")
-                    
-                    projected_feat = self.depth_projection_layers[i](feat)
+                if i < len(self.encoder_channels):
+                    target_channels = self.encoder_channels[i]
+                    if feat.shape[1] != target_channels:
+                        # 使用动态适配器直接投影到目标通道数
+                        adapter = self._get_or_create_adapter(feat.shape[1], target_channels, feat.device)
+                        projected_feat = adapter(feat)
+                    else:
+                        projected_feat = feat
                     projected_depth_feats.append(projected_feat)
                 else:
                     projected_depth_feats.append(feat)
@@ -597,7 +585,6 @@ class UnderwaterEnhanceNet(nn.Module):
             pred_gate=pred_gate,       # 深度门控
             depth_pred=depth_pred,      # 预测深度
             student_feats=student_feats_pass1 if training_mode else student_feats,
-            depth_conf_map=depth_conf_map,           # 置信度图
             attention_maps=self.get_attention_maps() if self.save_attention_maps else None
         )
 
@@ -633,19 +620,15 @@ class UnderwaterEnhanceNet(nn.Module):
                 # 注意：DepthFeatureExtractor输出固定通道数base_channels，而DepthDecoder输出递增通道数
                 # 这里我们检查的是DepthDecoder的输出，应该与expected_depth_channels匹配
                 for i, depth_feat in enumerate(depth_feats):
-                    if i < len(self.depth_projection_layers):
-                        expected_channels = self.depth_projection_layers[i].in_channels
+                    if i < len(self.encoder_channels):
+                        expected_channels = self.encoder_channels[i]
                         actual_channels = depth_feat.shape[1]
-                        if actual_channels != expected_channels:
-                            # 对于DepthFeatureExtractor，所有输出都是base_channels，这是正常的
-                            # 只有当实际通道数既不等于期望通道数，也不等于base_channels时才报错
-                            if actual_channels != self.base_channels:
-                                raise ValueError(
-                                    f"通道不匹配检测到！深度特征级别 {i}: "
-                                    f"实际通道数 {actual_channels} != 预期通道数 {expected_channels} 且 != base_channels {self.base_channels}"
-                                )
-                            else:
-                                self.arch_logger.info(f"深度特征级别 {i}: 使用DepthFeatureExtractor输出 ({actual_channels}通道)，将通过投影层适配到 {expected_channels}通道")
+                        # 动态适配：不再强制要求通道匹配，因为会在forward时动态适配
+                        if actual_channels != expected_channels and actual_channels != self.base_channels:
+                            # 只有当通道数完全不符合预期时才警告
+                            logger.warning(f"深度特征级别 {i}: 实际通道数 {actual_channels}, 将动态适配到 {expected_channels}")
+                        else:
+                            self.arch_logger.info(f"深度特征级别 {i}: 实际通道数 {actual_channels}, 符合预期或为base_channels")
                 
                 self.arch_logger.info("✓ 深度特征通道匹配验证通过")
                 
@@ -707,7 +690,7 @@ class UnderwaterEnhanceNet(nn.Module):
         all_pred_gates = []
         all_depth_preds = []
         all_student_feats = []
-        all_depth_conf_maps = []
+        # all_depth_conf_maps = []  # 已移除depth_conf_map
         all_attn_maps = []
         
         # 收集J_D和I_A输出
@@ -750,8 +733,8 @@ class UnderwaterEnhanceNet(nn.Module):
                 if output_dict.student_feats is not None:
                     all_student_feats.append(output_dict.student_feats)
                     
-                if output_dict.depth_conf_map is not None:
-                    all_depth_conf_maps.append(output_dict.depth_conf_map)
+                # if output_dict.depth_conf_map is not None:  # 已移除depth_conf_map
+                #     all_depth_conf_maps.append(output_dict.depth_conf_map)
                     
                 if output_dict.attention_maps is not None:
                     all_attn_maps.append(output_dict.attention_maps)
@@ -780,7 +763,7 @@ class UnderwaterEnhanceNet(nn.Module):
         
         # 整合多尺度特征需要更复杂的处理
         student_feats = all_student_feats if all_student_feats else None
-        depth_conf_map = torch.cat(all_depth_conf_maps, dim=0) if all_depth_conf_maps else None
+        # depth_conf_map = torch.cat(all_depth_conf_maps, dim=0) if all_depth_conf_maps else None  # 已移除
         
         # 整合注意力图
         attention_maps = None
@@ -803,7 +786,6 @@ class UnderwaterEnhanceNet(nn.Module):
             pred_gate=pred_gate,
             depth_pred=depth_pred,
             student_feats=student_feats,
-            depth_conf_map=depth_conf_map,
             attention_maps=attention_maps
         )
         
@@ -893,14 +875,16 @@ class UnderwaterEnhanceNet(nn.Module):
         student_feats_pass1, bottleneck_pass1 = self._encode(raw_flat, depth_feats=None, gt=None)
         depth_pred_flat, depth_feats = self.depth_decoder(bottleneck_pass1, student_feats_pass1)
         
-        # 投影深度特征
+        # 动态投影深度特征
         projected_depth_feats = []
         for i, feat in enumerate(depth_feats[:self.levels]):
-            if i < len(self.depth_projection_layers):
-                if feat.shape[1] != self.depth_projection_layers[i].in_channels:
-                    adapter = self._get_or_create_adapter(feat.shape[1], self.depth_projection_layers[i].in_channels, feat.device)
-                    feat = adapter(feat)
-                projected_feat = self.depth_projection_layers[i](feat)
+            if i < len(self.encoder_channels):
+                target_channels = self.encoder_channels[i]
+                if feat.shape[1] != target_channels:
+                    adapter = self._get_or_create_adapter(feat.shape[1], target_channels, feat.device)
+                    projected_feat = adapter(feat)
+                else:
+                    projected_feat = feat
                 projected_depth_feats.append(projected_feat)
             else:
                 projected_depth_feats.append(feat)
@@ -966,7 +950,6 @@ class UnderwaterEnhanceNet(nn.Module):
             pred_gate=primary_pred_gate,
             depth_pred=primary_depth_pred,
             student_feats=student_feats_flat,  # 保持原始特征格式 [B*N, ...]
-            depth_conf_map=None,  # 简化
             attention_maps=attention_maps,    # 🔥 正确传递注意力图
             # 多输入特有属性 - 🔥 所有候选都可用于损失计算
             multi_enhanced=enhanced,         # [B, N, C, H, W] - 所有N个增强候选
@@ -977,3 +960,7 @@ class UnderwaterEnhanceNet(nn.Module):
         )
         
         return result
+
+
+    
+

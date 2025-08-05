@@ -268,8 +268,18 @@ art)."""
         # 使用传入的step或默认的global_step
         current_step = step if step is not None else self.global_step
         
-        # 1) Console/file
-        msg = f"[{prefix}] Step {current_step}: " + ", ".join(f"{k}={v:.4f}" for k, v in metrics.items())
+        # 1) Console/file  
+        # 🔧 确保所有值都是数值类型，避免Tensor+str错误
+        safe_metrics = {}
+        for k, v in metrics.items():
+            if hasattr(v, 'item'):
+                safe_metrics[k] = v.item()
+            elif isinstance(v, torch.Tensor):
+                safe_metrics[k] = float(v.cpu().detach())
+            else:
+                safe_metrics[k] = float(v) if v is not None else 0.0
+        
+        msg = f"[{prefix}] Step {current_step}: " + ", ".join(f"{k}={v:.4f}" for k, v in safe_metrics.items())
         self.logger.info(msg)
 
         # 2) TensorBoard scalars and histograms (如果有TensorBoard writer)
@@ -338,8 +348,35 @@ art)."""
         if self.tb_writer is None:
             self.logger.debug(f"跳过图像记录 '{tag}'（无TensorBoard writer）")
             return
-        if len(image.shape) == 3:
-            image = image.unsqueeze(0)  # (C,H,W) -> (1,C,H,W)
+            
+        # 处理维度，确保图像是4维张量 (B, C, H, W)
+        if image.dim() == 2:  # (H, W) -> (1, 1, H, W)
+            image = image.unsqueeze(0).unsqueeze(0)
+        elif image.dim() == 3:  # (C, H, W) -> (1, C, H, W)
+            image = image.unsqueeze(0)
+        elif image.dim() == 5:  # 多退化输入 (B, N, C, H, W)
+            B, N, C, H, W = image.shape
+            self.logger.info(f"处理五维多退化输入: {image.shape}, B={B}, N={N}")
+            
+            # 对于多退化输入，创建网格显示前几个退化级别
+            if "multi" in tag or "degradation" in tag:
+                # 显示多个退化级别的网格
+                max_show = min(N, 4)  # 最多显示4个退化级别
+                multi_images = []
+                for i in range(max_show):
+                    multi_images.append(image[:, i, :, :, :])  # [B, C, H, W]
+                
+                # 将多个退化级别合并成一个批次
+                combined_batch = torch.cat(multi_images, dim=0)  # [B*max_show, C, H, W]
+                image = combined_batch
+                
+                self.logger.info(f"创建多退化网格显示: {max_show}个退化级别, 新形状: {image.shape}")
+            else:
+                # 对于其他情况，取第一个退化级别
+                image = image[:, 0, :, :, :]  # [B, C, H, W]
+        elif image.dim() != 4:
+            self.logger.error(f"Unsupported image dimension: {image.dim()}, expected 2, 3, 4, or 5")
+            return
         
         # 制作图像副本以避免修改原始数据
         image = image.detach().clone()
@@ -374,8 +411,15 @@ art)."""
                     else:
                         norm_img = img.cpu().numpy()
                 
-                # 将单通道图像转为三通道热力图
-                colored = cm.turbo(norm_img[0])[:,:,:3]  # 使用turbo colormap，删除alpha通道
+                # 🌊 将单通道图像转为三通道热力图（考虑深度物理语义）
+                # 深度物理意义：深色=近距离(0.1m)，浅色=远距离(30m)
+                # turbo colormap: 0=深蓝/紫(近), 1=红/黄(远)
+                if "depth" in tag.lower():
+                    # 对于深度图，直接使用turbo映射（符合深色近浅色远的语义）
+                    colored = cm.turbo(norm_img[0])[:,:,:3]
+                else:
+                    # 对于其他图像（如门控图），保持原有映射
+                    colored = cm.turbo(norm_img[0])[:,:,:3]
                 colored_tensor = torch.from_numpy(colored).permute(2, 0, 1)  # (H,W,3) -> (3,H,W)
                 colored_images.append(colored_tensor)
             

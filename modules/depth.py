@@ -8,10 +8,11 @@ import types
 logger = logging.getLogger(__name__)
 
 # 默认的深度处理参数 (可以从config中覆盖)
-DEFAULT_MIN_DEPTH = 1.0
-DEFAULT_MAX_DEPTH = 100.0
+# 🌊 水下图像深度范围：0.1-30米 (深色距离近，浅色距离远)
+DEFAULT_MIN_DEPTH = 0.1  # 最近距离 0.1米
+DEFAULT_MAX_DEPTH = 30.0  # 最远距离 30米
 DEFAULT_EPS = 1e-6
-DEFAULT_USE_LOG_TRANSFORM = True
+DEFAULT_USE_LOG_TRANSFORM = True  # 使用对数变换增强近距离细节
 
 #######################
 # Depth Utilities
@@ -94,6 +95,11 @@ def ensure_normalized_depth(
 
     # Clamp to [0, 1] for safety, though ideally normalization should achieve this.
     normalized_depth = torch.clamp(normalized_depth, 0.0, 1.0)
+    
+    # 💡 深度语义说明：
+    # - 0.0 对应 0.1米（最近距离，深色，高置信度）
+    # - 1.0 对应 30米（最远距离，浅色，低置信度）
+    # - 水下成像：距离越近受散射影响越小，增强效果越可靠
     
     # Mark as processed
     normalized_depth._depth_processed = True

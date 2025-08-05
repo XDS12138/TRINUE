@@ -1,6 +1,6 @@
 python scripts/train.py --config configs/train.yaml --resume
 
-python scripts/launch_tensorboard.py --port 6008
+python scripts/launch_tensorboard.py --port 6007
 
 git add .
 git commit -m "first commit"
@@ -14,7 +14,36 @@ git push -u origin main
 
 git commit -m "your message"
 git push
+[CrossAttention] 保存窗口注意力图: shape=torch.Size([6, 8, 64, 64])
+[CrossAttention] 保存窗口注意力图: shape=torch.Size([6, 8, 64, 64])
+[CrossAttention] 保存窗口注意力图: shape=torch.Size([6, 8, 64, 64])
+Epoch 1/100:  60%|████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████▏                                                                                                       | 400/666 [03:02<01:34,  2.83it/s, Loss=20078.8926][CrossAttention] 保存窗口注意力图: shape=torch.Size([6, 8, 64, 64])
+[CrossAttention] 保存窗口注意力图: shape=torch.Size([6, 8, 64, 64])
+[CrossAttention] 保存窗口注意力图: shape=torch.Size([6, 8, 64, 64])
+[CrossAttention] 保存窗口注意力图: shape=torch.Size([6, 8, 64, 64])
+[CrossAttention] 保存窗口注意力图: shape=torch.Size([6, 8, 64, 64])
+[CrossAttention] 保存窗口注意力图: shape=torch.Size([6, 8, 64, 64])
+[CrossAttention] 保存窗口注意力图: shape=torch.Size([6, 8, 64, 64])
+[CrossAttention] 保存窗口注意力图: shape=torch.Size([6, 8, 64, 64])
+Epoch 1/100:  60%|████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████▏                                                                                                       | 400/666 [03:02<01:34,  2.83it/s, Loss=20057.7578]18:33:12 [ERROR] 记录可视化数据时发生错误: too many values to unpack (expected 4)，步骤: 400
+18:33:12 [ERROR] Traceback (most recent call last):
+  File "/root/autodl-tmp/TRINUE/utils/visualization_utils.py", line 96, in log_training_visualization
+    _log_rgb_comparison(vis_raw_first_item, outputs.enhanced[0:1] if outputs.enhanced is not None else None,
+  File "/root/autodl-tmp/TRINUE/utils/visualization_utils.py", line 216, in _log_rgb_comparison
+    metric_logger.log_image("train/input", vis_input_normalized, step=step)
+  File "/root/autodl-tmp/TRINUE/utils/logger.py", line 414, in log_image
+    B, C, H, W = image.shape
+ValueError: too many values to unpack (expected 4)
 
+Epoch 1/100:  60%|████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████▌                                                                                                       | 401/666 [03:03<02:09,  2.04it/s, Loss=20057.7578][CrossAttention] 保存窗口注意力图: shape=torch.Size([6, 8, 64, 64])
+[CrossAttention] 保存窗口注意力图: shape=torch.Size([6, 8, 64, 64])
+[CrossAttention] 保存窗口注意力图: shape=torch.Size([6, 8, 64, 64])
+[CrossAttention] 保存窗口注意力图: shape=torch.Size([6, 8, 64, 64])
+[CrossAttention] 保存窗口注意力图: shape=torch.Size([6, 8, 64, 64])
+[CrossAttention] 保存窗口注意力图: shape=torch.Size([6, 8, 64, 64])
+[CrossAttention] 保存窗口注意力图: shape=torch.Size([6, 8, 64, 64])
+[CrossAttention] 保存窗口注意力图: shape=torch.Size([6, 8, 64, 64])
+Epoch 1/100:  60%|█████████████████████████████████████████████████████████████████████████████████████████████████████
 
 
 以下从“现有策略存在的局限性”与“可行的改进方向”两个角度进行分析，并结合常见的深度–RGB 融合方法，给出若干可落地的建议。

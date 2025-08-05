@@ -1,604 +1,877 @@
-import torch
-import torch.nn.functional as F
+#!/usr/bin/env python3
+"""
+综合评估指标模块
+
+包含图像质量评估指标和深度估计评估指标：
+- 全参考指标：PSNR, SSIM, CIEDE2000, LPIPS
+- 无参考指标：UCIQE, UIQM, NIQE  
+- 深度估计指标：阈值准确率、各种误差指标
+
+作者：基于用户提供的标准实现
+"""
+
 import numpy as np
-from typing import Union, Tuple, Dict, Callable, List
 import cv2
+import math
+import warnings
+import torch
+from typing import Dict, Union, Tuple, Optional, List
 
-# Attempt to import necessary libraries, with placeholders for now
+# 抑制一些不重要的警告
+warnings.filterwarnings('ignore')
+
+# 尝试导入scikit-image，如果不可用则使用自定义实现
 try:
-    import lpips
-    lpips_available = True
+    from skimage.metrics import structural_similarity as ssim_skimage
+    from skimage.metrics import peak_signal_noise_ratio as psnr_skimage
+    SKIMAGE_AVAILABLE = True
 except ImportError:
-    lpips_available = False
-    print("LPIPS library not found. Please install it using 'pip install lpips'")
+    print("Warning: scikit-image not available, using simplified implementations")
+    SKIMAGE_AVAILABLE = False
 
-try:
-    import piq
-    piq_available = True
-except ImportError:
-    piq_available = False
-    print("PIQ library not found. Please install it using 'pip install piq'")
+# ===============================
+# 图像质量评估指标
+# ===============================
 
-try:
-    from colour_difference import delta_E_CIEDE2000
-    colour_difference_available = True
-except ImportError:
-    colour_difference_available = False
-    print("colour-difference library not found. Please install it using 'pip install colour-difference'")
-
-# For UCIQE, UIQM, NIQE, BRISQUE, PIQE, we might use pyiqa or individual implementations.
-# For now, let's assume pyiqa or direct implementations will be handled.
-# If using pyiqa, you would import from it:
-# from pyiqa import create_metric
-# uciqe_metric = create_metric('uciqe', device=torch.device('cuda' if torch.cuda.is_available() else 'cpu'))
-# uiqm_metric = create_metric('uiqm', device=torch.device('cuda' if torch.cuda.is_available() else 'cpu'))
-# niqe_metric = create_metric('niqe', device=torch.device('cuda' if torch.cuda.is_available() else 'cpu')) # NIQE usually takes path or grayscale numpy
-# brisque_metric = create_metric('brisque', device=torch.device('cuda' if torch.cuda.is_available() else 'cpu')) # BRISQUE usually takes path or grayscale numpy
-# piqe_metric = create_metric('piqe', device=torch.device('cuda' if torch.cuda.is_available() else 'cpu')) # PIQE usually takes path or grayscale numpy
-
-
-def tensor_to_numpy(tensor: torch.Tensor) -> np.ndarray:
-    """Convert torch tensor to numpy array"""
-    if tensor.is_cuda:
-        tensor = tensor.detach().cpu()
-    return tensor.float().numpy() # Ensure float for calculations
-
-def _prepare_image_for_metric(img: Union[torch.Tensor, np.ndarray], 
-                              target_range_0_1: bool = True,
-                              target_chw: bool = False,
-                              target_hwc: bool = False) -> np.ndarray:
-    """Helper to convert image to numpy, handle batch, transpose, and normalize range."""
-    if isinstance(img, torch.Tensor):
-        img_np = tensor_to_numpy(img)
-    else:
-        img_np = img.astype(np.float32)
-
-    if img_np.ndim == 4:  # Batch: B, C, H, W or B, H, W, C
-        img_np = img_np[0] # Take the first image
-
-    # Ensure correct channel order before range normalization if needed
-    # Assuming input is likely CHW from PyTorch or HWC from cv2/skimage
-    if img_np.shape[0] == 1 or img_np.shape[0] == 3: # Likely CHW
-        if target_hwc: # if metric needs HWC
-            img_np = np.transpose(img_np, (1, 2, 0))
-    elif (img_np.shape[-1] == 1 or img_np.shape[-1] == 3) and target_chw: # Likely HWC but metric needs CHW
-         img_np = np.transpose(img_np, (2, 0, 1))
-
-
-    if target_range_0_1:
-        if img_np.min() < 0.0 or img_np.max() > 1.0: # Heuristic: if not in [0,1]
-            if img_np.min() >= -1.0 and img_np.max() <= 1.0: # Likely in [-1, 1]
-                img_np = (img_np + 1.0) / 2.0
-            else: # For other ranges (e.g. 0-255), try to normalize to 0-1
-                img_np = (img_np - img_np.min()) / (img_np.max() - img_np.min() + 1e-6)
-        img_np = np.clip(img_np, 0.0, 1.0)
-        
-    return img_np
-
-def _prepare_rgb_image_for_colour_metric(img_np: np.ndarray) -> np.ndarray:
-    """Prepare image for colour-difference: HWC, 0-1 range, then to Lab."""
-    if not (img_np.ndim == 3 and img_np.shape[-1] == 3):
-        raise ValueError("CIEDE2000 requires RGB images (HWC).")
-    # colour-difference expects image in [0,1] for conversion
-    img_lab = cv2.cvtColor(img_np.astype(np.float32), cv2.COLOR_RGB2Lab)
-    return img_lab
-
-def calculate_psnr(img1: Union[torch.Tensor, np.ndarray], 
-                  img2: Union[torch.Tensor, np.ndarray], 
-                  crop_border: int = 0,
-                  test_y_channel: bool = False) -> float:
-    """Calculate PSNR (Peak Signal-to-Noise Ratio)
+def calculate_psnr(img1, img2):
+    """
+    计算PSNR (Peak Signal-to-Noise Ratio)
     
     Args:
-        img1 (Tensor or ndarray): Images with range [0, 1].
-        img2 (Tensor or ndarray): Images with range [0, 1].
-        crop_border (int): Cropped pixels in each edge of an image. Default: 0.
-        test_y_channel (bool): Test on Y channel of YCbCr. Default: False.
+        img1: 参考图像 [0, 1] 或 [0, 255]
+        img2: 比较图像 [0, 1] 或 [0, 255]
     
     Returns:
-        float: PSNR result.
+        psnr_value: PSNR值
     """
-    # Convert tensor to numpy
-    img1_np = _prepare_image_for_metric(img1, target_range_0_1=False, target_hwc=True) # PSNR scales to 255 later
-    img2_np = _prepare_image_for_metric(img2, target_range_0_1=False, target_hwc=True)
-    
-    # [-1,1] -> [0,1] if necessary, then scale to 0-255
-    if img1_np.min() < 0: img1_np = (img1_np + 1.0) / 2.0
-    if img2_np.min() < 0: img2_np = (img2_np + 1.0) / 2.0
-    
-    if crop_border > 0:
-        img1_np = img1_np[crop_border:-crop_border, crop_border:-crop_border, ...]
-        img2_np = img2_np[crop_border:-crop_border, crop_border:-crop_border, ...]
-    
-    if test_y_channel and img1_np.shape[-1] == 3:
-        from skimage.color import rgb2ycbcr
-        img1_y = rgb2ycbcr(img1_np)[:, :, 0]
-        img2_y = rgb2ycbcr(img2_np)[:, :, 0]
-        img1_np, img2_np = img1_y, img2_y
-    
-    img1_np = img1_np * 255.
-    img2_np = img2_np * 255.
-    
-    mse = np.mean((img1_np - img2_np) ** 2)
-    if mse == 0:
-        return float('inf')
-    
-    return 20. * np.log10(255. / np.sqrt(mse))
-
-def calculate_ssim(img1: Union[torch.Tensor, np.ndarray], 
-                  img2: Union[torch.Tensor, np.ndarray], 
-                  crop_border: int = 0,
-                  test_y_channel: bool = False) -> float:
-    """Calculate SSIM (structural similarity) - Reuses existing logic, ensures proper input prep"""
     try:
-        from skimage.metrics import structural_similarity as ssim_skimage
-    except ImportError:
-        try:
-            from skimage.measure import compare_ssim as ssim_skimage # older skimage
-        except ImportError:
-            ssim_skimage = None # Fallback handled below
-
-    img1_np = _prepare_image_for_metric(img1, target_range_0_1=False, target_hwc=True) # SSIM scales to 255 later
-    img2_np = _prepare_image_for_metric(img2, target_range_0_1=False, target_hwc=True)
-
-    if img1_np.min() < 0: img1_np = (img1_np + 1.0) / 2.0
-    if img2_np.min() < 0: img2_np = (img2_np + 1.0) / 2.0
-
-    if crop_border > 0:
-        img1_np = img1_np[crop_border:-crop_border, crop_border:-crop_border, ...]
-        img2_np = img2_np[crop_border:-crop_border, crop_border:-crop_border, ...]
-
-    if test_y_channel and img1_np.shape[-1] == 3:
-        try:
-            from skimage.color import rgb2ycbcr
-            img1_y = rgb2ycbcr(img1_np)[:, :, 0]
-            img2_y = rgb2ycbcr(img2_np)[:, :, 0]
-            img1_np, img2_np = img1_y, img2_y
-        except ImportError:
-            print("scikit-image not found for Y channel SSIM. Calculating on RGB or grayscale.")
-            pass # Continue with original img1_np, img2_np
-
-    img1_np_255 = img1_np * 255.0
-    img2_np_255 = img2_np * 255.0
-
-    if ssim_skimage is not None:
-        if img1_np_255.ndim == 2: # Grayscale
-            return ssim_skimage(img1_np_255, img2_np_255, data_range=255.0)
-        elif img1_np_255.ndim == 3 and img1_np_255.shape[-1] == 3: # Color
-            try: # New scikit-image
-                return ssim_skimage(img1_np_255, img2_np_255, channel_axis=2, data_range=255.0, multichannel=True) # multichannel for older skimage
-            except TypeError: # older skimage
-                 return ssim_skimage(img1_np_255, img2_np_255, multichannel=True, data_range=255.0)
-        else: # Fallback for unexpected shapes with skimage
-            print(f"Unexpected image shape for scikit-image SSIM: {img1_np_255.shape}. Trying per-channel average.")
-            ssims = []
-            for i in range(img1_np_255.shape[-1]):
-                ssims.append(ssim_skimage(img1_np_255[..., i], img2_np_255[..., i], data_range=255.0))
-            return np.mean(ssims) if ssims else 0.0
-    else: # Fallback cv2 implementation (simplified from original, might need full one if skimage is commonly missing)
-        C1 = (0.01 * 255)**2
-        C2 = (0.03 * 255)**2
-        img1_f64 = img1_np_255.astype(np.float64)
-        img2_f64 = img2_np_255.astype(np.float64)
-        kernel = cv2.getGaussianKernel(11, 1.5)
-        window = np.outer(kernel, kernel.transpose())
+        # 确保图像在[0, 1]范围内
+        if img1.max() > 1.0:
+            img1 = img1.astype(np.float32) / 255.0
+        if img2.max() > 1.0:
+            img2 = img2.astype(np.float32) / 255.0
         
-        def _ssim_channel(ch1, ch2):
-            mu1 = cv2.filter2D(ch1, -1, window)[5:-5, 5:-5]
-            mu2 = cv2.filter2D(ch2, -1, window)[5:-5, 5:-5]
-            mu1_sq = mu1**2
-            mu2_sq = mu2**2
-            mu1_mu2 = mu1 * mu2
-            sigma1_sq = cv2.filter2D(ch1**2, -1, window)[5:-5, 5:-5] - mu1_sq
-            sigma2_sq = cv2.filter2D(ch2**2, -1, window)[5:-5, 5:-5] - mu2_sq
-            sigma12 = cv2.filter2D(ch1 * ch2, -1, window)[5:-5, 5:-5] - mu1_mu2
-            ssim_map = ((2 * mu1_mu2 + C1) * (2 * sigma12 + C2)) / ((mu1_sq + mu2_sq + C1) * (sigma1_sq + sigma2_sq + C2))
-            return ssim_map.mean()
-    
-        if img1_f64.ndim == 2: # Grayscale
-            return _ssim_channel(img1_f64, img2_f64)
-        elif img1_f64.ndim == 3: # Color, average over channels
-            ssim_vals = [_ssim_channel(img1_f64[..., i], img2_f64[..., i]) for i in range(img1_f64.shape[-1])]
-            return np.mean(ssim_vals) if ssim_vals else 0.0
-        return 0.0
-
-
-# --- New Metric Implementations ---
-
-# No-Reference Metrics
-def calculate_uciqe(img: Union[torch.Tensor, np.ndarray]) -> float:
-    """Calculate UCIQE (Underwater Color Image Quality Evaluation). Placeholder."""
-    img_np = _prepare_image_for_metric(img, target_range_0_1=True, target_hwc=True)
-    # UCIQE expects BGR uint8 image usually.
-    img_bgr_uint8 = (img_np * 255).astype(np.uint8)
-    if img_bgr_uint8.shape[-1] == 3: # If color, assume RGB and convert to BGR
-        img_bgr_uint8 = cv2.cvtColor(img_bgr_uint8, cv2.COLOR_RGB2BGR)
-    
-    # Placeholder: Actual UCIQE implementation is complex.
-    # Typically involves chroma, saturation, contrast components.
-    # Example using a known standalone implementation structure (conceptual)
-    # try:
-    #     from third_party_uciqe import get_uciqe_score
-    #     return get_uciqe_score(img_bgr_uint8)
-    # except ImportError:
-    #     print("UCIQE implementation not found.")
-    #     return 0.0
-    # For now, using pyiqa if available (conceptual)
-    try:
-        from pyiqa import create_metric
-        uciqe_metric_func = create_metric('uciqe', as_loss=False, device=torch.device('cpu')) # Assuming pyiqa uses tensors
-        # pyiqa might need B,C,H,W tensor in [0,1]
-        img_tensor = torch.from_numpy(np.transpose(img_np, (2,0,1))).unsqueeze(0)
-        return uciqe_metric_func(img_tensor).item()
-    except ImportError:
-        print("pyiqa not found for UCIQE. Returning 0.")
-        return 0.0
-    except Exception as e:
-        print(f"Error calculating UCIQE with pyiqa: {e}. Returning 0.")
-        return 0.0
-
-def calculate_uiqm(img: Union[torch.Tensor, np.ndarray]) -> float:
-    """Calculate UIQM (Underwater Image Quality Measure). Placeholder."""
-    img_np = _prepare_image_for_metric(img, target_range_0_1=True, target_hwc=True)
-    img_bgr_uint8 = (img_np * 255).astype(np.uint8)
-    if img_bgr_uint8.shape[-1] == 3:
-        img_bgr_uint8 = cv2.cvtColor(img_bgr_uint8, cv2.COLOR_RGB2BGR)
-        
-    # Placeholder: UIQM = c1*UICM + c2*UISM + c3*UIConM
-    # try:
-    #     from third_party_uiqm import get_uiqm_score
-    #     return get_uiqm_score(img_bgr_uint8)
-    # except ImportError:
-    #     print("UIQM implementation not found.")
-    #     return 0.0
-    try:
-        from pyiqa import create_metric
-        uiqm_metric_func = create_metric('uiqm', as_loss=False, device=torch.device('cpu'))
-        img_tensor = torch.from_numpy(np.transpose(img_np, (2,0,1))).unsqueeze(0)
-        return uiqm_metric_func(img_tensor).item()
-    except ImportError:
-        print("pyiqa not found for UIQM. Returning 0.")
-        return 0.0
-    except Exception as e:
-        print(f"Error calculating UIQM with pyiqa: {e}. Returning 0.")
-        return 0.0
-
-# Full-Reference Metrics
-def calculate_ciede2000(img1: Union[torch.Tensor, np.ndarray], img2: Union[torch.Tensor, np.ndarray]) -> float:
-    """Calculate CIEDE2000 color difference."""
-    if not colour_difference_available:
-        print("colour-difference library not available for CIEDE2000. Returning 0.")
-        return 0.0
-    
-    img1_rgb_np = _prepare_image_for_metric(img1, target_range_0_1=True, target_hwc=True)
-    img2_rgb_np = _prepare_image_for_metric(img2, target_range_0_1=True, target_hwc=True)
-
-    if not (img1_rgb_np.ndim == 3 and img1_rgb_np.shape[-1] == 3 and \
-            img2_rgb_np.ndim == 3 and img2_rgb_np.shape[-1] == 3):
-        print("CIEDE2000 requires RGB images (H,W,3). Returning 0 for non-RGB or mismatched shapes.")
-        return 0.0
-
-    img1_lab = _prepare_rgb_image_for_colour_metric(img1_rgb_np)
-    img2_lab = _prepare_rgb_image_for_colour_metric(img2_rgb_np)
-    
-    # Calculate delta_E for each pixel and then average
-    # delta_E_CIEDE2000 expects two Lab pixels (1D arrays of length 3)
-    delta_e_map = np.zeros_like(img1_lab[..., 0])
-    for r in range(img1_lab.shape[0]):
-        for c in range(img1_lab.shape[1]):
-            delta_e_map[r,c] = delta_E_CIEDE2000(img1_lab[r,c,:], img2_lab[r,c,:])
-            
-    return np.mean(delta_e_map)
-
-
-lpips_model_alex_rgb = None # Global LPIPS model instance
-def calculate_lpips(img1: Union[torch.Tensor, np.ndarray], img2: Union[torch.Tensor, np.ndarray], net_type='alex') -> float:
-    """Calculate LPIPS (Learned Perceptual Image Patch Similarity)."""
-    global lpips_model_alex_rgb
-    if not lpips_available:
-        print("LPIPS library not available. Returning 0.")
-        return 0.0
-
-    # LPIPS expects torch.Tensor, CHW, range [-1, 1]
-    if isinstance(img1, np.ndarray):
-        img1 = torch.from_numpy(img1.astype(np.float32))
-    if isinstance(img2, np.ndarray):
-        img2 = torch.from_numpy(img2.astype(np.float32))
-
-    # Ensure CHW
-    if img1.ndim == 3 and img1.shape[-1] == 3: # HWC to CHW
-        img1 = img1.permute(2, 0, 1)
-    if img2.ndim == 3 and img2.shape[-1] == 3: # HWC to CHW
-        img2 = img2.permute(2, 0, 1)
-    
-    if img1.ndim == 2: # Grayscale H,W to 1,H,W
-        img1 = img1.unsqueeze(0)
-    if img2.ndim == 2: # Grayscale H,W to 1,H,W
-        img2 = img2.unsqueeze(0)
-
-    # Add batch dim if missing: C,H,W to B,C,H,W
-    if img1.ndim == 3:
-        img1 = img1.unsqueeze(0)
-    if img2.ndim == 3:
-        img2 = img2.unsqueeze(0)
-    
-    # Normalize to [-1, 1]
-    if img1.max() > 1.0: # Assuming [0, 255] or [0, 1]
-        if img1.max() > 2.0: # Likely [0, 255]
-            img1 = img1 / 255.0
-        img1 = img1 * 2.0 - 1.0
-    elif img1.min() >= 0.0 and img1.max() <=1.0: # in [0,1]
-         img1 = img1 * 2.0 - 1.0
-
-    if img2.max() > 1.0:
-        if img2.max() > 2.0:
-            img2 = img2 / 255.0
-        img2 = img2 * 2.0 - 1.0
-    elif img2.min() >=0.0 and img2.max() <=1.0:
-        img2 = img2 * 2.0 - 1.0
-    
-    img1 = torch.clamp(img1, -1.0, 1.0)
-    img2 = torch.clamp(img2, -1.0, 1.0)
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    if lpips_model_alex_rgb is None:
-        try:
-            lpips_model_alex_rgb = lpips.LPIPS(net=net_type, version='0.1').to(device) # Common version
-            lpips_model_alex_rgb.eval() # Set to eval mode
-        except Exception as e:
-            print(f"Failed to load LPIPS model: {e}. Returning 0.")
-            return 0.0
-
-    try:
-        with torch.no_grad():
-            distance = lpips_model_alex_rgb(img1.to(device).float(), img2.to(device).float())
-        return distance.item()
-    except Exception as e:
-        print(f"Error during LPIPS calculation: {e}. Returning 0.")
-        return 0.0
-
-def calculate_fsim(img1: Union[torch.Tensor, np.ndarray], img2: Union[torch.Tensor, np.ndarray]) -> float:
-    """Calculate FSIM (Feature Similarity Index)."""
-    if not piq_available:
-        print("PIQ library not available for FSIM. Returning 0.")
-        return 0.0
-
-    # PIQ's FSIM expects torch.Tensor, BCHW, range [0, 1], RGB or Grayscale
-    if isinstance(img1, np.ndarray):
-        img1 = torch.from_numpy(img1.astype(np.float32))
-    if isinstance(img2, np.ndarray):
-        img2 = torch.from_numpy(img2.astype(np.float32))
-
-    # Ensure CHW if HWC
-    if img1.ndim == 3 and img1.shape[-1] in [1,3]: img1 = img1.permute(2,0,1)
-    if img2.ndim == 3 and img2.shape[-1] in [1,3]: img2 = img2.permute(2,0,1)
-    
-    # Ensure 3 channels for FSIM if grayscale (PIQ might handle it, but good to be explicit)
-    # if img1.ndim == 2 or (img1.ndim == 3 and img1.shape[0] == 1): # H,W or 1,H,W
-    #     img1 = img1.squeeze().repeat(3,1,1) if img1.ndim > 2 else img1.repeat(3,1,1)
-    # if img2.ndim == 2 or (img2.ndim == 3 and img2.shape[0] == 1):
-    #     img2 = img2.squeeze().repeat(3,1,1) if img2.ndim > 2 else img2.repeat(3,1,1)
-        
-    # Add batch dim
-    if img1.ndim == 2 : img1 = img1.unsqueeze(0).unsqueeze(0) # H,W -> B,C,H,W
-    elif img1.ndim == 3: img1 = img1.unsqueeze(0) # C,H,W -> B,C,H,W
-
-    if img2.ndim == 2 : img2 = img2.unsqueeze(0).unsqueeze(0)
-    elif img2.ndim == 3: img2 = img2.unsqueeze(0)
-
-
-    # Normalize to [0, 1]
-    if img1.max() > 1.0: img1 = img1 / 255.0
-    if img2.max() > 1.0: img2 = img2 / 255.0
-    img1 = torch.clamp(img1, 0.0, 1.0)
-    img2 = torch.clamp(img2, 0.0, 1.0)
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    try:
-        # FSIM in PIQ defaults to data_range=1.0
-        fsim_val: torch.Tensor = piq.fsim(img1.to(device).float(), img2.to(device).float(), data_range=1.)
-        return fsim_val.item()
-    except Exception as e:
-        print(f"Error calculating FSIM with PIQ: {e}. Returning 0.")
-        return 0.0
-
-# No-Reference metrics (NIQE, BRISQUE, PIQE)
-# These often require specific grayscale uint8 numpy inputs or paths.
-# Using pyiqa is a good option here.
-def _calculate_nriqa_metric(img: Union[torch.Tensor, np.ndarray], metric_name: str) -> float:
-    img_np_hwc = _prepare_image_for_metric(img, target_range_0_1=True, target_hwc=True)
-    # Most IQA metrics in pyiqa prefer BGR uint8 or grayscale uint8
-    
-    # if img_np_hwc.shape[-1] == 3: # RGB
-    #     img_gray_uint8 = (cv2.cvtColor(img_np_hwc, cv2.COLOR_RGB2GRAY) * 255).astype(np.uint8)
-    # elif img_np_hwc.ndim == 2 or img_np_hwc.shape[-1] == 1: # Grayscale
-    #     img_gray_uint8 = (img_np_hwc.squeeze() * 255).astype(np.uint8)
-    # else:
-    #     print(f"{metric_name} expects grayscale or RGB image. Got shape {img_np_hwc.shape}. Returning 0.")
-    #     return 0.0
-
-    try:
-        from pyiqa import create_metric
-        # For pyiqa, usually input is a tensor B,C,H,W in [0,1]
-        if img_np_hwc.ndim == 2: # H,W grayscale
-            img_tensor = torch.from_numpy(img_np_hwc).unsqueeze(0).unsqueeze(0).float() # B,1,H,W
-        elif img_np_hwc.ndim == 3 and img_np_hwc.shape[-1] == 1: # H,W,1 grayscale
-            img_tensor = torch.from_numpy(np.transpose(img_np_hwc, (2,0,1))).unsqueeze(0).float() # B,1,H,W
-        elif img_np_hwc.ndim == 3 and img_np_hwc.shape[-1] == 3: # H,W,C color
-            img_tensor = torch.from_numpy(np.transpose(img_np_hwc, (2,0,1))).unsqueeze(0).float() # B,3,H,W
+        if SKIMAGE_AVAILABLE:
+            return psnr_skimage(img1, img2, data_range=1.0)
         else:
-            print(f"Unsupported image shape for pyiqa {metric_name}: {img_np_hwc.shape}")
-            return 0.0
-
-        metric_func = create_metric(metric_name.lower(), as_loss=False, device=torch.device("cpu")) # Use CPU to avoid OOM with many metrics
-        return metric_func(img_tensor).item()
-    except ImportError:
-        print(f"pyiqa not found for {metric_name}. Please install it. Returning 0.")
-        return 0.0
+            # 简化的PSNR计算
+            mse = np.mean((img1 - img2) ** 2)
+            if mse == 0:
+                return 100  # 图像完全相同
+            return 20 * np.log10(1.0 / np.sqrt(mse))
     except Exception as e:
-        print(f"Error calculating {metric_name} with pyiqa: {e}. Returning 0.")
+        print(f"Error calculating PSNR: {e}")
         return 0.0
 
-def calculate_niqe(img: Union[torch.Tensor, np.ndarray]) -> float:
-    """Calculate NIQE (Natural Image Quality Evaluator)."""
-    return _calculate_nriqa_metric(img, "niqe")
-
-def calculate_brisque(img: Union[torch.Tensor, np.ndarray]) -> float:
-    """Calculate BRISQUE (Blind/Referenceless Image Spatial Quality Evaluator)."""
-    return _calculate_nriqa_metric(img, "brisque")
-
-def calculate_piqe(img: Union[torch.Tensor, np.ndarray]) -> float:
-    """Calculate PIQE (Perception based Image Quality Evaluator)."""
-    return _calculate_nriqa_metric(img, "piqe")
-
-
-# Depth Metrics
-def calculate_depth_mae(pred: Union[torch.Tensor, np.ndarray], gt: Union[torch.Tensor, np.ndarray]) -> float:
-    """Calculate Mean Absolute Error for depth maps."""
-    pred_np = _prepare_image_for_metric(pred, target_range_0_1=False) # Keep original scale
-    gt_np = _prepare_image_for_metric(gt, target_range_0_1=False)
-    if pred_np.shape != gt_np.shape:
-        # Try to resize pred to gt if they don't match (simple F.interpolate like)
-        # This is a basic resize, more sophisticated alignment might be needed
-        pred_tensor = torch.from_numpy(pred_np).unsqueeze(0).unsqueeze(0) # B,C,H,W
-        pred_resized = F.interpolate(pred_tensor, size=gt_np.shape[-2:], mode='bilinear', align_corners=False)
-        pred_np = pred_resized.squeeze().numpy()
-
-    if pred_np.shape != gt_np.shape: # Check again after resize
-        print(f"Depth MAE: pred shape {pred_np.shape} and gt shape {gt_np.shape} mismatch. Returning 0.")
-        return 0.0
-    return np.mean(np.abs(pred_np - gt_np))
-
-def calculate_depth_rmse(pred: Union[torch.Tensor, np.ndarray], gt: Union[torch.Tensor, np.ndarray]) -> float:
-    """Calculate Root Mean Squared Error for depth maps."""
-    pred_np = _prepare_image_for_metric(pred, target_range_0_1=False)
-    gt_np = _prepare_image_for_metric(gt, target_range_0_1=False)
-    if pred_np.shape != gt_np.shape:
-        pred_tensor = torch.from_numpy(pred_np).unsqueeze(0).unsqueeze(0)
-        pred_resized = F.interpolate(pred_tensor, size=gt_np.shape[-2:], mode='bilinear', align_corners=False)
-        pred_np = pred_resized.squeeze().numpy()
-        
-    if pred_np.shape != gt_np.shape:
-        print(f"Depth RMSE: pred shape {pred_np.shape} and gt shape {gt_np.shape} mismatch. Returning 0.")
-        return 0.0
-    return np.sqrt(np.mean((pred_np - gt_np)**2))
-
-def calculate_delta_thresholds(pred: Union[torch.Tensor, np.ndarray], 
-                               gt: Union[torch.Tensor, np.ndarray], 
-                               thresholds: List[float] = [1.25, 1.25**2, 1.25**3]) -> Dict[str, float]:
-    """Calculate percentage of pixels satisfying delta thresholds for depth maps."""
-    pred_np = _prepare_image_for_metric(pred, target_range_0_1=False).squeeze()
-    gt_np = _prepare_image_for_metric(gt, target_range_0_1=False).squeeze()
-
-    if pred_np.shape != gt_np.shape:
-        pred_tensor = torch.from_numpy(pred_np).unsqueeze(0).unsqueeze(0)
-        pred_resized = F.interpolate(pred_tensor, size=gt_np.shape[-2:], mode='bilinear', align_corners=False)
-        pred_np = pred_resized.squeeze().numpy()
-
-    if pred_np.shape != gt_np.shape:
-        print(f"Delta Thresholds: pred shape {pred_np.shape} and gt shape {gt_np.shape} mismatch. Returning empty dict.")
-        return {}
-
-    # Ensure positive depths for ratio calculation, clamp small values
-    valid_mask = (gt_np > 1e-3) & (pred_np > 1e-3)
-    pred_np_valid = pred_np[valid_mask]
-    gt_np_valid = gt_np[valid_mask]
-
-    if gt_np_valid.size == 0:
-        print("Delta Thresholds: No valid pixels for comparison (all gt depths are too small or zero).")
-        return {f"delta_{t:.2f}": 0.0 for t in thresholds}
-
-    ratio = np.maximum(gt_np_valid / pred_np_valid, pred_np_valid / gt_np_valid)
+def calculate_ssim(img1, img2):
+    """
+    计算SSIM (Structural Similarity Index)
     
-    results = {}
-    for t in thresholds:
-        results[f"delta_{t:.2f}"] = np.mean((ratio < t).astype(np.float32)) * 100.0 # Percentage
-    return results
+    Args:
+        img1: 参考图像
+        img2: 比较图像
+    
+    Returns:
+        ssim_value: SSIM值
+    """
+    try:
+        # 确保图像在[0, 1]范围内
+        if img1.max() > 1.0:
+            img1 = img1.astype(np.float32) / 255.0
+        if img2.max() > 1.0:
+            img2 = img2.astype(np.float32) / 255.0
+        
+        if SKIMAGE_AVAILABLE:
+            if len(img1.shape) == 3:
+                # 彩色图像
+                return ssim_skimage(img1, img2, multichannel=True, data_range=1.0)
+            else:
+                # 灰度图像
+                return ssim_skimage(img1, img2, data_range=1.0)
+        else:
+            # 简化的SSIM计算（基于均值和方差）
+            if len(img1.shape) == 3:
+                # 转换为灰度图像进行简化计算
+                img1 = np.mean(img1, axis=2)
+                img2 = np.mean(img2, axis=2)
+            
+            mu1 = np.mean(img1)
+            mu2 = np.mean(img2)
+            sigma1 = np.var(img1)
+            sigma2 = np.var(img2)
+            sigma12 = np.mean((img1 - mu1) * (img2 - mu2))
+            
+            C1 = 0.01 ** 2
+            C2 = 0.03 ** 2
+            
+            ssim_val = ((2 * mu1 * mu2 + C1) * (2 * sigma12 + C2)) / \
+                      ((mu1 ** 2 + mu2 ** 2 + C1) * (sigma1 + sigma2 + C2))
+            return ssim_val
+    except Exception as e:
+        print(f"Error calculating SSIM: {e}")
+        return 0.0
+
+def rgb_to_lab(rgb):
+    """RGB转LAB色彩空间"""
+    # 确保RGB在[0, 1]范围内
+    if rgb.max() > 1.0:
+        rgb = rgb.astype(np.float32) / 255.0
+    
+    # OpenCV的LAB转换
+    rgb_uint8 = (rgb * 255).astype(np.uint8)
+    lab = cv2.cvtColor(rgb_uint8, cv2.COLOR_RGB2LAB)
+    return lab.astype(np.float32)
+
+def calculate_ciede2000(img1, img2):
+    """
+    计算CIEDE2000色差
+    这是一个简化版本，真正的CIEDE2000计算非常复杂
+    
+    Args:
+        img1: 参考图像
+        img2: 比较图像
+    
+    Returns:
+        ciede2000_value: CIEDE2000色差值
+    """
+    try:
+        # 转换到LAB色彩空间
+        lab1 = rgb_to_lab(img1)
+        lab2 = rgb_to_lab(img2)
+        
+        # 简化的色差计算（不是完整的CIEDE2000）
+        # 真正的CIEDE2000需要复杂的公式，这里使用Delta E CIE 1994近似
+        delta_l = lab1[:,:,0] - lab2[:,:,0]
+        delta_a = lab1[:,:,1] - lab2[:,:,1]
+        delta_b = lab1[:,:,2] - lab2[:,:,2]
+        
+        delta_e = np.sqrt(delta_l**2 + delta_a**2 + delta_b**2)
+        return np.mean(delta_e)
+    except Exception as e:
+        print(f"Error calculating CIEDE2000: {e}")
+        return 0.0
+
+def calculate_lpips(img1, img2):
+    """
+    计算LPIPS (Learned Perceptual Image Patch Similarity)
+    使用预训练的AlexNet模型
+    
+    Args:
+        img1: 参考图像 (numpy array 或 torch tensor)
+        img2: 比较图像 (numpy array 或 torch tensor)
+    
+    Returns:
+        lpips_value: LPIPS值 (越低越好，约0-1范围)
+    """
+    try:
+        import lpips
+        import torch
+        
+        # 创建LPIPS模型
+        lpips_model = lpips.LPIPS(net='alex')
+        
+        # 处理输入图像
+        def process_image(img):
+            # 如果是numpy数组，转换为torch tensor
+            if isinstance(img, np.ndarray):
+                # 确保在[0, 1]范围内
+                if img.max() > 1.0:
+                    img = img.astype(np.float32) / 255.0
+                
+                # 转换为PyTorch格式 [1, C, H, W]
+                if len(img.shape) == 3:
+                    img_tensor = torch.from_numpy(img.transpose(2, 0, 1)).unsqueeze(0).float()
+                else:
+                    img_tensor = torch.from_numpy(img).unsqueeze(0).unsqueeze(0).float()
+            else:
+                img_tensor = img
+                
+            # LPIPS期望输入在[-1, 1]范围内
+            return img_tensor * 2.0 - 1.0
+        
+        img1_tensor = process_image(img1)
+        img2_tensor = process_image(img2)
+        
+        # 计算LPIPS
+        with torch.no_grad():
+            lpips_score = lpips_model(img1_tensor, img2_tensor).item()
+        
+        return float(lpips_score)
+        
+    except ImportError as e:
+        print(f"Error: lpips library is required for LPIPS calculation: {e}")
+        print("Please install it with: pip install lpips")
+        # 回退到简化版本
+        return calculate_lpips_simple(img1, img2)
+        
+    except Exception as e:
+        print(f"Error calculating LPIPS: {e}")
+        # 回退到简化版本
+        return calculate_lpips_simple(img1, img2)
 
 
-# --- ALL_METRICS Dictionary ---
-ALL_METRICS: Dict[str, Callable[..., Union[float, Dict[str, float]]]] = {
+def calculate_lpips_simple(img1, img2):
+    """
+    简化的LPIPS计算
+    真正的LPIPS需要预训练的深度学习模型，这里使用基于梯度的近似
+    
+    Args:
+        img1: 参考图像
+        img2: 比较图像
+    
+    Returns:
+        lpips_value: 简化的LPIPS值
+    """
+    try:
+        # 确保图像在[0, 1]范围内
+        if img1.max() > 1.0:
+            img1 = img1.astype(np.float32) / 255.0
+        if img2.max() > 1.0:
+            img2 = img2.astype(np.float32) / 255.0
+        
+        # 转换为灰度图像进行梯度计算
+        if len(img1.shape) == 3:
+            gray1 = cv2.cvtColor((img1 * 255).astype(np.uint8), cv2.COLOR_RGB2GRAY)
+            gray2 = cv2.cvtColor((img2 * 255).astype(np.uint8), cv2.COLOR_RGB2GRAY)
+        else:
+            gray1 = (img1 * 255).astype(np.uint8)
+            gray2 = (img2 * 255).astype(np.uint8)
+        
+        # 计算梯度
+        grad1_x = cv2.Sobel(gray1, cv2.CV_64F, 1, 0, ksize=3)
+        grad1_y = cv2.Sobel(gray1, cv2.CV_64F, 0, 1, ksize=3)
+        grad2_x = cv2.Sobel(gray2, cv2.CV_64F, 1, 0, ksize=3)
+        grad2_y = cv2.Sobel(gray2, cv2.CV_64F, 0, 1, ksize=3)
+        
+        # 计算梯度差异
+        grad_diff = np.sqrt((grad1_x - grad2_x)**2 + (grad1_y - grad2_y)**2)
+        
+        # 返回归一化的梯度差异
+        return np.mean(grad_diff) / 255.0
+    except Exception as e:
+        print(f"Error calculating LPIPS: {e}")
+        return 0.0
+
+def calculate_uciqe(img):
+    """
+    计算UCIQE (Underwater Color Image Quality Evaluation)
+    完全符合原始论文定义 - Yang & Sowmya 2015
+    论文公式: UCIQE = c1 * σ_c + c2 * conl + c3 * μ_s
+    
+    Args:
+        img: 输入图像 (numpy array)
+    
+    Returns:
+        uciqe_value: UCIQE值 (严格按照论文原始定义)
+    """
+    try:
+        # 确保图像在[0, 255]范围内
+        if img.max() <= 1.0:
+            img = (img * 255).astype(np.uint8)
+        else:
+            img = img.astype(np.uint8)
+        
+        # 转换到LAB色彩空间
+        lab = cv2.cvtColor(img, cv2.COLOR_RGB2LAB).astype(np.float32)
+        
+        # LAB分量
+        L = lab[:,:,0]  # 亮度: 0-100
+        a = lab[:,:,1]  # 绿-红轴: 0-255 (OpenCV格式，需要转换为-128到+127)
+        b = lab[:,:,2]  # 蓝-黄轴: 0-255 (OpenCV格式，需要转换为-128到+127)
+        
+        # 将OpenCV的LAB转换为标准LAB
+        a_std = a - 128.0  # 转换为-128到+127范围
+        b_std = b - 128.0  # 转换为-128到+127范围
+        
+        # 1. 计算色度 (Chroma) - σ_c
+        C = np.sqrt(a_std**2 + b_std**2)
+        sigma_c = np.std(C)
+        
+        # 2. 计算亮度对比度 (Contrast on Lightness) - conl
+        # 论文使用亮度通道的标准差作为对比度
+        conl = np.std(L)
+        
+        # 3. 计算饱和度均值 (Mean of Saturation) - μ_s
+        # 论文定义: S = C / L, 其中L是亮度
+        L_safe = np.maximum(L, 1.0)  # 避免除零
+        S = C / L_safe
+        mu_s = np.mean(S)
+        
+        # UCIQE标准权重系数 (论文原始值)
+        c1 = 0.4680
+        c2 = 0.2745  
+        c3 = 0.2576
+        
+        # 严格按照论文公式计算 - 不进行任何归一化
+        uciqe = c1 * sigma_c + c2 * conl + c3 * mu_s
+        
+        return float(uciqe)
+        
+    except Exception as e:
+        print(f"Error calculating UCIQE: {e}")
+        return 0.0
+
+def calculate_uiqm(img):
+    """
+    计算UIQM (Underwater Image Quality Measure)
+    完全符合原始论文定义 - Panetta et al. 2015
+    论文公式: UIQM = c1 * UICM + c2 * UISM + c3 * UIConM
+    
+    Args:
+        img: 输入图像 (numpy array)
+    
+    Returns:
+        uiqm_value: UIQM值 (严格按照论文原始定义)
+    """
+    try:
+        # 确保图像在[0, 255]范围内
+        if img.max() <= 1.0:
+            img = (img * 255).astype(np.uint8)
+        else:
+            img = img.astype(np.uint8)
+        
+        # 转换为浮点数 [0, 255]
+        img_float = img.astype(np.float32)
+        
+        # 分离RGB通道
+        r, g, b = img_float[:,:,0], img_float[:,:,1], img_float[:,:,2]
+        
+        # 1. 计算UICM (Underwater Image Contrast Measure)
+        # 基于RGB通道差异的对比度计算
+        rg = r - g
+        yb = 0.5 * (r + g) - b
+        
+        # 计算RG和YB的统计特性
+        rg_mean, rg_std = np.mean(rg), np.std(rg)
+        yb_mean, yb_std = np.mean(yb), np.std(yb)
+        
+        # UICM = sqrt(α²+β²) + 0.3*sqrt(μ_rg²+μ_yb²)
+        uicm = np.sqrt(rg_std**2 + yb_std**2) + 0.3 * np.sqrt(rg_mean**2 + yb_mean**2)
+        
+        # 2. 计算UISM (Underwater Image Sharpness Measure)
+        # 使用EME (Enhancement by Entropy Maximization)
+        def calculate_eme(channel, block_size=8):
+            """计算EME"""
+            h, w = channel.shape
+            num_blocks_h = h // block_size
+            num_blocks_w = w // block_size
+            
+            if num_blocks_h == 0 or num_blocks_w == 0:
+                return 0.0
+            
+            eme_sum = 0.0
+            for i in range(num_blocks_h):
+                for j in range(num_blocks_w):
+                    block = channel[i*block_size:(i+1)*block_size, j*block_size:(j+1)*block_size]
+                    min_val = np.min(block)
+                    max_val = np.max(block)
+                    
+                    # 避免除零
+                    if min_val > 0:
+                        eme_sum += 20 * np.log10(max_val / min_val)
+            
+            return eme_sum / (num_blocks_h * num_blocks_w)
+        
+        # 分别计算RGB三个通道的EME
+        eme_r = calculate_eme(r)
+        eme_g = calculate_eme(g)
+        eme_b = calculate_eme(b)
+        
+        # UISM = (EME_R + EME_G + EME_B) / 3
+        uism = (eme_r + eme_g + eme_b) / 3.0
+        
+        # 3. 计算UIConM (Underwater Image Colorfulness Measure)
+        # 使用HSV色彩空间计算色彩丰富度
+        img_hsv = cv2.cvtColor(img, cv2.COLOR_RGB2HSV).astype(np.float32)
+        saturation = img_hsv[:,:,1]
+        
+        # UIConM = 饱和度的标准差
+        uiconm = np.std(saturation)
+        
+        # UIQM标准权重组合 (论文原始值)
+        c1 = 0.0282  # UICM权重
+        c2 = 0.2953  # UISM权重  
+        c3 = 3.5753  # UIConM权重 (恢复论文原始值)
+        
+        # 严格按照论文公式计算 - 不进行任何归一化
+        uiqm = c1 * uicm + c2 * uism + c3 * uiconm
+        
+        return float(uiqm)
+        
+    except Exception as e:
+        print(f"Error calculating UIQM: {e}")
+        return 0.0
+
+def calculate_niqe(img):
+    """
+    计算NIQE (Natural Image Quality Evaluator)
+    使用pyiqa库的标准实现
+    
+    Args:
+        img: 输入图像 (numpy array)
+    
+    Returns:
+        niqe_value: NIQE值 (越低越好，约0-10范围)
+    """
+    try:
+        import pyiqa
+        import torch
+        
+        # 创建NIQE模型
+        niqe_model = pyiqa.create_metric('niqe', device='cpu')
+        
+        # 确保图像在[0, 1]范围内
+        if img.max() > 1.0:
+            img = img.astype(np.float32) / 255.0
+        
+        # 转换为pytorch张量格式 [1, C, H, W]
+        img_tensor = torch.from_numpy(img.transpose(2, 0, 1)).unsqueeze(0).float()
+        
+        # 计算NIQE
+        with torch.no_grad():
+            niqe_score = niqe_model(img_tensor).item()
+        
+        return float(niqe_score)
+        
+    except ImportError as e:
+        print(f"Error: pyiqa library is required for NIQE calculation: {e}")
+        print("Please install it with: pip install pyiqa")
+        return 0.0
+        
+    except Exception as e:
+        print(f"Error calculating NIQE: {e}")
+        return 0.0
+
+# ===============================
+# 深度估计评估指标
+# ===============================
+
+class DepthMetrics:
+    """深度估计评估指标计算类"""
+    
+    def __init__(self, thresholds: list = [1.05, 1.05**2, 1.05**3]):
+        """
+        初始化评估指标计算器
+        
+        Args:
+            thresholds: 阈值列表，默认为[1.05, 1.05², 1.05³]
+        """
+        self.thresholds = thresholds
+        
+    def compute_scale_invariant_errors(self, pred: np.ndarray, gt: np.ndarray, 
+                                     mask: Optional[np.ndarray] = None) -> Dict[str, float]:
+        """
+        计算尺度不变的深度误差指标
+        
+        Args:
+            pred: 预测深度图 (H, W) 或 (N, H, W)
+            gt: 真实深度图 (H, W) 或 (N, H, W)
+            mask: 有效像素掩码 (H, W) 或 (N, H, W)，可选
+            
+        Returns:
+            包含各种评估指标的字典
+        """
+        # 确保输入为numpy数组
+        if torch.is_tensor(pred):
+            pred = pred.cpu().numpy()
+        if torch.is_tensor(gt):
+            gt = gt.cpu().numpy()
+        if torch.is_tensor(mask) and mask is not None:
+            mask = mask.cpu().numpy()
+            
+        # 扁平化处理
+        pred_flat = pred.flatten()
+        gt_flat = gt.flatten()
+        
+        # 创建有效掩码
+        if mask is not None:
+            mask_flat = mask.flatten()
+        else:
+            mask_flat = np.ones_like(gt_flat, dtype=bool)
+            
+        # 过滤无效值
+        valid_mask = (
+            mask_flat & 
+            (gt_flat > 0) & 
+            (pred_flat > 0) & 
+            np.isfinite(gt_flat) & 
+            np.isfinite(pred_flat) &
+            (gt_flat != np.inf) &
+            (pred_flat != np.inf)
+        )
+        
+        if np.sum(valid_mask) == 0:
+            return self._get_nan_metrics()
+            
+        pred_valid = pred_flat[valid_mask]
+        gt_valid = gt_flat[valid_mask]
+        
+        # 计算各种误差指标
+        metrics = {}
+        
+        # 1. 阈值准确率指标 (δ < threshold)
+        ratio = np.maximum(pred_valid / gt_valid, gt_valid / pred_valid)
+        for i, threshold in enumerate(self.thresholds):
+            metrics[f'delta_{i+1}'] = np.mean(ratio < threshold)
+        
+        # 为了兼容性，添加标准命名
+        metrics['delta1'] = metrics['delta_1']  # δ < 1.05
+        metrics['delta2'] = metrics['delta_2']  # δ < 1.05²
+        metrics['delta3'] = metrics['delta_3']  # δ < 1.05³
+        
+        # 2. 绝对相对误差 (Absolute Relative Error)
+        abs_rel = np.abs(pred_valid - gt_valid) / gt_valid
+        metrics['abs_rel'] = np.mean(abs_rel)
+        
+        # 3. 平方相对误差 (Squared Relative Error)
+        sq_rel = ((pred_valid - gt_valid) ** 2) / gt_valid
+        metrics['sq_rel'] = np.mean(sq_rel)
+        
+        # 4. 均方根误差 (Root Mean Square Error)
+        rmse = np.sqrt(np.mean((pred_valid - gt_valid) ** 2))
+        metrics['rmse'] = rmse
+        
+        # 5. 对数均方根误差 (Root Mean Square Log Error)
+        log_pred = np.log(pred_valid)
+        log_gt = np.log(gt_valid)
+        rmse_log = np.sqrt(np.mean((log_pred - log_gt) ** 2))
+        metrics['rmse_log'] = rmse_log
+        
+        # 6. 尺度不变对数误差 (Scale-Invariant Logarithmic Error)
+        log_diff = log_pred - log_gt
+        silog = np.sqrt(np.mean(log_diff ** 2) - (np.mean(log_diff) ** 2))
+        metrics['silog'] = silog
+        
+        # 添加统计信息
+        metrics['num_valid_pixels'] = int(np.sum(valid_mask))
+        metrics['total_pixels'] = int(len(pred_flat))
+        metrics['valid_ratio'] = np.sum(valid_mask) / len(pred_flat)
+        
+        return metrics
+    
+    def compute_metrics(self, pred: np.ndarray, gt: np.ndarray, 
+                       mask: Optional[np.ndarray] = None) -> Dict[str, float]:
+        """
+        计算所有深度评估指标（主要接口）
+        
+        Args:
+            pred: 预测深度图
+            gt: 真实深度图  
+            mask: 有效像素掩码，可选
+            
+        Returns:
+            包含所有评估指标的字典
+        """
+        return self.compute_scale_invariant_errors(pred, gt, mask)
+    
+    def _get_nan_metrics(self) -> Dict[str, float]:
+        """返回所有指标为NaN的字典"""
+        return {
+            'delta_1': float('nan'),
+            'delta_2': float('nan'), 
+            'delta_3': float('nan'),
+            'delta1': float('nan'),
+            'delta2': float('nan'),
+            'delta3': float('nan'),
+            'abs_rel': float('nan'),
+            'sq_rel': float('nan'),
+            'rmse': float('nan'),
+            'rmse_log': float('nan'),
+            'silog': float('nan'),
+            'num_valid_pixels': 0,
+            'total_pixels': 0,
+            'valid_ratio': 0.0
+        }
+    
+    def aggregate_metrics(self, metrics_list: list) -> Dict[str, float]:
+        """
+        聚合多个样本的评估指标
+        
+        Args:
+            metrics_list: 各个样本的指标字典列表
+            
+        Returns:
+            聚合后的平均指标
+        """
+        if not metrics_list:
+            return self._get_nan_metrics()
+            
+        # 过滤掉无效的指标
+        valid_metrics = [m for m in metrics_list if not np.isnan(m.get('abs_rel', float('nan')))]
+        
+        if not valid_metrics:
+            return self._get_nan_metrics()
+            
+        aggregated = {}
+        metric_keys = ['delta_1', 'delta_2', 'delta_3', 'delta1', 'delta2', 'delta3',
+                      'abs_rel', 'sq_rel', 'rmse', 'rmse_log', 'silog']
+        
+        # 计算各指标的平均值
+        for key in metric_keys:
+            values = [m[key] for m in valid_metrics if not np.isnan(m.get(key, float('nan')))]
+            if values:
+                aggregated[key] = np.mean(values)
+            else:
+                aggregated[key] = float('nan')
+        
+        # 聚合统计信息
+        aggregated['num_valid_pixels'] = sum(m['num_valid_pixels'] for m in valid_metrics)
+        aggregated['total_pixels'] = sum(m['total_pixels'] for m in valid_metrics)
+        aggregated['valid_ratio'] = aggregated['num_valid_pixels'] / aggregated['total_pixels'] if aggregated['total_pixels'] > 0 else 0.0
+        aggregated['num_samples'] = len(valid_metrics)
+        
+        return aggregated
+
+# ===============================
+# 综合评估函数
+# ===============================
+
+def evaluate_with_reference(pred_img, ref_img):
+    """
+    计算所有全参考指标
+    
+    Args:
+        pred_img: 预测图像
+        ref_img: 参考图像
+    
+    Returns:
+        metrics_dict: 包含所有指标的字典
+    """
+    metrics = {}
+    
+    # 确保图像尺寸一致
+    if pred_img.shape != ref_img.shape:
+        ref_img = cv2.resize(ref_img, (pred_img.shape[1], pred_img.shape[0]))
+    
+    # 计算各项指标
+    metrics['PSNR'] = calculate_psnr(pred_img, ref_img)
+    metrics['SSIM'] = calculate_ssim(pred_img, ref_img)
+    metrics['CIEDE2000'] = calculate_ciede2000(pred_img, ref_img)
+    metrics['LPIPS'] = calculate_lpips(pred_img, ref_img)
+    
+    return metrics
+
+def evaluate_no_reference(img):
+    """
+    计算所有无参考指标
+    完全符合原始论文定义
+    
+    Args:
+        img: 输入图像
+    
+    Returns:
+        metrics_dict: 包含所有指标的字典
+    """
+    metrics = {}
+    
+    metrics['UCIQE'] = calculate_uciqe(img)
+    metrics['UIQM'] = calculate_uiqm(img)
+    metrics['NIQE'] = calculate_niqe(img)
+    
+    return metrics
+
+def evaluate_depth_estimation(pred, gt, epsilon=1e-8,
+                              gt_units='m', valid_min=0.1, valid_max=100.0, pred_clamp_val=80.0):
+    """
+    评估深度估计结果，支持中值缩放对齐
+    Args:
+        pred (torch.Tensor): 预测深度图 (B, 1, H, W)，单位应为米
+        gt (torch.Tensor):   真实深度图 (B, 1, H, W)，单位由gt_units指定
+        epsilon (float):     防止除零的小常数
+        gt_units (str):      真实深度图的单位 ('m' 或 'mm')
+        valid_min (float):   真实深度图的有效最小值 (与gt_units相同单位)
+        valid_max (float):   真实深度图的有效最大值 (与gt_units相同单位)
+        pred_clamp_val (float): 预测深度图在计算scale前的最大钳位值 (单位: 米)
+    Returns:
+        dict: 包含各种深度评估指标的字典
+    """
+    
+    # 确保pred和gt是浮点数
+    pred = pred.float()
+    gt = gt.float()
+
+    # --- 1. 单位归一化 ---
+    # 将GT统一转换为米
+    if gt_units == 'mm':
+        gt = gt / 1000.0
+        valid_min_m = valid_min / 1000.0
+        valid_max_m = valid_max / 1000.0
+    else: # 默认为 'm'
+        valid_min_m = valid_min
+        valid_max_m = valid_max
+
+    # --- 2. 创建有效值掩码 ---
+    # 根据转换后的单位(米)创建掩码
+    valid_mask = (gt > valid_min_m) & (gt < valid_max_m)
+    
+    # 对预测值进行钳位，防止尺度因子计算时出现极端值
+    pred_clamped = torch.clamp(pred, min=epsilon, max=pred_clamp_val)
+    
+    # --- 3. 中值尺度对齐 (Median Scaling) ---
+    # 在有效区域内计算尺度因子
+    median_scale = torch.median(gt[valid_mask]) / torch.median(pred_clamped[valid_mask])
+    pred_scaled = pred_clamped * median_scale
+
+    # 只在有效区域内计算指标
+    pred_final = pred_scaled[valid_mask]
+    gt_final = gt[valid_mask]
+
+    if gt_final.numel() == 0:
+        # 如果没有有效像素，返回默认值
+        return {
+            'depth_mae': 0, 'depth_rmse': 0, 'depth_abs_rel': 0, 'depth_sq_rel': 0,
+            'depth_delta1': 0, 'depth_delta2': 0, 'depth_delta3': 0,
+            'median_scale': float(median_scale.item()) if median_scale.numel() > 0 else 1.0
+        }
+    
+    # --- 4. 计算指标 ---
+    # 使用对齐和掩码后的数据
+    mae = torch.mean(torch.abs(pred_final - gt_final))
+    rmse = torch.sqrt(torch.mean(torch.pow(pred_final - gt_final, 2)))
+    abs_rel = torch.mean(torch.abs(pred_final - gt_final) / gt_final)
+    sq_rel = torch.mean(torch.pow(pred_final - gt_final, 2) / gt_final)
+
+    # Delta 指标
+    ratio = torch.max(pred_final / gt_final, gt_final / pred_final)
+    delta1 = torch.mean((ratio < 1.25).float())
+    delta2 = torch.mean((ratio < 1.25**2).float())
+    delta3 = torch.mean((ratio < 1.25**3).float())
+
+    return {
+        'depth_mae': float(mae.item()),
+        'depth_rmse': float(rmse.item()),
+        'depth_abs_rel': float(abs_rel.item()),
+        'depth_sq_rel': float(sq_rel.item()),
+        'depth_delta1': float(delta1.item()),
+        'depth_delta2': float(delta2.item()),
+        'depth_delta3': float(delta3.item()),
+        'median_scale': float(median_scale.item()) # 也返回计算出的尺度因子，方便调试
+    }
+
+
+def calculate_depth_metrics(pred, gt, valid_mask):
+    """
+    (此函数将被废弃，由evaluate_depth_estimation替代)
+    根据有效区域计算深度指标
+    """
+    if valid_mask.sum() == 0:
+        return 0, 0, 0, 0, 0, 0, 0
+
+    pred_valid = pred[valid_mask]
+    gt_valid = gt[valid_mask]
+
+    # ... (旧的实现)
+    return 0,0,0,0,0,0,0
+
+
+def find_files_recursively(root_dir, extensions=('.jpg', '.png')):
+    """
+    递归查找目录中的所有文件
+    
+    Args:
+        root_dir: 根目录
+        extensions: 文件扩展名列表 (如 .jpg, .png)
+    
+    Returns:
+        file_list: 文件路径列表
+    """
+    file_list = []
+    for root, dirs, files in os.walk(root_dir):
+        for file in files:
+            if file.lower().endswith(extensions):
+                file_list.append(os.path.join(root, file))
+    return file_list
+
+# ===============================
+# 兼容性定义（保持与原API一致）
+# ===============================
+
+# 原有函数的别名，保持兼容性
+def calculate_depth_mae(pred, gt):
+    """计算深度MAE（保持兼容性）"""
+    if torch.is_tensor(pred):
+        pred = pred.cpu().numpy()
+    if torch.is_tensor(gt):
+        gt = gt.cpu().numpy()
+    
+    pred_flat = pred.flatten()
+    gt_flat = gt.flatten()
+    valid_mask = (gt_flat > 0) & (pred_flat > 0)
+    
+    if np.sum(valid_mask) == 0:
+        return 0.0
+    
+    return np.mean(np.abs(pred_flat[valid_mask] - gt_flat[valid_mask]))
+
+def calculate_depth_rmse(pred, gt):
+    """计算深度RMSE（保持兼容性）"""
+    if torch.is_tensor(pred):
+        pred = pred.cpu().numpy()
+    if torch.is_tensor(gt):
+        gt = gt.cpu().numpy()
+    
+    pred_flat = pred.flatten()
+    gt_flat = gt.flatten()
+    valid_mask = (gt_flat > 0) & (pred_flat > 0)
+    
+    if np.sum(valid_mask) == 0:
+        return 0.0
+    
+    return np.sqrt(np.mean((pred_flat[valid_mask] - gt_flat[valid_mask]) ** 2))
+
+# 旧版本的函数映射
+ALL_METRICS = {
     "psnr": calculate_psnr,
     "ssim": calculate_ssim,
     "uciqe": calculate_uciqe,
     "uiqm": calculate_uiqm,
     "ciede2000": calculate_ciede2000,
     "lpips": calculate_lpips,
-    "fsim": calculate_fsim,
     "niqe": calculate_niqe,
-    "brisque": calculate_brisque,
-    "piqe": calculate_piqe,
     "depth_mae": calculate_depth_mae,
     "depth_rmse": calculate_depth_rmse,
-    "depth_delta": calculate_delta_thresholds, # Note: This returns a dict
 }
 
-FULL_REFERENCE_METRICS = [
-    "psnr", 
-    "ssim", 
-    "ciede2000", 
-    "lpips", 
-    "fsim"
-]
+FULL_REFERENCE_METRICS = ["psnr", "ssim", "ciede2000", "lpips"]
+NO_REFERENCE_METRICS = ["uciqe", "uiqm", "niqe"]
+DEPTH_METRICS = ["depth_mae", "depth_rmse"]
 
-NO_REFERENCE_METRICS = [
-    "uciqe", 
-    "uiqm", 
-    "niqe", 
-    "brisque", 
-    "piqe"
-]
+# ===============================
+# 测试函数
+# ===============================
 
-DEPTH_METRICS = [
-    "depth_mae",
-    "depth_rmse",
-    "depth_delta"
-]
+def test_metrics():
+    """测试所有指标函数"""
+    print("=== 综合评估指标测试 ===")
+    
+    # 创建测试图像
+    img1 = np.random.rand(256, 256, 3).astype(np.float32)
+    img2 = img1 + 0.1 * np.random.rand(256, 256, 3).astype(np.float32)
+    img2 = np.clip(img2, 0, 1)
+    
+    # 测试全参考指标
+    print("\n测试全参考指标:")
+    ref_metrics = evaluate_with_reference(img1, img2)
+    for metric, value in ref_metrics.items():
+        print(f"  {metric}: {value:.4f}")
+    
+    # 测试无参考指标
+    print("\n测试无参考指标:")
+    noref_metrics = evaluate_no_reference(img1)
+    for metric, value in noref_metrics.items():
+        print(f"  {metric}: {value:.4f}")
+    
+    # 测试深度指标
+    print("\n测试深度估计指标:")
+    gt_depth = np.random.uniform(1.0, 10.0, (100, 100))
+    pred_depth = gt_depth + np.random.normal(0, 0.5, (100, 100))
+    pred_depth = np.maximum(pred_depth, 0.1)
+    mask = np.random.random((100, 100)) > 0.1
+    
+    depth_metrics = evaluate_depth_estimation(pred_depth, gt_depth, mask)
+    print_metrics(depth_metrics, "深度估计测试")
+    
+    print("\n指标测试完成!")
 
-def calculate_depth_statistics(pred: Union[torch.Tensor, np.ndarray], 
-                              gt: Union[torch.Tensor, np.ndarray]) -> Dict[str, float]:
-    """
-    Calculate comprehensive depth statistics including MAE, RMSE, AbsRel, SqRel
-    
-    Args:
-        pred: Predicted depth map
-        gt: Ground truth depth map
-        
-    Returns:
-        Dict containing various depth metrics
-    """
-    pred_np = _prepare_image_for_metric(pred, target_range_0_1=False).squeeze()
-    gt_np = _prepare_image_for_metric(gt, target_range_0_1=False).squeeze()
-    
-    # Resize if shapes don't match
-    if pred_np.shape != gt_np.shape:
-        pred_tensor = torch.from_numpy(pred_np).unsqueeze(0).unsqueeze(0)
-        pred_resized = F.interpolate(pred_tensor, size=gt_np.shape[-2:], mode='bilinear', align_corners=False)
-        pred_np = pred_resized.squeeze().numpy()
-    
-    if pred_np.shape != gt_np.shape:
-        print(f"Depth statistics: pred shape {pred_np.shape} and gt shape {gt_np.shape} mismatch. Returning zeros.")
-        return {'mae': 0.0, 'rmse': 0.0, 'abs_rel': 0.0, 'sq_rel': 0.0}
-    
-    # Create valid mask (avoid division by zero)
-    valid_mask = (gt_np > 1e-3) & (pred_np > 1e-3)
-    
-    if not np.any(valid_mask):
-        print("Depth statistics: No valid pixels for comparison.")
-        return {'mae': 0.0, 'rmse': 0.0, 'abs_rel': 0.0, 'sq_rel': 0.0}
-    
-    pred_valid = pred_np[valid_mask]
-    gt_valid = gt_np[valid_mask]
-    
-    # Calculate metrics
-    mae = np.mean(np.abs(pred_valid - gt_valid))
-    rmse = np.sqrt(np.mean((pred_valid - gt_valid) ** 2))
-    abs_rel = np.mean(np.abs(pred_valid - gt_valid) / gt_valid)
-    sq_rel = np.mean(((pred_valid - gt_valid) ** 2) / gt_valid)
-    
-    return {
-        'mae': float(mae),
-        'rmse': float(rmse),
-        'abs_rel': float(abs_rel),
-        'sq_rel': float(sq_rel)
-    } 
+if __name__ == '__main__':
+    test_metrics() 

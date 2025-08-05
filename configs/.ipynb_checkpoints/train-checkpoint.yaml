@@ -1,0 +1,430 @@
+# UnderwaterEnhanceNet 训练配置
+
+# 实验配置
+experiment:
+  name: underwater_enhance_run
+  output_dir: ~/autodl-fs/experiments/train
+  auto_naming: true  # 自动为每次实验添加时间戳
+  timestamp_format: "%Y%m%d_%H%M%S"  # 时间戳格式
+
+# 模型配置
+model:
+  base_channels: 48 
+  levels: 4
+  heads: 8
+  bottleneck_blocks: 8
+  encoder_window_size: 8  # 🔧 修复264错误：12无法整除256，改为8 
+  bottleneck_window_size: 8  # 启用瓶颈窗口
+  decoder_block_window_size: 8
+  depth_processor_config:
+    double_channels: True
+    use_cross_attn: true
+
+# 🔥 多输入一致性学习配置（解码器融合级别约束）
+multi_input_consistency:
+  enable: true                    # 是否启用多输入一致性学习
+  
+  # 🔥 多输出融合配置
+  fusion:
+    strategy: "confidence_weighted"  # 融合策略：'first_only', 'mean', 'confidence_weighted'
+    temperature: 1.0                # 置信度权重温度参数，控制权重分布尖锐程度
+
+  # 🔥 跨退化一致性损失 (CMCL) 配置
+  cmcl:
+    enable: true                    # 是否启用CMCL损失
+    lambda_var: 1.0                # 方差损失权重
+    lambda_rgb: 1.0                # RGB一致性损失权重
+    lambda_depth: 1.0              # 深度一致性损失权重
+    k_decay: 1.0                   # 深度置信权重衰减系数
+
+# 训练配置
+train:
+  epochs: 100
+  val_interval: 1
+  vis_interval: 1000  # 🔧 临时禁用可视化以排查Tensor+str错误
+  param_vis_interval: 5000  # 每多少个batch记录一次参数直方图
+  save_best: true  # 是否保存最佳模型
+  save_interval: 10  # 每多少个epoch保存一次模型
+  validation_start_epoch: 20  # 🔥 从第20个epoch开始进行多验证集验证
+
+
+# GPU配置
+gpu:
+  use_gpu: true  # 是否使用GPU
+  device_ids: [0]  # 使用的GPU ID列表，恢复双GPU
+  mixed_precision: false  # 是否使用混合精度训练
+  distributed: false  # 禁用分布式训练（单卡）
+  backend: "nccl"  # 分布式后端，可选 "nccl" (GPU) 或 "gloo" (CPU)
+  sync_bn: true  # 是否使用SyncBatchNorm
+  find_unused_parameters: false  # 是否在DDP中查找未使用参数
+
+# 数据配置
+data:
+  format: "folder"  # 数据格式: "folder" 或 "lmdb"
+  dataset_type: multi_degradation
+  train_root: "DATA/train"  # 训练数据集路径
+  val_root: null  # 禁用旧验证集，使用多验证集配置
+  folder_structure:  # 固定文件夹结构，仅在format="folder"时有效
+    gt: "gt"        # 目标图像文件夹名
+    depth: "depth"  # 深度图文件夹名
+  # 退化图像文件夹列表 - 用于控制输入数据
+  degradation_folders: ['color_B_1', 'color_B_2','color_B_3','color_BG_1', 'color_BG_2','color_BG_3','color_G_1', 'color_G_2','color_G_3','color_Y_1', 'color_Y_2','color_Y_3','color_YG_1', 'color_YG_2','color_YG_3']  # which folders to use
+  lmdb_paths:  # LMDB路径，仅在format="lmdb"时有效
+    train: "DATA/train.lmdb"
+    val: "DATA/val.lmdb"
+  batch_size: 6  # 进一步降低内存使用
+  num_workers: 48  # 保持原有的高并行度
+  persistent_workers: true  # 持久化worker，避免重复fork
+  prefetch_factor: 4  # 每个worker预取批次数
+  pin_memory: true  # 加速GPU数据传输
+  resolution: 256  # 🔥 提升训练分辨率以保留更多细节
+  augment_prob: 0.1  # 🔥 适当增加数据增强概率
+  augmentations:
+    random_crop: True
+    flip_h: True
+    color_jitter: True
+  
+  # 🔥 验证时的处理策略
+  validation_processing:
+    method: "preserve_aspect_ratio"  # 保持长宽比
+    padding_mode: "reflect"  # 使用反射填充避免边界效应
+    max_resolution: 1024  # 限制最大分辨率避免内存问题
+
+# 🔥 多验证集配置
+validation_sets:
+  # 📸 水下图像增强 - 有参考验证集（使用全部7个指标）
+  uieb_test:
+    name: "UIEB_Test"
+    type: "enhancement_with_reference"
+    data_root: "DATA/color_val/UIEB_test"
+    enabled: true
+    description: "UIEB测试集 - 水下图像增强全参考评估"
+    metrics:
+      - "psnr"
+      - "ssim" 
+      - "ms_ssim"
+      - "ciede2000"
+      - "lpips"
+      - "fid"
+      - "sam"
+    save_images: 5
+    folder_structure:
+      input: "input"
+      gt: "gt"
+    
+  lsui_test:
+    name: "LSUI_Test"
+    type: "enhancement_with_reference"
+    data_root: "DATA/color_val/LSUI_test"
+    enabled: true
+    description: "LSUI测试集 - 水下图像增强全参考评估"
+    metrics:
+      - "psnr"
+      - "ssim"
+      - "ms_ssim"
+      - "ciede2000"
+      - "lpips"
+      - "fid"
+      - "sam"
+    save_images: 5
+    folder_structure:
+      input: "input"
+      gt: "gt"
+
+  ubb_test:
+    name: "UBB_Test"
+    type: "enhancement_with_reference"
+    data_root: "DATA/color_val/UBB-test"
+    enabled: true
+    description: "UBB测试集 - 水下图像增强全参考评估"
+    metrics:
+      - "psnr"
+      - "ssim"
+      - "ms_ssim"
+      - "ciede2000"
+      - "lpips"
+      - "fid"
+      - "sam"
+    save_images: 5
+    folder_structure:
+      gt: "gt"
+      input: "color_BG_1"  # 默认输入文件夹
+    multi_input: true  # 标记为多输入验证集
+    input_folders:  # 所有退化类型文件夹
+      - "color_B_1"
+      - "color_B_2"
+      - "color_B_3"
+      - "color_BG_1"
+      - "color_BG_2"
+      - "color_BG_3"
+      - "color_G_1"
+      - "color_G_2"
+      - "color_G_3"
+      - "color_Y_1"
+      - "color_Y_2"
+      - "color_Y_3"
+      - "color_YG_1"
+      - "color_YG_2"
+      - "color_YG_3"
+
+  # 🌊 水下图像增强 - 无参考验证集（仅使用无参考指标）
+  uieb_challenging:
+    name: "UIEB_Challenging_NoRef"
+    type: "enhancement_no_reference"
+    data_root: "DATA/color_val/UIEB_challenging"
+    enabled: true
+    description: "UIEB挑战性测试集 - 无参考质量评估"
+    metrics:
+      - "uciqe"
+      - "uiqm"
+      - "niqe"
+    save_images: 5
+    folder_structure:
+      input: "."
+
+  squid_noref:
+    name: "SQUID_NoRef"
+    type: "enhancement_no_reference"
+    data_root: "DATA/color_val/SQUID"
+    enabled: true
+    description: "SQUID数据集 - 无参考质量评估"
+    metrics:
+      - "uciqe"
+      - "uiqm"
+      - "niqe"
+    save_images: 5
+    folder_structure:
+      input: "."
+
+  # 🏔️ 深度预测验证集
+  seathru_depth:
+    name: "SeaThru_Depth"
+    type: "depth_prediction"
+    data_root: "DATA/depth_val/SeaThru_D3_D5_TestSet/test"
+    enabled: true
+    description: "SeaThru D3&D5 深度预测测试集"
+    depth_gt_units: "m"      # 深度图单位: m (米)
+    depth_valid_min: 0.1     # 有效深度最小值 (m)
+    depth_valid_max: 26.0    # 有效深度最大值 (m)
+    pred_clamp_val: 26.0     # 预测值计算scale前的最大钳位值 (m)
+    metrics:
+      - "depth_mae"
+      - "depth_rmse"
+      - "depth_abs_rel"
+      - "depth_sq_rel"
+      - "depth_log10"
+      - "depth_delta1"
+      - "depth_delta2"
+      - "depth_delta3"
+    save_images: 5
+    folder_structure:
+      rgb: "rgb"        # RGB图像文件夹
+      depth: "depth"    # 深度图像文件夹
+    depth_format: "npy"  # 🔧 指定深度文件格式为numpy
+
+  squid_depth:
+    name: "SQUID_Depth"
+    type: "depth_prediction"
+    data_root: "DATA/depth_val/SQUID_Monocular_Left_Camera_TestSet/test"
+    enabled: true
+    description: "SQUID单目深度预测测试集"
+    depth_gt_units: "mm"     # 深度图单位: mm (毫米)
+    depth_valid_min: 1.0     # 有效深度最小值 (mm)
+    depth_valid_max: 115.0   # 有效深度最大值 (mm)
+    pred_clamp_val: 0.115    # 预测值计算scale前的最大钳位值 (m, 115mm)
+    metrics:
+      - "depth_mae"
+      - "depth_rmse"
+      - "depth_abs_rel"
+      - "depth_sq_rel"
+      - "depth_log10"
+      - "depth_delta1"
+      - "depth_delta2"
+      - "depth_delta3"
+    save_images: 5
+    folder_structure:
+      rgb: "rgb"
+      depth: "depth"
+    depth_format: "npy"
+
+
+
+  ubb_depth_test:
+    name: "UBB_Depth_Test"
+    type: "depth_prediction"
+    data_root: "DATA/depth_val/UBB-depthtest"
+    enabled: true
+    description: "UBB深度预测验证集"
+    depth_gt_units: "relative"  # 相对深度单位
+    depth_valid_min: 0.1      # 有效深度最小值
+    depth_valid_max: 100.0    # 有效深度最大值
+    pred_clamp_val: 80.0      # 预测值钳位值
+    metrics:
+      - "depth_mae"
+      - "depth_rmse"
+      - "depth_abs_rel"
+      - "depth_sq_rel"
+      - "depth_log10"
+      - "depth_delta1"
+      - "depth_delta2"
+      - "depth_delta3"
+    save_images: 5
+    folder_structure:
+      rgb: "color_BG_1"  # 使用color_BG_1作为默认RGB输入
+      depth: "gt"       # depth GT在gt文件夹中
+    depth_format: "png"  # UBB深度文件为PNG格式
+    multi_input: true   # 🔧 标记为多输入验证集
+    rgb_folders:  # 🔧 指定所有RGB输入文件夹
+      - "color_BG_1"
+      - "color_BG_2"
+      - "color_BG_3"
+      - "color_B_1"
+      - "color_B_2"
+      - "color_B_3"
+      - "color_G_1"
+      - "color_G_2"
+      - "color_G_3"
+      - "color_Y_1"
+      - "color_Y_2"
+      - "color_Y_3"
+      - "color_YG_1"
+      - "color_YG_2"
+      - "color_YG_3"
+
+# 优化器配置
+optimizer:
+  name: adamw  # adam, adamw, sgd
+  lr: 0.0001
+  weight_decay: 0.01
+  beta1: 0.9
+  beta2: 0.99
+  momentum: 0.9  # 仅对SGD有效
+  nesterov: true  # 仅对SGD有效
+  attn_lr_scale: 0.5  # 交叉注意力模块的学习率缩放因子
+  physics_lr_scale: 0.8 # 物理参数模块的学习率缩放因子
+  clip_grad_norm: 1.0  # 🔧 添加梯度裁剪，防止梯度爆炸
+
+# 学习率调度器
+scheduler:
+  name: cosine_warmup  # cosine, cosine_warmup, multistep, step, plateau
+  warmup_epochs: 10
+  min_lr: 0.000001
+  milestones: [60, 80]  # 仅对multistep有效
+  gamma: 0.1  # 衰减因子，仅对multistep和step有效
+  patience: 5  # 仅对plateau有效
+  factor: 0.5  # 仅对plateau有效
+
+# 损失函数权重
+loss:
+  # 自动调参设置
+  use_uncertainty_weighting: true  # 是否使用自动调参（不确定性加权）。设为false时使用下面的静态权重
+  sigma_init:                      # 不确定性权重初始值
+    rgb: 0.5                       # RGB损失初始权重
+    depth: 0.2                     # 深度损失初始权重
+  lambda_img: 3.0    # L1 像素损失
+  lambda_ssim: 1.0   # 结构相似度损失
+  lambda_perc: 1.0   # 感知损失
+  lambda_fft: 0.1   # 频域损失
+  lambda_grad: 0.1   # 梯度损失
+  lambda_depth: 1  # 深度预测损失
+  lambda_smooth: 0.01  # 深度平滑损失
+  lambda_cons: 0.05  # 交叉注意力一致性损失权重
+
+  
+  # 🔥 跨退化一致性损失 (CMCL) 权重
+  lambda_cmcl: 0.1         # CMCL总权重
+  lambda_cmcl_var: 1.0     # 方差损失权重
+  lambda_cmcl_rgb: 1.0     # RGB一致性权重  
+  lambda_cmcl_depth: 1.0   # 深度一致性权重
+  cmcl_k_decay: 1.0        # 深度衰减系数
+# 物理一致性损失权重已删除
+  depth_weight: 1.0  # 深度回归损失权重（用于连续深度预测）
+  depth_processing:
+    use_log_transform: true  # 是否使用对数变换
+    min_depth: 5000.0  # 最小有效深度值
+    max_depth: 65000.0  # 最大有效深度值
+    edge_weight: 0.5  # 边缘感知损失权重
+    use_edge_aware_loss: true  # 是否使用边缘感知损失
+    # 添加对数和线性变换的独立深度范围
+    min_depth_log: 5000.0  # 对数变换时的最小深度
+    max_depth_log: 65000.0  # 对数变换时的最大深度
+    min_depth_linear: 5000.0  # 线性变换时的最小深度
+    max_depth_linear: 65000.0  # 线性变换时的最大深度
+    use_cross_attn: true
+
+  # 深度边缘颜色损失配置
+  depth_edge_color:
+    w_edge: 1.0  # 边缘权重
+    w_depth: 0.5  # 深度权重
+  # 交叉注意力一致性损失配置
+  cross_attention:
+    method: "symmetric_kl"  # 使用对称KL散度 KL(P‖Q)+KL(Q‖P)
+    reduction: "mean"  # 使用平均值聚合损失
+    enable_saving: true  # 是否启用注意力图保存
+    eps: 0.00000001  # 🔧 修复：使用明确的数值而不是科学计数法，避免YAML解析为字符串
+
+# 可视化配置
+visualization:
+  save_images: true
+  save_features: true
+  save_depth_fusion: true
+  max_images_per_batch: 4  # 每个批次最多保存多少图像
+  vis_freq: 500  # 每多少个batch保存一次可视化
+  val_vis_interval: 50  # 验证时每多少个batch记录一次TensorBoard可视化
+  max_val_vis_samples: 10  # 验证时最多在TensorBoard中可视化多少个样本
+  val_images:
+    save: true  # 是否保存验证集图像
+    max_samples: 8  # 最多保存多少个验证样本 (向后兼容配置)
+    save_comparison: true  # 是否保存对比图(输入/输出/GT)
+    save_metrics: true  # 是否在图像上标注指标
+  
+  # 🔥 多验证集可视化配置
+  multi_validation:
+    enabled: true  # 是否启用多验证集验证
+    save_detailed_results: true  # 是否保存详细结果到CSV
+    tensorboard_logging: true  # 是否记录到TensorBoard
+    comparison_layout: "horizontal"  # 对比图布局：horizontal(水平) 或 vertical(垂直)
+    save_individual_metrics: true  # 是否为每个验证集单独保存指标文件
+  save_model_graph: false  # 是否保存模型结构图
+  plot_lr: true  # 是否绘制学习率曲线 
+  save_attention_maps: true  # 🔧 启用注意力图保存以计算注意力一致性损失
+  
+  # TensorBoard记录频率控制 - 影响训练速度的关键配置
+  tensorboard:
+    # 基础训练指标 (train/*, optimizer/*, gpu/*)
+    train_metrics_freq: 10  # 每N步记录一次训练指标 (1=每步记录)
+    
+    # 物理参数指标 (physics/*)
+    physics_metrics:
+      enable: true  # 是否启用物理参数记录
+      freq: 100  # 每N步记录一次物理参数 (1=每步记录)
+      save_histograms: true  # 是否保存物理参数分布直方图
+    
+    # 模型参数分布 (params/*)
+    model_params:
+      enable: false  # 是否启用参数直方图记录 (耗时，建议调试时启用)
+      freq: 5000  # 每N步记录一次参数分布
+    
+    # 梯度分布 (grads/*)
+    gradients:
+      enable: false  # 是否启用梯度直方图记录 (耗时，建议调试时启用)
+      freq: 5000  # 每N步记录一次梯度分布
+    
+    # 验证指标 (val/*)
+    val_metrics_freq: 1  # 验证时每N个epoch记录一次 (1=每个epoch记录)
+    
+    # 不确定性权重 (uncertainty/*)
+    uncertainty_weights:
+      enable: true  # 是否记录不确定性权重
+      freq: 10  # 每N步记录一次不确定性权重
+    
+    # 注意力图可视化 (attention/*)
+    attention_maps:
+      enable: true  # 是否保存注意力图
+      freq: 1000  # 每N步保存一次注意力图
+
+
+logging:
+  console_level: "WARNING"  # 控制台日志级别："DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"
+                         # 设置为"CRITICAL"将使日志只写入文件而不显示到终端
+  file_level: "DEBUG"    # 文件日志级别，建议保持"DEBUG"以捕获所有信息
