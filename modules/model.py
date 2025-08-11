@@ -580,11 +580,29 @@ class UnderwaterEnhanceNet(nn.Module):
             self.logger.info(f"Final output shapes: enhanced={out.shape}, pred_gate={pred_gate.shape}, depth_pred={depth_pred.shape}")
 
         # ===== 最终输出统一封装 =====
+        # 在DDP下返回内建容器（dict），便于DDP识别输出中的Tensor
+        try:
+            import torch.distributed as dist
+            ddp_active = dist.is_available() and dist.is_initialized()
+        except Exception:
+            ddp_active = False
+
+        student_feats_out = student_feats_pass1 if training_mode else student_feats
+        if ddp_active:
+            return {
+                'enhanced': out,
+                'pred_gate': pred_gate,
+                'depth_pred': depth_pred,
+                'student_feats': student_feats_out,
+                'attention_maps': self.get_attention_maps() if self.save_attention_maps else None,
+                'is_multi_input': False
+            }
+
         return ModelOutput(
             enhanced=out,               # 增强后结果
             pred_gate=pred_gate,       # 深度门控
             depth_pred=depth_pred,      # 预测深度
-            student_feats=student_feats_pass1 if training_mode else student_feats,
+            student_feats=student_feats_out,
             attention_maps=self.get_attention_maps() if self.save_attention_maps else None
         )
 
@@ -781,6 +799,22 @@ class UnderwaterEnhanceNet(nn.Module):
         # 物理模型输出已删除
         
         # 返回输出
+        try:
+            import torch.distributed as dist
+            ddp_active = dist.is_available() and dist.is_initialized()
+        except Exception:
+            ddp_active = False
+
+        if ddp_active:
+            return {
+                'enhanced': enhanced,
+                'pred_gate': pred_gate,
+                'depth_pred': depth_pred,
+                'student_feats': student_feats,
+                'attention_maps': attention_maps,
+                'is_multi_input': False
+            }
+
         output = ModelOutput(
             enhanced=enhanced,
             pred_gate=pred_gate,
@@ -945,6 +979,27 @@ class UnderwaterEnhanceNet(nn.Module):
         # 特征一致性已删除，只保留输出层面的CMCL一致性约束
         
         # 🔥 创建多输入模式的输出（包含所有候选用于损失计算）
+        # 在DDP下返回dict以便识别Tensor
+        try:
+            import torch.distributed as dist
+            ddp_active = dist.is_available() and dist.is_initialized()
+        except Exception:
+            ddp_active = False
+
+        if ddp_active:
+            return {
+                'enhanced': primary_enhanced,
+                'pred_gate': primary_pred_gate,
+                'depth_pred': primary_depth_pred,
+                'student_feats': student_feats_flat,
+                'attention_maps': attention_maps,
+                'multi_enhanced': enhanced,
+                'multi_depth_pred': depth_pred,
+                'multi_res_d': res_d,
+                'multi_res_c': res_c,
+                'is_multi_input': True
+            }
+
         result = ModelOutput(
             enhanced=primary_enhanced,
             pred_gate=primary_pred_gate,

@@ -22,7 +22,7 @@ class DepthDecoder(nn.Module):
     新增功能：在解码过程中，每一层的深度特征都与对应的RGB特征进行RGB→Depth交叉注意力融合
     """
     def __init__(self, base_c=48, levels=4, window=4, enable_cross_attention=True, 
-                 min_depth=5000.0, max_depth=65000.0):
+                 min_depth=2000.0, max_depth=65535.0):
         super().__init__()
         self.levels = levels
         self.base_c = base_c  # 保存base_c用于后续计算

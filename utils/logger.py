@@ -220,13 +220,26 @@ class MetricLogger:
     Logs scalar metrics to console, file, TensorBoard, and CSV for external visualization.
     Also supports logging images, histograms, and text to TensorBoard.
     """
-    def __init__(self, logger: logging.Logger, tb_writer: SummaryWriter, csv_path: str):
+    def __init__(self, logger: logging.Logger, tb_writer: SummaryWriter, csv_path: str, csv_cfg: dict = None):
         self.logger = logger
         self.tb_writer = tb_writer
         self.csv_path = csv_path
         self.step = 0
         self.global_step = 0  # 全局步数计数器，不会被reset重置
         self.csv_header_written = False
+        # 维护一个稳定且可扩展的字段列表，避免首行字段固定导致后续指标丢失
+        self.csv_fieldnames = None
+        # 紧凑版CSV设置
+        self.csv_cfg = csv_cfg or {}
+        self.compact_enabled = self.csv_cfg.get('compact_enabled', True)
+        self.compact_path = os.path.join(os.path.dirname(csv_path), self.csv_cfg.get('compact_filename', 'metrics_compact.csv'))
+        self.compact_fields = self.csv_cfg.get('compact_fields', [
+            'step','global_step','prefix',
+            'img_total_loss','l1_loss','ssim_loss','perc_loss','fft_loss','grad_loss',
+            'depth_decoder_loss','depth_smooth_loss','depth_rec_loss','depth_total_loss',
+            'attn_cons_loss','cmcl_loss','lr','step_time'
+        ])
+        self.compact_header_written = False
         
         # 记录TensorBoard日志目录位置（如果有TensorBoard writer）
         if self.tb_writer is not None:
@@ -309,18 +322,83 @@ art)."""
                 if isinstance(v, torch.Tensor) and v.numel() > 1:
                     self.tb_writer.add_histogram(f"{prefix}/{k}_hist", v, current_step)
 
-        # 3) Append to CSV
-        fieldnames = ['step', 'global_step', 'prefix'] + list(metrics.keys())
-        if not self.csv_header_written:
+        # 3) Append to CSV（带有自适应列扩展）
+        base_fields = ['step', 'global_step', 'prefix']
+        incoming_keys = list(metrics.keys())
+        incoming_fieldnames = base_fields + incoming_keys
+
+        def _rewrite_csv_with_new_header(new_fieldnames):
+            try:
+                # 读取旧内容（若存在）
+                old_rows = []
+                if os.path.exists(self.csv_path) and os.path.getsize(self.csv_path) > 0:
+                    with open(self.csv_path, mode='r', newline='') as rf:
+                        reader = csv.DictReader(rf)
+                        for row in reader:
+                            old_rows.append(row)
+                # 用新表头重写文件
+                with open(self.csv_path, mode='w', newline='') as wf:
+                    writer = csv.DictWriter(wf, fieldnames=new_fieldnames)
+                    writer.writeheader()
+                    # 逐行补全缺失字段并写回
+                    for row in old_rows:
+                        fixed = {k: row.get(k, '') for k in new_fieldnames}
+                        writer.writerow(fixed)
+                self.logger.info(f"metrics.csv 表头更新：新增字段 {set(new_fieldnames) - set(self.csv_fieldnames or [])}")
+            except Exception as e:
+                self.logger.error(f"更新metrics.csv表头失败: {e}")
+        
+        # 初始化或扩展字段集合
+        if not self.csv_header_written or self.csv_fieldnames is None:
+            self.csv_fieldnames = incoming_fieldnames
             with open(self.csv_path, mode='w', newline='') as f:
-                writer = csv.DictWriter(f, fieldnames=fieldnames)
+                writer = csv.DictWriter(f, fieldnames=self.csv_fieldnames)
                 writer.writeheader()
             self.csv_header_written = True
-
-        row = {'step': current_step, 'global_step': self.global_step, 'prefix': prefix, **{k: float(v) for k, v in metrics.items()}}
+        else:
+            # 如果出现新字段，扩展表头并重写文件
+            missing = [k for k in incoming_fieldnames if k not in self.csv_fieldnames]
+            if missing:
+                self.csv_fieldnames.extend(missing)
+                _rewrite_csv_with_new_header(self.csv_fieldnames)
+        
+        # 写入当前行（使用稳定字段顺序）
+        row = {'step': current_step, 'global_step': self.global_step, 'prefix': prefix}
+        row.update({k: float(v) for k, v in metrics.items()})
         with open(self.csv_path, mode='a', newline='') as f:
-            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer = csv.DictWriter(f, fieldnames=self.csv_fieldnames)
             writer.writerow(row)
+
+        # 4) 写入紧凑版CSV（固定字段顺序，缺失填空）
+        if self.compact_enabled:
+            # 初始化表头
+            if not self.compact_header_written or not os.path.exists(self.compact_path):
+                with open(self.compact_path, mode='w', newline='') as cf:
+                    cw = csv.DictWriter(cf, fieldnames=self.compact_fields)
+                    cw.writeheader()
+                self.compact_header_written = True
+            # 准备行数据，缺失字段填空
+            compact_row = {k: '' for k in self.compact_fields}
+            compact_row.update({
+                'step': current_step,
+                'global_step': self.global_step,
+                'prefix': prefix,
+            })
+            # 把可用的指标映射进去
+            for k in self.compact_fields:
+                if k in ('step','global_step','prefix'):
+                    continue
+                val = metrics.get(k, None)
+                if val is not None:
+                    if hasattr(val, 'item'):
+                        val = val.item()
+                    elif isinstance(val, torch.Tensor):
+                        val = float(val.cpu().detach())
+                    compact_row[k] = val
+            # 追加写入
+            with open(self.compact_path, mode='a', newline='') as cf:
+                cw = csv.DictWriter(cf, fieldnames=self.compact_fields)
+                cw.writerow(compact_row)
 
         self.step += 1
         self.global_step += 1  # 全局步数始终增加，不受epoch重置影响

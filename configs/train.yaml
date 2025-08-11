@@ -46,18 +46,18 @@ train:
   param_vis_interval: 5000  # 每多少个batch记录一次参数直方图
   save_best: true  # 是否保存最佳模型
   save_interval: 10  # 每多少个epoch保存一次模型
-  validation_start_epoch: 20  # 🔥 从第20个epoch开始进行多验证集验证
+  validation_start_epoch: 1  # 🔥 从第1个epoch开始进行多验证集验证
 
 
 # GPU配置
 gpu:
   use_gpu: true  # 是否使用GPU
-  device_ids: [0]  # 使用的GPU ID列表，恢复双GPU
-  mixed_precision: true # 保持关闭混合精度训练
-  distributed: false  # 禁用分布式训练（单卡）
+  device_ids: [0,1]  # 使用的GPU ID列表，恢复双GPU
+  mixed_precision: false # 保持关闭混合精度训练
+  distributed: True  # 启用分布式训练（双卡）
   backend: "nccl"  # 分布式后端，可选 "nccl" (GPU) 或 "gloo" (CPU)
   sync_bn: true  # 是否使用SyncBatchNorm
-  find_unused_parameters: false  # 是否在DDP中查找未使用参数
+  find_unused_parameters: true  # 动态计算图：本步未用到的参数允许跳过梯度
   
   # 🚀 性能优化配置
   optimization:
@@ -323,27 +323,42 @@ scheduler:
 
 # 损失函数权重
 loss:
-  # 自动调参设置
-  use_uncertainty_weighting: true  # 是否使用自动调参（不确定性加权）。设为false时使用下面的静态权重
-  sigma_init:                      # 不确定性权重初始值
-    rgb: 0.5                       # RGB损失初始权重
-    depth: 0.2                     # 深度损失初始权重
-  lambda_img: 3.0    # L1 像素损失
-  lambda_ssim: 1.0   # 结构相似度损失
-  lambda_perc: 1.0   # 感知损失
-  lambda_fft: 0.1   # 频域损失
-  lambda_grad: 0.1   # 梯度损失
-  lambda_depth: 1  # 深度预测损失
-  lambda_smooth: 0.01  # 深度平滑损失
-  lambda_cons: 0.05  # 交叉注意力一致性损失权重
-
+  use_uncertainty_weighting: true
+  sigma_init:
+    rgb: 0.6
+    rgb_l1: 0.6
+    rgb_ssim: 0.6
+    rgb_perc: 0.7
+    rgb_fft: 0.7
+    rgb_grad: 0.6
+    depth: 0.7
+    depth_decoder: 0.6
+    depth_smooth: 0.7
+    depth_rec: 3.0
+    attncons: 1.1
+    cmcl: 0.65
+    cmcl_var: 0.65
+    cmcl_rgb: 0.65
+    cmcl_depth: 0.65
   
-  # 🔥 跨退化一致性损失 (CMCL) 权重
-  lambda_cmcl: 0.1         # CMCL总权重
-  lambda_cmcl_var: 1.0     # 方差损失权重
-  lambda_cmcl_rgb: 1.0     # RGB一致性权重  
-  lambda_cmcl_depth: 1.0   # 深度一致性权重
-  cmcl_k_decay: 1.0        # 深度衰减系数
+  # 仅在 use_uncertainty_weighting=false 时生效的手动权重（细粒度）
+  lambda_smooth: 0.01        # 深度平滑项专用
+  lambda_attncons: 1.0           # 注意力一致性项专用
+  lambda_img_l1: 1.0
+  lambda_img_ssim: 1.0
+  lambda_img_perc: 1.0
+  lambda_img_fft: 1.0
+  lambda_img_grad: 1.0
+  lambda_depth_decoder: 1.0
+  lambda_depth_smooth: 1.0
+  lambda_depth_rec: 1.0
+
+  # CMCL 总权重（两种模式均适用）
+  lambda_cmcl: 0.1
+  lambda_cmcl_var: 1.0
+  lambda_cmcl_rgb: 1.0
+  lambda_cmcl_depth: 1.0
+  cmcl_k_decay: 1.0
 # 物理一致性损失权重已删除
   depth_weight: 1.0  # 深度回归损失权重（用于连续深度预测）
   depth_processing:
@@ -367,7 +382,7 @@ loss:
   cross_attention:
     method: "symmetric_kl"  # 使用对称KL散度 KL(P‖Q)+KL(Q‖P)
     reduction: "mean"  # 使用平均值聚合损失
-    enable_saving: true  # 是否启用注意力图保存
+    enable_saving: false  # 关闭注意力图保存以降低显存
     eps: 0.00000001  # 🔧 修复：使用明确的数值而不是科学计数法，避免YAML解析为字符串
 
 # 可视化配置

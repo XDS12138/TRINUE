@@ -18,7 +18,8 @@ def resume_from_checkpoint(checkpoint_dir: str,
                          optimizer: torch.optim.Optimizer = None,
                          scheduler: torch.optim.lr_scheduler._LRScheduler = None,
                          device = None,
-                         scaler = None) -> tuple:
+                         scaler = None,
+                         train_sampler = None) -> tuple:
     """
     从检查点目录中找到最新的检查点并恢复模型、优化器、调度器状态
     
@@ -94,6 +95,15 @@ def resume_from_checkpoint(checkpoint_dir: str,
                 scaler.load_state_dict(checkpoint['scaler_state_dict'])
             except Exception as e:
                 logger.error(f"无法恢复混合精度scaler状态: {e}")
+
+        # 恢复训练采样器状态（用于分布式训练的epoch同步）
+        if train_sampler and 'sampler_epoch' in checkpoint:
+            try:
+                if hasattr(train_sampler, 'set_epoch'):
+                    train_sampler.set_epoch(checkpoint['sampler_epoch'])
+                    logger.info(f"恢复训练采样器epoch状态: {checkpoint['sampler_epoch']}")
+            except Exception as e:
+                logger.error(f"无法恢复训练采样器状态: {e}")
 
         # 恢复训练轮次和最佳指标
         start_epoch = checkpoint.get('epoch', 0)
@@ -186,3 +196,109 @@ def get_checkpoint_info(checkpoint_path):
     except Exception as e:
         logger.error(f"获取检查点信息失败: {e}")
         return None 
+
+
+def validate_config_compatibility(checkpoint_path, current_config):
+    """
+    验证checkpoint与当前配置的兼容性
+    
+    Args:
+        checkpoint_path: 检查点文件路径
+        current_config: 当前训练配置
+        
+    Returns:
+        bool: 是否兼容
+        str: 兼容性信息
+    """
+    try:
+        checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
+        
+        # 检查是否保存了配置信息
+        if 'config' not in checkpoint:
+            return True, "检查点未包含配置信息，跳过兼容性检查"
+        
+        saved_config = checkpoint['config']
+        
+        # 检查关键配置项
+        critical_keys = [
+            ['model', 'type'],
+            ['model', 'params'],
+            ['data', 'input_size'],
+            ['train', 'mixed_precision']
+        ]
+        
+        warnings = []
+        errors = []
+        
+        for key_path in critical_keys:
+            saved_val = saved_config
+            current_val = current_config
+            
+            try:
+                for key in key_path:
+                    saved_val = saved_val[key]
+                    current_val = current_val[key]
+                
+                if saved_val != current_val:
+                    key_str = '.'.join(key_path)
+                    if key_path[0] == 'model':  # 模型相关是错误
+                        errors.append(f"{key_str}: saved={saved_val}, current={current_val}")
+                    else:  # 其他是警告
+                        warnings.append(f"{key_str}: saved={saved_val}, current={current_val}")
+                        
+            except KeyError:
+                # 配置键不存在，跳过
+                continue
+        
+        if errors:
+            error_msg = "配置不兼容:\n" + "\n".join([f"  ❌ {e}" for e in errors])
+            if warnings:
+                error_msg += "\n配置警告:\n" + "\n".join([f"  ⚠️  {w}" for w in warnings])
+            return False, error_msg
+        
+        if warnings:
+            warning_msg = "配置警告:\n" + "\n".join([f"  ⚠️  {w}" for w in warnings])
+            return True, warning_msg
+        
+        return True, "✅ 配置完全兼容"
+        
+    except Exception as e:
+        return True, f"配置兼容性检查失败: {e}"
+
+
+def get_checkpoint_summary(checkpoint_dir):
+    """
+    获取检查点目录的摘要信息
+    
+    Args:
+        checkpoint_dir: 检查点目录
+        
+    Returns:
+        dict: 摘要信息
+    """
+    if not os.path.isdir(checkpoint_dir):
+        return {"error": "目录不存在"}
+    
+    checkpoints = [f for f in os.listdir(checkpoint_dir) if f.endswith('.pth')]
+    if not checkpoints:
+        return {"error": "无检查点文件"}
+    
+    # 获取最新和最佳检查点信息
+    latest_checkpoint = max([os.path.join(checkpoint_dir, f) for f in checkpoints], key=os.path.getmtime)
+    best_checkpoint = os.path.join(checkpoint_dir, 'model_best.pth') if 'model_best.pth' in checkpoints else None
+    
+    summary = {
+        "total_checkpoints": len(checkpoints),
+        "latest_checkpoint": {
+            "path": latest_checkpoint,
+            "info": get_checkpoint_info(latest_checkpoint)
+        }
+    }
+    
+    if best_checkpoint and os.path.exists(best_checkpoint):
+        summary["best_checkpoint"] = {
+            "path": best_checkpoint,
+            "info": get_checkpoint_info(best_checkpoint)
+        }
+    
+    return summary 

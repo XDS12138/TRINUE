@@ -4,7 +4,7 @@ import torch.nn.functional as F
 from .blocks import RestormerBlock, DACBlock
 from .blocks import BeerLambertPML, PSFPML
 import logging
-import kornia.filters as K  # 用于高斯卷积
+# import kornia.filters as K  # 用于高斯卷积（当前未使用）
 
 logger = logging.getLogger(__name__)
 
@@ -24,7 +24,9 @@ class MultiTaskDecoder(nn.Module):
       - res_d: Tensor[B, 3, H, W]  Deblur residual
       - res_c: Tensor[B, 3, H, W]  Color correction residual
     """
-    def __init__(self, base_channels=48, input_channels_bottleneck=384, levels=3, decoder_block_window_size=8, num_encoder_feature_levels=None):
+    def __init__(self, base_channels=48, input_channels_bottleneck=384, levels=3, decoder_block_window_size=8, num_encoder_feature_levels=None,
+                 depth_raw_min: float = 2000.0, depth_raw_max: float = 65535.0,
+                 depth_meter_min: float = 0.1, depth_meter_max: float = 30.0):
         super().__init__()
         self.levels = levels
         self.base_channels = base_channels
@@ -36,6 +38,12 @@ class MultiTaskDecoder(nn.Module):
             self.num_encoder_feature_levels = num_encoder_feature_levels
 
         logger.info(f"MultiTaskDecoder initialized with {levels} decoder levels, {self.num_encoder_feature_levels} expected encoder feature levels (for depth fusion weights).")
+        
+        # 深度标定参数（像素→米）
+        self.depth_raw_min = float(depth_raw_min)
+        self.depth_raw_max = float(depth_raw_max)
+        self.depth_meter_min = float(depth_meter_min)
+        self.depth_meter_max = float(depth_meter_max)
 
         # Deblur Branch
         self.deblur_ups = nn.ModuleList()#上采样模块
@@ -388,8 +396,16 @@ class MultiTaskDecoder(nn.Module):
                 raw_resized = F.interpolate(raw, size=fused.shape[-2:], 
                                           mode='bilinear', align_corners=False)
                 
-                # 应用Beer-Lambert物理调制
-                fused = self.color_pmls[i](fused, raw_resized, depth_resized, beta_c, B_c)
+                # 3️⃣ 深度标定（像素→米），再传递给Beer-Lambert PML
+                # 将原始像素值范围 [depth_raw_min, depth_raw_max] 映射到物理米制 [depth_meter_min, depth_meter_max]
+                depth_meters = (depth_resized - self.depth_raw_min) / (self.depth_raw_max - self.depth_raw_min + 1e-6)
+                depth_meters = torch.clamp(depth_meters, 0.0, 1.0)
+                depth_meters = depth_meters * (self.depth_meter_max - self.depth_meter_min) + self.depth_meter_min
+
+                # 原图从 [-1,1] → [0,1]，以匹配 BL-PML 内部的 I_tilde = 2*I_raw - 1
+                raw_unit = (raw_resized + 1.0) / 2.0
+
+                fused = self.color_pmls[i](fused, raw_unit, depth_meters, beta_c, B_c)
             
             # 通过DACBlock，不再应用深度加权
             if i < len(self.dac_blocks):

@@ -230,9 +230,19 @@ class UnderwaterDatasetBase(Dataset):
             
             # 右填充
             right_start = paste_x + img_w
-            right_padding = resized_np[:, -paste_x:]  # 取右边缘
-            right_padding = np.fliplr(right_padding)  # 水平翻转
-            canvas_np[paste_y:paste_y+img_h, right_start:] = right_padding
+            # 计算实际需要的右填充宽度
+            right_width = canvas_np.shape[1] - right_start
+            if right_width > 0:
+                # 从图像右边缘取相应宽度的像素
+                right_source_width = min(right_width, paste_x, img_w)
+                right_padding = resized_np[:, -right_source_width:]  # 取右边缘
+                right_padding = np.fliplr(right_padding)  # 水平翻转
+                # 如果需要更多填充，重复边缘像素
+                if right_width > right_source_width:
+                    edge_col = right_padding[:, -1:]  # 最右边的列
+                    extra_padding = np.repeat(edge_col, right_width - right_source_width, axis=1)
+                    right_padding = np.concatenate([right_padding, extra_padding], axis=1)
+                canvas_np[paste_y:paste_y+img_h, right_start:right_start+right_width] = right_padding[:, :right_width]
         
         # 上下填充
         if paste_y > 0:
@@ -243,9 +253,19 @@ class UnderwaterDatasetBase(Dataset):
             
             # 下填充
             bottom_start = paste_y + img_h
-            bottom_padding = canvas_np[bottom_start-paste_y:bottom_start, :]  # 取下边缘
-            bottom_padding = np.flipud(bottom_padding)  # 垂直翻转
-            canvas_np[bottom_start:, :] = bottom_padding
+            # 计算实际需要的下填充高度
+            bottom_height = canvas_np.shape[0] - bottom_start
+            if bottom_height > 0:
+                # 从已填充区域取相应高度的像素
+                bottom_source_height = min(bottom_height, paste_y, img_h)
+                bottom_padding = canvas_np[bottom_start-bottom_source_height:bottom_start, :]  # 取下边缘
+                bottom_padding = np.flipud(bottom_padding)  # 垂直翻转
+                # 如果需要更多填充，重复边缘像素
+                if bottom_height > bottom_source_height:
+                    edge_row = bottom_padding[-1:, :]  # 最下边的行
+                    extra_padding = np.repeat(edge_row, bottom_height - bottom_source_height, axis=0)
+                    bottom_padding = np.concatenate([bottom_padding, extra_padding], axis=0)
+                canvas_np[bottom_start:bottom_start+bottom_height, :] = bottom_padding[:bottom_height, :]
         
         return Image.fromarray(canvas_np)
     

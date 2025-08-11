@@ -41,7 +41,7 @@ from utils.experiment_manager import setup_experiment_dir
 from utils.logging_setup import setup_logging_system
 from utils.training_setup import setup_training
 from utils.data_loader import prepare_data
-from utils.checkpoint_manager import resume_from_checkpoint, save_checkpoint_extended
+from utils.checkpoint_manager import resume_from_checkpoint, save_checkpoint_extended, validate_config_compatibility
 from utils.visualization_utils import log_training_visualization, save_validation_images
 from utils.distributed_utils import setup_for_distributed_launch
 from utils.multi_validation_manager import MultiValidationManager
@@ -75,9 +75,20 @@ def train_epoch(train_loader, model, criterion, optimizer, device, metric_logger
     for i, batch in enumerate(progress_bar):
         current_step = epoch * len(train_loader) + i
         
+        import time
+        step_start = time.time()
+        
         # 解析批次数据
         raw_imgs, depth_gt, gt = _parse_batch_data(batch, device, config)
         B = raw_imgs.shape[0]
+
+        # 记录批次基本信息
+        try:
+            mem_alloc = torch.cuda.memory_allocated() if torch.cuda.is_available() else 0
+            mem_reserved = torch.cuda.memory_reserved() if torch.cuda.is_available() else 0
+            train_logger.info(f"[STEP {current_step}] batch_size={B}, raw_shape={tuple(raw_imgs.shape)}, depth_shape={None if depth_gt is None else tuple(depth_gt.shape)}, gt_shape={None if gt is None else tuple(gt.shape)} | mem_alloc={mem_alloc/1e9:.3f}GB, mem_reserved={mem_reserved/1e9:.3f}GB")
+        except Exception:
+            pass
         
         optimizer.zero_grad()
         
@@ -94,19 +105,31 @@ def train_epoch(train_loader, model, criterion, optimizer, device, metric_logger
                     enable_consistency = config.get('multi_input_consistency', {}).get('enable', False)
                     
                     # 前向传播选择逻辑
-                    if hasattr(model, 'forward') and raw_imgs.dim() == 5:
-                        outputs = model.forward(raw_imgs, depth_gt, gt, enable_multi_input_consistency=enable_consistency)
+                    outputs = model(raw_imgs, depth_gt, gt, enable_multi_input_consistency=enable_consistency)
+                    # 统一适配 dict/ModelOutput
+                    if isinstance(outputs, dict):
+                        out_enh = outputs['enhanced']
+                        out_feats = outputs.get('student_feats')
+                        out_attn = outputs.get('attention_maps')
+                        out_depth = outputs.get('depth_pred')
+                        out_multi_enh = outputs.get('multi_enhanced')
+                        out_multi_depth = outputs.get('multi_depth_pred')
                     else:
-                        outputs = model.multi_forward(raw_imgs, depth_gt, gt)
+                        out_enh = outputs.enhanced
+                        out_feats = outputs.student_feats
+                        out_attn = outputs.attention_maps
+                        out_depth = outputs.depth_pred
+                        out_multi_enh = getattr(outputs, 'multi_enhanced', None)
+                        out_multi_depth = getattr(outputs, 'multi_depth_pred', None)
                     loss = criterion(
-                        outputs.enhanced, gt,
+                        out_enh, gt,
                         depth_gt=depth_gt,
-                        student_feats=outputs.student_feats,
-                        attention_maps=outputs.attention_maps,
-                        depth_pred=outputs.depth_pred,
+                        student_feats=out_feats,
+                        attention_maps=out_attn,
+                        depth_pred=out_depth,
                         raw=raw_imgs,
-                        multi_enhanced=getattr(outputs, 'multi_enhanced', None),
-                        multi_depth_pred=getattr(outputs, 'multi_depth_pred', None)
+                        multi_enhanced=out_multi_enh,
+                        multi_depth_pred=out_multi_depth
                     )
                 
                 # 反向传播（混合精度）
@@ -122,19 +145,31 @@ def train_epoch(train_loader, model, criterion, optimizer, device, metric_logger
             else:
                 # 启用多输入一致性学习（如果配置中启用）
                 enable_consistency = config.get('multi_input_consistency', {}).get('enable', False)
-                if hasattr(model, 'forward') and raw_imgs.dim() == 5:
-                    outputs = model.forward(raw_imgs, depth_gt, gt, enable_multi_input_consistency=enable_consistency)
+                outputs = model(raw_imgs, depth_gt, gt, enable_multi_input_consistency=enable_consistency)
+                # 统一适配 dict/ModelOutput
+                if isinstance(outputs, dict):
+                    out_enh = outputs['enhanced']
+                    out_feats = outputs.get('student_feats')
+                    out_attn = outputs.get('attention_maps')
+                    out_depth = outputs.get('depth_pred')
+                    out_multi_enh = outputs.get('multi_enhanced')
+                    out_multi_depth = outputs.get('multi_depth_pred')
                 else:
-                    outputs = model.multi_forward(raw_imgs, depth_gt, gt)
+                    out_enh = outputs.enhanced
+                    out_feats = outputs.student_feats
+                    out_attn = outputs.attention_maps
+                    out_depth = outputs.depth_pred
+                    out_multi_enh = getattr(outputs, 'multi_enhanced', None)
+                    out_multi_depth = getattr(outputs, 'multi_depth_pred', None)
                 loss = criterion(
-                    outputs.enhanced, gt,
+                    out_enh, gt,
                     depth_gt=depth_gt,
-                    student_feats=outputs.student_feats,
-                    attention_maps=outputs.attention_maps,
-                    depth_pred=outputs.depth_pred,
+                    student_feats=out_feats,
+                    attention_maps=out_attn,
+                    depth_pred=out_depth,
                     raw=raw_imgs,
-                    multi_enhanced=getattr(outputs, 'multi_enhanced', None),
-                    multi_depth_pred=getattr(outputs, 'multi_depth_pred', None)
+                    multi_enhanced=out_multi_enh,
+                    multi_depth_pred=out_multi_depth
                 )
                 
                 # 反向传播
@@ -154,15 +189,62 @@ def train_epoch(train_loader, model, criterion, optimizer, device, metric_logger
             import traceback
             error_logger.error("详细错误堆栈:")
             error_logger.error(traceback.format_exc())
+            # DDP 下不要吞掉异常，否则会触发 reducer 未完成归约错误
+            try:
+                import torch.distributed as dist
+                if dist.is_available() and dist.is_initialized():
+                    try:
+                        dist.barrier()
+                    except Exception:
+                        pass
+                    raise
+            except Exception:
+                pass
+            # 非分布式模式可以尝试跳过该 batch
             continue
         
         current_loss = loss.item()
         epoch_loss += current_loss
         
+        # 记录详细损失组件与学习率
+        try:
+            if hasattr(criterion, 'get_latest_losses'):
+                comp = criterion.get_latest_losses()
+                # 简洁展开主要组件
+                train_logger.info(
+                    f"[STEP {current_step}] loss={current_loss:.6f} | img(l1={comp.get('l1_loss',0):.4f}, ssim={comp.get('ssim_loss',0):.4f}, perc={comp.get('perc_loss',0):.4f}, fft={comp.get('fft_loss',0):.4f}, grad={comp.get('grad_loss',0):.4f}) | "
+                    f"depth(dec={comp.get('depth_decoder_loss',0):.4f}, smooth={comp.get('depth_smooth_loss',0):.4f}, rec={comp.get('depth_rec_loss',0):.4f}) | "
+                    f"attn={comp.get('attn_cons_loss',0):.4f} | cmcl={comp.get('cmcl_loss',0):.4f}"
+                )
+        except Exception:
+            pass
+        
+        # 学习率
+        try:
+            lr_vals = [pg['lr'] for pg in optimizer.param_groups]
+            step_time = time.time() - step_start
+            train_logger.info(f"[STEP {current_step}] lr={lr_vals} | time={step_time:.3f}s")
+            # 记录到TensorBoard（训练）
+            if metric_logger is not None:
+                try:
+                    metric_logger.log_metrics({'lr': float(lr_vals[0]), 'step_time': float(step_time)}, prefix='train', step=current_step)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        
         progress_bar.set_postfix({"Loss": f"{current_loss:.4f}"})
         
         # 记录指标
         _log_training_metrics(criterion, current_step, config, metric_logger, multi_logger)
+        
+        # 定期强制刷新TensorBoard，确保前端及时更新
+        try:
+            flush_freq = config.get('visualization', {}).get('tensorboard', {}).get('flush_freq', 50)
+            if current_step % int(flush_freq) == 0 and metric_logger is not None:
+                metric_logger.flush()
+        except Exception:
+            pass
         
         # 可视化记录
         if i % vis_interval == 0:
@@ -216,23 +298,48 @@ def validate_legacy(val_loader, model, criterion, device, metric_logger, epoch, 
             # 前向传播
             if mixed_precision:
                 with autocast():
-                    outputs = model.multi_forward(raw_imgs, depth_gt, gt)
+                    # 启用多输入一致性学习（如果配置中启用）
+                    enable_consistency = config.get('multi_input_consistency', {}).get('enable', False)
+                    outputs = model(raw_imgs, depth_gt, gt, enable_multi_input_consistency=enable_consistency)
+                    # 统一适配 dict/ModelOutput
+                    if isinstance(outputs, dict):
+                        out_enh = outputs['enhanced']
+                        out_feats = outputs.get('student_feats')
+                        out_attn = outputs.get('attention_maps')
+                        out_depth = outputs.get('depth_pred')
+                    else:
+                        out_enh = outputs.enhanced
+                        out_feats = outputs.student_feats
+                        out_attn = outputs.attention_maps
+                        out_depth = outputs.depth_pred
                     loss = criterion(
-                        outputs.enhanced, gt,
+                        out_enh, gt,
                         depth_gt=depth_gt,
-                        student_feats=outputs.student_feats,
-                        attention_maps=outputs.attention_maps,
-                        depth_pred=outputs.depth_pred,
+                        student_feats=out_feats,
+                        attention_maps=out_attn,
+                        depth_pred=out_depth,
                         raw=raw_imgs
                     )
             else:
-                outputs = model.multi_forward(raw_imgs, depth_gt, gt)
+                # 启用多输入一致性学习（如果配置中启用）
+                enable_consistency = config.get('multi_input_consistency', {}).get('enable', False)
+                outputs = model(raw_imgs, depth_gt, gt, enable_multi_input_consistency=enable_consistency)
+                if isinstance(outputs, dict):
+                    out_enh = outputs['enhanced']
+                    out_feats = outputs.get('student_feats')
+                    out_attn = outputs.get('attention_maps')
+                    out_depth = outputs.get('depth_pred')
+                else:
+                    out_enh = outputs.enhanced
+                    out_feats = outputs.student_feats
+                    out_attn = outputs.attention_maps
+                    out_depth = outputs.depth_pred
                 loss = criterion(
-                    outputs.enhanced, gt,
+                    out_enh, gt,
                     depth_gt=depth_gt,
-                    student_feats=outputs.student_feats,
-                    attention_maps=outputs.attention_maps,
-                    depth_pred=outputs.depth_pred,
+                    student_feats=out_feats,
+                    attention_maps=out_attn,
+                    depth_pred=out_depth,
                     raw=raw_imgs
                 )
             
@@ -240,8 +347,11 @@ def validate_legacy(val_loader, model, criterion, device, metric_logger, epoch, 
             num_batches += 1
             
             # 计算RGB指标
-            if outputs.enhanced is not None and gt is not None:
-                enhanced_norm, gt_norm = _normalize_images(outputs.enhanced, gt)
+            enhanced_imgs = out_enh if 'out_enh' in locals() else (outputs['enhanced'] if isinstance(outputs, dict) else outputs.enhanced)
+            depth_pred_imgs = out_depth if 'out_depth' in locals() else (outputs.get('depth_pred') if isinstance(outputs, dict) else getattr(outputs, 'depth_pred', None))
+            
+            if enhanced_imgs is not None and gt is not None:
+                enhanced_norm, gt_norm = _normalize_images(enhanced_imgs, gt)
                 
                 psnr = compute_psnr(enhanced_norm, gt_norm)
                 ssim = compute_ssim(enhanced_norm, gt_norm)
@@ -252,8 +362,8 @@ def validate_legacy(val_loader, model, criterion, device, metric_logger, epoch, 
             # 保存验证图像
             if vis_count < max_val_samples and val_images_dir is not None:
                 save_validation_images(
-                    raw_imgs[0:1], outputs.enhanced[0:1], gt[0:1] if gt is not None else None,
-                    outputs.depth_pred[0:1] if outputs.depth_pred is not None else None,
+                    raw_imgs[0:1], enhanced_imgs[0:1] if enhanced_imgs is not None else None, gt[0:1] if gt is not None else None,
+                    depth_pred_imgs[0:1] if depth_pred_imgs is not None else None,
                     depth_gt[0:1] if depth_gt is not None else None,
                     val_images_dir, vis_count, config
                 )
@@ -298,6 +408,9 @@ def main_worker(config, args):
     # 2. 设置日志系统
     multi_logger, metric_logger, tb_writer = setup_logging_system(exp_dir, config)
     logger = multi_logger.get_logger('train')
+
+    # 2.1 初始化统一日志文件并记录训练开始
+    multi_logger.log_training_start(config)
     
     # 3. 设置训练环境
     setup_result = setup_training(args, config, args.local_rank)
@@ -319,6 +432,31 @@ def main_worker(config, args):
     train_loader = data_loaders['train_loader']
     val_loader = data_loaders['val_loader']
     train_sampler = data_loaders['train_sampler']
+
+    # 4.1 记录数据和环境信息
+    try:
+        # 数据规模
+        train_size = len(getattr(train_loader, 'dataset', [])) if train_loader is not None else 0
+        val_size = len(getattr(val_loader, 'dataset', [])) if val_loader is not None else 0
+        logger.info(f"[DATA] Train samples: {train_size}, Val samples: {val_size}, Batch size: {config.get('data', {}).get('batch_size')} ")
+        # GPU/CPU信息
+        if torch.cuda.is_available():
+            device_count = torch.cuda.device_count()
+            device_names = [torch.cuda.get_device_name(i) for i in range(device_count)]
+            logger.info(f"[GPU] CUDA available: True, Devices: {device_count}, Names: {device_names}")
+        else:
+            logger.info("[GPU] CUDA available: False, using CPU")
+    except Exception as e:
+        logger.warning(f"记录数据/环境信息失败: {e}")
+
+    # 4.2 记录模型参数信息
+    try:
+        model_to_count = setup_result['model'].module if hasattr(setup_result['model'], 'module') else setup_result['model']
+        total_params = sum(p.numel() for p in model_to_count.parameters())
+        trainable_params = sum(p.numel() for p in model_to_count.parameters() if p.requires_grad)
+        logger.info(f"[MODEL] Total params: {total_params:,}, Trainable: {trainable_params:,}")
+    except Exception as e:
+        logger.warning(f"统计模型参数失败: {e}")
     
     # 5. 初始化多验证集管理器
     multi_val_manager = MultiValidationManager(config, device, multi_logger, metric_logger)
@@ -330,13 +468,27 @@ def main_worker(config, args):
     
     if args.resume:
         logger.info(f"正在尝试从检查点目录 '{checkpoint_dir}' 恢复训练...")
+        
+        # 配置兼容性检查
+        checkpoints = [f for f in os.listdir(checkpoint_dir) if f.endswith('.pth')] if os.path.exists(checkpoint_dir) else []
+        if checkpoints:
+            latest_checkpoint_path = max([os.path.join(checkpoint_dir, f) for f in checkpoints], key=os.path.getmtime)
+            is_compatible, compatibility_msg = validate_config_compatibility(latest_checkpoint_path, config)
+            
+            logger.info(f"配置兼容性检查: {compatibility_msg}")
+            if not is_compatible:
+                logger.error("❌ 配置不兼容，无法安全恢复训练！")
+                logger.error("请检查模型配置是否与保存的检查点一致。")
+                return
+        
         model, optimizer, scheduler, scaler, start_epoch, best_metric = resume_from_checkpoint(
             checkpoint_dir=checkpoint_dir,
             model=model,
             optimizer=optimizer,
             scheduler=scheduler,
             device=device,
-            scaler=scaler
+            scaler=scaler,
+            train_sampler=train_sampler
         )
     
     # 7. 仅验证模式
@@ -363,6 +515,9 @@ def main_worker(config, args):
         if args.distributed:
             train_sampler.set_epoch(epoch)
         
+        # 8.1 为当前epoch挂载单一日志文件并记录开始
+        multi_logger.log_epoch_start(epoch, config['train']['epochs'])
+        
         # 训练
         train_loss, _ = train_epoch(
             train_loader, model, criterion, optimizer, device,
@@ -378,6 +533,17 @@ def main_worker(config, args):
             )
         else:
             val_loss, val_metric = 0.0, 0.0
+        
+        # 8.2 记录epoch结束和主要指标，确保写入到该epoch的日志文件
+        multi_logger.log_epoch_end(
+            epoch,
+            {
+                'train_loss': train_loss,
+                'val_loss': val_loss,
+                'val_psnr': val_metric,
+                'lr': optimizer.param_groups[0]['lr'],
+            }
+        )
         
         # 🔥 多验证集验证 - 从第20个epoch开始
         multi_val_results = {}
@@ -411,15 +577,25 @@ def main_worker(config, args):
             if is_best:
                 best_metric = main_metric
             
-            save_checkpoint_extended(
-                state={
+            # 构建checkpoint状态字典
+            checkpoint_state = {
                     'epoch': epoch + 1,
                     'model_state_dict': model.module.state_dict() if hasattr(model, 'module') else model.state_dict(),
                     'optimizer_state_dict': optimizer.state_dict(),
                     'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
                     'best_metric': best_metric,
                     'scaler_state_dict': scaler.state_dict() if scaler else None,
-                },
+                'config': config,  # 保存配置信息用于后续兼容性检查
+            }
+            
+            # 保存分布式训练采样器的epoch状态
+            if train_sampler and hasattr(train_sampler, 'epoch'):
+                checkpoint_state['sampler_epoch'] = train_sampler.epoch
+            elif args.distributed:
+                checkpoint_state['sampler_epoch'] = epoch
+            
+            save_checkpoint_extended(
+                state=checkpoint_state,
                 is_best=is_best,
                 checkpoint_dir=checkpoint_dir,
                 filename=f"checkpoint_epoch_{epoch+1}.pth"
@@ -431,26 +607,30 @@ def main_worker(config, args):
 
 
 def _parse_batch_data(batch, device, config):
-    """解析批次数据"""
+    """解析批次数据，已通过collate函数正确处理多退化格式"""
     if isinstance(batch, dict):
-        raw_imgs = batch['raw_imgs'].to(device)
+        raw_imgs = batch['raw_imgs'].to(device)  # 现在已经是 [B, N, C, H, W] 格式
         depth_gt = batch['depth'].to(device) if 'depth' in batch and batch['depth'] is not None else None
         gt = batch['gt'].to(device) if 'gt' in batch and batch['gt'] is not None else None
         
-        # 数据形状验证（可选）
-        # print(f"[DEBUG] _parse_batch_data: raw_imgs.shape={raw_imgs.shape}, dim={raw_imgs.dim()}")
-        # print(f"[DEBUG] _parse_batch_data: depth_gt.shape={depth_gt.shape if depth_gt is not None else None}")
-        # print(f"[DEBUG] _parse_batch_data: gt.shape={gt.shape if gt is not None else None}")
+        # 数据形状验证和调试信息（临时启用用于调试）
+        print(f"[DEBUG] _parse_batch_data: raw_imgs.shape={raw_imgs.shape}, dim={raw_imgs.dim()}")
+        if depth_gt is not None:
+            print(f"[DEBUG] _parse_batch_data: depth_gt.shape={depth_gt.shape}")
+        if gt is not None:
+            print(f"[DEBUG] _parse_batch_data: gt.shape={gt.shape}")
         
-        # 保持5D张量用于多输入处理
-        # raw_imgs形状应该是 [B, N, C, H, W] 其中N是退化类型数量
+        # 验证多退化格式
+        if raw_imgs.dim() == 5:
+            print(f"[DEBUG] ✅ 多退化格式正确: [B={raw_imgs.shape[0]}, N={raw_imgs.shape[1]}, C={raw_imgs.shape[2]}, H={raw_imgs.shape[3]}, W={raw_imgs.shape[4]}]")
+        else:
+            print(f"[DEBUG] ⚠️  未检测到多退化格式，维度为: {raw_imgs.dim()}")
+            
     else:
         raw_imgs, depth_gt_tuple, gt_tuple = batch[:3]
         raw_imgs = raw_imgs.to(device)
         depth_gt = depth_gt_tuple.to(device) if depth_gt_tuple is not None else None
         gt = gt_tuple.to(device) if gt_tuple is not None else None
-        
-        # 保持5D张量用于多输入处理
     
     return raw_imgs, depth_gt, gt
 
@@ -567,11 +747,14 @@ def main():
     set_seed(args.seed, config.get('gpu', {}))
     
     # 分布式训练处理
-    if setup_for_distributed_launch(config, args):
-        return  # 分布式训练已启动，主进程退出
+    spawned = setup_for_distributed_launch(config, args)
+    if spawned:
+        return  # 分布式训练已通过mp.spawn启动，主进程退出
     
-    # 单GPU或CPU训练
-    args.local_rank = -1
+    # 若非torchrun环境，不要覆盖torchrun传入的LOCAL_RANK
+    if 'RANK' not in os.environ:
+        args.local_rank = -1
+    
     main_worker(config, args)
 
 

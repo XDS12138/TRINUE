@@ -161,16 +161,17 @@ class WindowAttention(nn.Module):
         x = x.view(B, C, Hp // ws, ws, Wp // ws, ws)          # B,C,Nh,ws,Nw,ws
         x = x.permute(0, 2, 4, 3, 5, 1).contiguous()          # B,Nh,Nw,ws,ws,C
         windows = x.view(-1, ws * ws, C)                      # B*Nh*Nw , ws² , C
-        return windows, (Hp, Wp)
+        return windows, (Hp, Wp, H, W)  # 保存填充后和原始尺寸
 
-    def _window_reverse(self, windows, pad_hw, B):
-        Hp, Wp      = pad_hw
+    def _window_reverse(self, windows, size_info, B):
+        Hp, Wp, H, W = size_info  # 解包填充后和原始尺寸
         ws          = self.window_size
         C           = windows.size(-1)
         x = windows.view(B, Hp // ws, Wp // ws, ws, ws, C)    # B,Nh,Nw,ws,ws,C
         x = x.permute(0, 5, 1, 3, 2, 4).contiguous()          # B,C,Nh,ws,Nw,ws
         x = x.view(B, C, Hp, Wp)
-        return x[:, :, :Hp - (ws - Hp % ws) % ws, :Wp - (ws - Wp % ws) % ws]
+        # 直接切片到原始尺寸，避免复杂的填充计算
+        return x[:, :, :H, :W]
 
     def forward(self, x):
         """
@@ -178,7 +179,7 @@ class WindowAttention(nn.Module):
         out: [B, C, H, W]
         """
         B, C, H, W = x.shape
-        windows, pad_hw = self._window_partition(x)           # nW*B, ws², C
+        windows, size_info = self._window_partition(x)        # nW*B, ws², C
         qkv = self.qkv(windows).reshape(-1, windows.size(1), 3, self.heads, self.d_k)
         q, k, v = qkv.unbind(dim=2)                           # each: [nW*B, ws², heads, dk]
         q = q.transpose(1, 2)                                 # [nW*B, heads, ws², dk]
@@ -189,7 +190,7 @@ class WindowAttention(nn.Module):
         out  = (attn @ v)                                     # [nW*B, heads, ws², dk]
         out  = out.transpose(1, 2).reshape(windows.shape)     # [nW*B, ws², C]
         out  = self.proj(out)
-        out  = self._window_reverse(out, pad_hw, B)           # [B, C, H, W]
+        out  = self._window_reverse(out, size_info, B)        # [B, C, H, W]
         return out
 
 class RestormerBlock(nn.Module):

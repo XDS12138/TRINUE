@@ -263,118 +263,447 @@ Decoder Inputs at Level i:
 ```
 
 #### DACBlock 详解 (用于颜色分支)
+
+**DACBlock** = **D**ilated conv + **A**ttention + **C**hannel-wise refinement Block
+
 ```
-            Input: x
-              │
-        .─────'─────. (残差连接)
-        │           │
-        │   ┌───────▼───────┐
-        │   │ Depthwise     │
-        │   │ Dilated Conv  │
-        │   └───────┬───────┘
-        │           │
-        │           y
-        │           │
-        │ .─────────'─────────. (特征 y 同时送往两个路径)
-        │ │                   │
-        │ │         ┌─────────▼─────────┐
-        │ │         │ Channel Attention │
-        │ │         │ (Pool->Conv->Act) │
-        │ │         └─────────┬─────────┘
-        │ │                   │
-        │ │                   ca
-        │ │                   │
-        │ └─────────────────▶( * ) (y 和 ca 逐元素相乘)
-        │                     │
-        │           ┌─────────▼─────────┐
-        │           │ Pointwise Conv    │ (1x1卷积)
-        │           └─────────┬─────────┘
-        │                     │
-        │           ┌─────────▼─────────┐
-        │           │       GELU        │
-        │           └─────────┬─────────┘
-        │                     │
-        └───────────────────▶( + )
-                              │
-                              ▼
-                           Output
+          Input x [B,C,H,W]
+               │
+         ┌─────'─────┐ (残差连接)
+         │           │
+         │    ┌──────▼──────┐
+         │    │  DW Conv    │ (3×3, d=2)
+         │    │ (groups=C)  │
+         │    └──────┬──────┘
+         │           │
+         │        y [B,C,H,W]
+         │           │
+         │    ┌──────'──────┐
+         │    │             │
+         │    │      ┌──────▼──────┐
+         │    │      │ Channel     │
+         │    │      │ Attention   │
+         │    │      │ GAP→Conv→   │
+         │    │      │ GELU→Conv→  │
+         │    │      │ Sigmoid     │
+         │    │      └──────┬──────┘
+         │    │             │
+         │    │        ca [B,C,1,1]
+         │    │             │
+         │    └──────────▶( ⊙ ) ← Hadamard乘积 (非cat!)
+         │                  │     y * ca (广播到H×W)
+         │                  │
+         │         ┌────────▼────────┐
+         │         │   Conv 1×1      │
+         │         └────────┬────────┘
+         │                  │
+         │         ┌────────▼────────┐
+         │         │      GELU       │
+         │         └────────┬────────┘
+         │                  │
+         └─────────────────▶( + )
+                            │
+                            ▼
+                      Output [B,C,H,W]
 ```
+
+**关键操作说明：**
+- **⊙** 表示 Hadamard 乘积（逐元素相乘），**不是** concatenation
+- `ca ∈ [0,1]^{B×C×1×1}` 通过广播与 `y ∈ R^{B×C×H×W}` 相乘
+- 公式：`y_att = y ⊙ ca`，其中 `ca` 自动广播到 `[B,C,H,W]`
 
 ### 物理调制层详解
 
 #### PSF物理调制层 (PSF-PML) - 去模糊分支
 ```
-                           PSF-PML 物理调制层
-                                   |
-                           ┌───────────────┐
-                           │   输入参数     │
-                           │ • feat: 特征   │
-                           │ • depth_norm  │
-                           │ • blur_scale  │
-                           └───────┬───────┘
-                                   │
-                           ┌───────▼───────┐
-                           │ 计算模糊强度    │
-                           │ σ = blur_scale │
-                           │     × depth    │
-                           └───────┬───────┘
-                                   │
-                           ┌───────▼───────┐
-                           │  参数预测网络   │
-                           │ (fc1/fc2 are   │
-                           │  Conv 1x1)    │
-                           │ δ = fc2(relu(  │
-                           │     fc1(σ)))   │
-                           └───────┬───────┘
-                                   │
-                           ┌───────▼───────┐
-                           │   加性调制     │
-                           │ output = feat  │
-                           │        + δ     │
-                           └───────────────┘
+PSF-PML (Deblur Branch)
+
+     feat [B,C,H,W]              depth_pred [B,1,H0,W0]        blur_scale [B,1,1,1]
+           │                     (pixel: 2000–65535)                    │
+           │                            │                               │
+           │                            ▼                               │
+           │                   ┌─────────────────┐                      │
+           │                   │ Per-image Norm  │                      │
+           │                   │ d_min = amin()  │                      │
+           │                   │ d_max = amax()  │                      │
+           │                   │ norm = clamp()  │                      │
+           │                   └─────────┬───────┘                      │
+           │                             │                               │
+           │                      depth_norm [B,1,H0,W0]               │
+           │                           [0,1]                            │
+           │                             │                               │
+           │                             ▼                               │
+           │                   ┌─────────────────┐                      │
+           │                   │ Interpolation   │                      │
+           │                   │ (bilinear)      │                      │
+           │                   └─────────┬───────┘                      │
+           │                             │                               │
+           │                      depth_interp [B,1,H,W]               │
+           │                             │                               │
+           │                             ▼                               │
+           │                   ┌─────────────────┐                      │
+           │                   │ Detach Grads    │                      │
+           │                   └─────────┬───────┘                      │
+           │                             │                               │
+           │                      depth_detached                        │
+           │                             │                               │
+           │                             └─────────┬─────────────────────┘
+           │                                       │
+           │                                       ▼
+           │                             ┌─────────────────┐
+           │                             │ σ = blur_scale  │
+           │                             │   · depth_det   │
+           │                             └─────────┬───────┘
+           │                                       │
+           │                                σ [B,1,H,W]
+           │                                       │
+           │                                       ▼
+           │                             ┌─────────────────┐
+           │                             │ u = ReLU(       │
+           │                             │   Conv1x1(σ))   │
+           │                             └─────────┬───────┘
+           │                                       │
+           │                                       ▼
+           │                             ┌─────────────────┐
+           │                             │ Δ = Conv1x1(u)  │
+           │                             └─────────┬───────┘
+           │                                       │
+           │                                Δ [B,C,H,W]
+           │                                       │
+           └───────────────────────────────────────┼───────▶ ( + )
+                                                   │            │
+                                                   └────────────┘
+                                                                │
+                                                                ▼
+                                                         out [B,C,H,W]
 ```
 
 #### Beer-Lambert物理调制层 (BL-PML) - 颜色分支
 ```
-                        BL-PML 物理调制层
-                               |
-                      ┌────────────────┐
-                      │     输入参数    │
-                      │ • feat, I_raw  │
-                      │ • depth, β_c, B_c│
-                      └────────┬───────┘
-                               │
-                      ┌────────▼───────┐
-                      │  物理量计算     │
-                      │ t = exp(-βd)   │  (透射率)
-                      │ b = 1 - t      │  (后向散射)
-                      │ I~ = 2I_raw-1  │  (归一化图像)
-                      └────────┬───────┘
-                               │
-                      ┌────────▼───────┐
-                      │  特征拼接      │
-                      │ m = cat(t,b,I~)│
-                      │ shape: [B,9,H,W]│
-                      └────────┬───────┘
-                               │
-                      ┌────────▼───────┐
-                      │  参数预测网络   │
-                      │ (fc1/fc2 are   │
-                      │  Conv 1x1)    │
-                      │ params = fc2(  │
-                      │  relu(fc1(m))) │
-                      └────────┬───────┘
-                               │
-                      ┌────────▼───────┐
-                      │  参数分离      │
-                      │ γ, δ = chunk   │
-                      └────────┬───────┘
-                               │
-                      ┌────────▼───────┐
-                      │   仿射变换     │
-                      │ out = γ*feat+δ │
-                      └────────────────┘
+BL-PML (Color Branch)
+
+feat [B,C,H,W]    depth_pred [B,1,H0,W0]    I_raw [B,3,H0,W0]    β_c,B_c [B,3,1,1]
+      │           (pixel: 2000–65535)         (range: [-1,1])            │
+      │                   │                         │                    │
+      │                   ▼                         ▼                    │
+      │         ┌─────────────────┐       ┌─────────────────┐            │
+      │         │ Interpolation   │       │ Interpolation   │            │
+      │         │ (bilinear)      │       │ (bilinear)      │            │
+      │         └─────────┬───────┘       └─────────┬───────┘            │
+      │                   │                         │                    │
+      │            depth_i [B,1,H,W]         I_i [B,3,H,W]              │
+      │                   │                         │                    │
+      │                   ▼                         ▼                    │
+      │         ┌─────────────────┐       ┌─────────────────┐            │
+      │         │ Pixel → Meters  │       │ Normalize       │            │
+      │         │ (physical)      │       │ [-1,1] → [0,1]  │            │
+      │         └─────────┬───────┘       └─────────┬───────┘            │
+      │                   │                         │                    │
+      │            d_m [B,1,H,W]           I_norm [B,3,H,W]             │
+      │            (meters)                     [0,1]                    │
+      │                   │                         │                    │
+      │                   ▼                         ▼                    │
+      │         ┌─────────────────┐       ┌─────────────────┐            │
+      │         │ Detach Grads    │       │ Standardize     │            │
+      │         └─────────┬───────┘       │ [0,1] → [-1,1]  │            │
+      │                   │               └─────────┬───────┘            │
+      │            d_det [B,1,H,W]                  │                    │
+      │                   │                   Ĩ [B,3,H,W]               │
+      │                   │                    [-1,1]                    │
+      │                   ▼                         │                    │
+      │         ┌─────────────────┐                 │                    │
+      │         │ repeat(d_det,3) │                 │                    │
+      │         └─────────┬───────┘                 │                    │
+      │                   │                         │                    │
+      │            d3 [B,3,H,W]             Ĩ [B,3,H,W]                 │
+      │                   │                         │                    │
+      │                   └─────────┬───────────────┼────────────────────┘
+      │                             │               │
+      │                             ▼               ▼
+      │                   ┌─────────────────────────────────┐
+      │                   │ Beer-Lambert Physics (Current)  │
+      │                   │ t = exp(-β_c · d3)   (uses β_c) │
+      │                   │ b = 1 - t           (computed)  │
+      │                   │ m = cat(t, b, Ĩ)    [B,9,H,W]   │
+      │                   │ Note: B_c unused in current    │
+      │                   └─────────┬───────────────────────┘
+      │                             │
+      │                             ▼
+      │                   ┌─────────────────┐
+      │                   │ u = ReLU(       │
+      │                   │   Conv1x1(m))   │
+      │                   └─────────┬───────┘
+      │                             │
+      │                             ▼
+      │                   ┌─────────────────┐
+      │                   │ [γ,δ] = chunk(  │
+      │                   │   Conv1x1(u))   │
+      │                   └─────────┬───────┘
+      │                             │
+      │                      γ,δ [B,C,H,W]
+      │                             │
+      └─────────────────────────────┼───────▶ γ·feat + δ
+                                    │              │
+                                    └──────────────┘
+                                                   │
+                                                   ▼
+                                            out [B,C,H,W]
 ```
+
+### **🔬 完整版 Beer-Lambert 物理建模 (理论版本)**
+
+当前实现为简化版本，完整的 Beer-Lambert 水下图像形成模型应该包含背景光散射：
+
+```
+Complete Beer-Lambert Underwater Image Formation Model
+
+I_source [B,3,H,W]     depth [B,1,H,W]     β_c,B_c [B,3,1,1]
+    (clear scene)        (meters)           (extinction, backlight)
+         │                    │                        │
+         │                    ▼                        │
+         │          ┌─────────────────┐                │
+         │          │ Physics Terms   │                │
+         │          │ d3 = repeat(d,3)│                │
+         │          │ t = exp(-β_c·d3)│ (transmission) │
+         │          └─────────┬───────┘                │
+         │                    │                        │
+         │              transmission t                 │
+         │                    │                        │
+         └──────────┬─────────┼─────────┬──────────────┘
+                    │         │         │
+                    ▼         ▼         ▼
+         ┌─────────────────┐  │  ┌─────────────────┐
+         │ Direct Term     │  │  │ Backscatter     │
+         │ I_direct =      │  │  │ I_back =        │
+         │ I_source ⊙ t    │  │  │ B_c ⊙ (1-t)     │
+         └─────────┬───────┘  │  └─────────┬───────┘
+                   │          │            │
+                   └──────────┼────────────┘
+                              │
+                              ▼
+                   ┌─────────────────┐
+                   │ Image Formation │
+                   │ I_observed =    │
+                   │ I_direct +      │
+                   │ I_back          │
+                   └─────────┬───────┘
+                             │
+                      I_observed [B,3,H,W]
+                       (degraded image)
+                             │
+                             ▼
+                   ┌─────────────────┐
+                   │ Feature Fusion  │
+                   │ m = cat(t,      │
+                   │    I_observed,  │
+                   │    I_source)    │
+                   │ [B,9,H,W]       │
+                   └─────────┬───────┘
+                             │
+                             ▼
+                   ┌─────────────────┐
+                   │ Neural MLP      │
+                   │ [γ,δ] = MLP(m)  │
+                   └─────────┬───────┘
+                             │
+                             ▼
+                   ┌─────────────────┐
+                   │ Feature Mod     │
+                   │ out = γ⊙feat+δ  │
+                   └─────────────────┘
+```
+
+### **📊 当前版本 vs 完整版本对比**
+
+| 方面 | 当前简化版本 | 完整物理版本 |
+|------|-------------|-------------|
+| **物理建模** | 仅透射项 `t` | 透射 + 背景散射 |
+| **公式** | `特征调制` | `I = I₀·t + B·(1-t)` |
+| **B_c 使用** | ❌ 未使用 | ✅ 背景光散射 |
+| **复杂度** | 简单特征拼接 | 完整图像重建 |
+| **优势** | 训练稳定，计算高效 | 物理完备，理论严格 |
+| **劣势** | 物理不完整 | 参数难辨识，训练复杂 |
+
+### **🔍 为什么采用简化版本？**
+
+1. **参数辨识性问题**: `I = I₀·exp(-βd) + B·(1-exp(-βd))` 中 I₀、β、B 相互耦合难分离
+2. **监督信号缺失**: 缺少 I₀、B 的真值标签，无法约束物理参数
+3. **训练稳定性**: B_c 与 δ 参数功能重叠，容易产生梯度冲突
+4. **实用性考虑**: 当前的神经调制已能隐式学习背景光效应
+
+未来可考虑引入物理先验（水体类型、颜色锚点）来启用完整的 Beer-Lambert 建模。
+
+### 🌊 深度图到物理调制层的映射流程
+
+本节详细描述深度图是如何从预测阶段传递到两个物理调制层(PSF-PML和BL-PML)的完整映射流程。
+
+#### 📈 第一阶段：深度预测生成
+
+深度图的预测在模型的Pass-1阶段完成：
+
+```python
+# 在 UnderwaterEnhanceNet.forward() 中：
+# Pass-1: RGB编码器 + DepthDecoder 预测深度
+depth_pred, depth_feats = self.depth_decoder(bottleneck_pass1, student_feats_pass1)
+# depth_pred: [B, 1, H, W] - 全分辨率连续深度预测图
+```
+
+#### 🔄 第二阶段：动态空间插值映射
+
+在`MultiTaskDecoder`中，**同一个`depth_pred`**会被动态插值到不同解码层的特征图尺寸，但两个分支的预处理方式不同：
+
+##### 去模糊分支 (PSFPML)
+```python
+# 在每个解码层 i：
+# 1️⃣ 深度归一化到[0,1]
+d_min = torch.amin(depth_pred, dim=(2, 3), keepdim=True)  # [B, 1, 1, 1]
+d_max = torch.amax(depth_pred, dim=(2, 3), keepdim=True)  # [B, 1, 1, 1]
+depth_norm = (depth_pred - d_min) / (d_max - d_min + 1e-6)  # [B, 1, H, W]
+
+# 2️⃣ 空间插值到当前层特征尺寸
+depth_norm_resized = F.interpolate(depth_norm, size=fused.shape[-2:], 
+                                 mode='bilinear', align_corners=False)
+# 从 [B, 1, H, W] → [B, 1, H_i, W_i]
+
+# 3️⃣ 传递给PSF-PML
+fused = self.deblur_pmls[i](fused, depth_norm_resized, blur_scale)
+```
+
+##### 颜色分支 (BeerLambertPML)
+```python
+# 在每个解码层 i：
+# 1️⃣ 空间插值原始深度图（像素值[2000,65535]）
+depth_resized = F.interpolate(depth_pred, size=fused.shape[-2:], 
+                            mode='bilinear', align_corners=False)
+# 从 [B, 1, H, W] → [B, 1, H_i, W_i]
+
+# 2️⃣ 像素值 → 物理深度（米）映射
+depth_meters = (depth_resized - self.depth_raw_min) / (self.depth_raw_max - self.depth_raw_min + 1e-6)
+depth_meters = torch.clamp(depth_meters, 0.0, 1.0)  # 归一化到[0,1]
+depth_meters = depth_meters * (self.depth_meter_max - self.depth_meter_min) + self.depth_meter_min
+# [2000,65535] → [0,1] → [0.1m, 30m]
+
+# 3️⃣ 同时插值原始图像
+raw_resized = F.interpolate(raw, size=fused.shape[-2:], 
+                          mode='bilinear', align_corners=False)
+
+# 4️⃣ 传递给Beer-Lambert PML（使用物理深度）
+fused = self.color_pmls[i](fused, raw_resized, depth_meters, beta_c, B_c)
+```
+
+#### 🎯 第三阶段：物理调制中的深度使用
+
+两种PML对深度图的**通道处理**有本质差异：
+
+##### PSFPML - 保持单通道（空间现象）
+```python
+def forward(self, feat, depth_norm, blur_scale):
+    # depth_norm: [B, 1, H_i, W_i] - 保持1通道
+    
+    # 计算深度相关的模糊强度
+    sigma = blur_scale * depth_norm  # [B, 1, H_i, W_i]
+    # ↑ 深度越大 → 模糊越强（对所有RGB通道相同）
+    
+    # 预测调制参数并应用
+    delta = self.fc2(F.relu(self.fc1(sigma)))  # 从1通道预测C通道补偿
+    return feat + delta
+```
+
+**物理原理**：模糊是**空间现象**，相同深度对RGB三通道产生相同程度的模糊
+
+##### BeerLambertPML - 复制成三通道（光谱现象）
+```python
+def forward(self, feat, I_raw, depth, beta_c, B_c):
+    # depth: [B, 1, H_i, W_i] - 输入1通道
+    
+    # 🔥 关键：复制成3通道以匹配RGB光谱衰减
+    depth_3ch = depth.repeat(1, 3, 1, 1)  # [B, 3, H_i, W_i]
+    
+    # Beer-Lambert计算（RGB各通道独立衰减）
+    t = torch.exp(-beta_c * depth_3ch)    # [B,3,1,1] × [B,3,H,W] = [B,3,H,W]
+    #             ↑RGB独立的消光系数      ↑RGB三通道深度
+    b = 1 - t                             # [B, 3, H, W]
+    I_tilde = 2 * I_raw - 1               # [B, 3, H, W]
+    
+    # 物理特征拼接并预测调制参数
+    m = torch.cat([t, b, I_tilde], dim=1)     # [B, 9, H_i, W_i]
+    gamma, delta = torch.chunk(self.fc2(F.relu(self.fc1(m))), 2, dim=1)
+    return gamma * feat + delta
+```
+
+**物理原理**：光衰减是**光谱相关的**，RGB三通道有不同的衰减系数
+- 红光：β_R ≈ 1.0 (衰减快，传播近)
+- 绿光：β_G ≈ 0.5 (中等衰减)  
+- 蓝光：β_B ≈ 0.2 (衰减慢，传播远)
+
+#### 📊 多尺度映射示例
+
+```
+原始深度预测: depth_pred [B, 1, 256, 256] (像素值 2000-65535)
+                        │
+                ┌───────┴───────┐
+                │               │
+             去模糊分支        颜色分支
+                │               │
+         Level 0: 64×64    Level 0: 64×64
+         ┌────────────┐    ┌────────────┐
+         │depth_norm  │    │depth_resized│
+         │[B,1,64,64] │    │[B,1,64,64] │
+         │归一化[0,1] │    │像素值[2000,65535]│
+         └──────┬─────┘    └──────┬─────┘
+                │                 │
+                │                 ▼ 像素→米映射
+                │           ┌────────────┐
+                │           │depth_meters│
+                │           │[B,1,64,64] │
+                │           │物理深度[0.1m,30m]│
+                │           └──────┬─────┘
+                │                 │
+                │                 ▼ repeat(1,3,1,1)
+                │           ┌────────────┐
+                │           │depth_3ch   │
+                │           │[B,3,64,64] │
+                │           └──────┬─────┘
+                │                 │
+       ┌────▼────┐      ┌─────▼─────┐
+       │PSF-PML  │      │BL-PML     │
+       │sigma计算│      │Beer-Lambert│
+       │1ch→Cch │      │9ch→2Cch   │
+       └─────────┘      └───────────┘
+            
+     Level 1: 128×128   Level 1: 128×128
+     ┌────────────┐    ┌────────────┐
+     │depth_norm  │    │depth_3ch   │
+     │[B,1,128,128]│   │[B,3,128,128]│
+     └──────┬─────┘    └──────┬─────┘
+            │                 │
+       ┌────▼────┐      ┌─────▼─────┐
+       │PSF-PML  │      │BL-PML     │
+       └─────────┘      └───────────┘
+```
+
+#### 🔑 关键设计特点
+
+1. **深度图复用**：同一个预测深度图被两个分支重复使用，通过双线性插值适配不同分辨率
+2. **差异化预处理**：
+   - PSF分支：深度归一化到[0,1]，关注相对深度差异
+   - 颜色分支：保持原始深度值，用于精确的物理计算
+3. **通道处理差异**：
+   - PSFPML：保持单通道，体现模糊的空间一致性
+   - BeerLambertPML：复制为三通道，体现光谱衰减的差异性
+4. **梯度截断**：两个PML中都使用`depth.detach()`防止物理调制影响深度预测的梯度更新
+5. **逐层自适应**：每个解码层都有独立的物理调制，实现多尺度物理建模
+
+#### 💡 物理原理对比总结
+
+| 特征 | **PSFPML** | **BeerLambertPML** |
+|------|------------|-------------------|
+| **物理现象** | 深度相关模糊（PSF扩散） | 光谱衰减（Beer-Lambert定律） |
+| **深度预处理** | 归一化到[0,1] | 保持原始物理值 |
+| **通道处理** | 保持1通道 | 复制为3通道 |
+| **物理依据** | 模糊对所有颜色影响相同 | RGB光谱有不同衰减系数 |
+| **调制方式** | 加性调制: `feat + δ` | 仿射变换: `γ×feat + δ` |
+| **输入通道** | 1通道深度 | 9通道物理特征 |
 
 ---
 
@@ -543,3 +872,172 @@ Backbone通过一系列下采样操作来提取多尺度特征。在第 `i` 级�
     *   尺寸保持不变: `(H_0 / 2^{i+1}, W_0 / 2^{i+1})`
 
 这个过程会一直持续到最后一层解码器 (j=L-2, i=0)，最终输出一个尺寸为 `(H_0/2, W_0/2)`，通道数为 `C_base` 的特征图，该特征图将被送入重建头（Recon Head）以生成最终的残差图像。 
+
+### 📐 深度标定（像素→米）与分支差异
+
+- **PSF-PML（去模糊分支）使用 depth_norm：**
+  - 目的：表达“相对深浅”决定模糊强度，与物理单位无强约束。
+  - 做法：对每张图按其[min, max]归一化到[0,1]，再与`blur_scale`相乘生成σ，体现相对模糊程度。
+
+- **BL-PML（颜色分支）使用米制深度：**
+  - 目的：Beer-Lambert 定律 t = exp(-β·d) 需要“物理绝对深度”d（单位：米），与光谱消光系数β匹配。
+  - 做法：将DepthDecoder输出的原始深度像素值（如2000–65535）先缩放到[0,1]，再映射到物理范围[0.1m, 30m]，然后输入BL-PML。
+
+```python
+# MultiTaskDecoder.__init__(...,
+#   depth_raw_min=2000.0, depth_raw_max=65535.0,
+#   depth_meter_min=0.1, depth_meter_max=30.0)
+
+# 在颜色分支每层：像素→米，再喂给BL-PML
+depth_meters = (depth_resized - self.depth_raw_min) / (self.depth_raw_max - self.depth_raw_min + 1e-6)
+depth_meters = torch.clamp(depth_meters, 0.0, 1.0)
+depth_meters = depth_meters * (self.depth_meter_max - self.depth_meter_min) + self.depth_meter_min
+fused = self.color_pmls[i](fused, raw_resized, depth_meters, beta_c, B_c)
+```
+
+- **直观理解**：
+  - 去模糊看"谁更远谁更模糊"→ 用归一化深度，鲁棒且快速收敛。
+  - 颜色衰减看"水下绝对距离多长"→ 用米制深度，保持β与d的物理耦合关系。
+
+---
+
+## 🎯 颜色恢复解码器最终输出与残差融合
+
+### 📤 MultiTaskDecoder 最终输出机制
+
+MultiTaskDecoder 通过两个并行分支分别生成去模糊残差和颜色校正残差，然后在重建头中与原始图像进行残差融合。
+
+```
+MultiTaskDecoder 输出流程:
+                    
+            ┌─────────────────┐     ┌─────────────────┐
+            │   去模糊分支      │     │   颜色校正分支    │
+            │                 │     │                 │
+            │ x_deblur        │     │ x_color         │
+            │ [B,C,H/2,W/2]   │     │ [B,C,H/2,W/2]   │
+            └─────────┬───────┘     └─────────┬───────┘
+                      │                       │
+            ┌─────────▼───────┐     ┌─────────▼───────┐
+            │ deblur_recon    │     │ color_recon     │
+            │ Conv2d(C→3)     │     │ Conv2d(C→3)     │
+            └─────────┬───────┘     └─────────┬───────┘
+                      │                       │
+                 res_d [B,3,H/2,W/2]   res_c [B,3,H/2,W/2]
+                      │                       │
+                      └───────────┬───────────┘
+                                  │
+                            MultiTaskDecoder
+                            return res_d, res_c
+```
+
+#### 🔧 重建头 (ReconHead) 残差融合
+
+```
+ReconHead 残差融合机制:
+
+       raw [B,3,H,W]        res_d [B,3,H/2,W/2]    res_c [B,3,H/2,W/2]
+           │                         │                       │
+           │                ┌────────▼────────┐     ┌────────▼────────┐
+           │                │ Bilinear        │     │ Bilinear        │
+           │                │ Interpolate     │     │ Interpolate     │
+           │                │ → [B,3,H,W]     │     │ → [B,3,H,W]     │
+           │                └────────┬────────┘     └────────┬────────┘
+           │                         │                       │
+           └─────────────────────────┼───────────────────────┘
+                                     │
+                           ┌─────────▼─────────┐
+                           │ enhanced =        │
+                           │ raw + res_d + res_c│
+                           └─────────┬─────────┘
+                                     │
+                           ┌─────────▼─────────┐
+                           │ tanh(enhanced)    │ 激活到[-1,1]
+                           └─────────┬─────────┘
+                                     │
+                                 final_output [B,3,H,W]
+```
+
+**关键特性：**
+- **双残差机制**: `enhanced = raw + res_d + res_c`
+- **尺寸自适应**: 自动将残差插值到原图分辨率
+- **tanh激活**: 确保输出在 `[-1,1]` 范围内
+- **物理意义**: `res_d` 修复高频细节，`res_c` 修复低频颜色偏移
+
+---
+
+## 🔍 深度解码器最终输出与投影
+
+### 📈 DepthDecoder 深度预测生成
+
+DepthDecoder 采用 U-Net 架构，结合 RGB→Depth 交叉注意力，生成连续深度预测图。
+
+```
+DepthDecoder 最终输出机制:
+
+                    x [B,48,H,W]  ← 最终解码特征
+                           │
+                  ┌────────▼────────┐
+                  │  Prediction     │
+                  │  Head (3×3)     │ 
+                  └────────┬────────┘
+                           │
+                    raw_pred [B,1,H,W]  ← 原始预测
+                           │
+                  ┌────────▼────────┐
+                  │      Tanh       │  将输出限制到[-1,1]
+                  └────────┬────────┘
+                           │
+                normalized_pred [-1,1]
+                           │
+                  ┌────────▼────────┐
+                  │   Normalize     │  (pred + 1) / 2
+                  │   [0,1]         │
+                  └────────┬────────┘
+                           │
+                    norm_pred [0,1]
+                           │
+                  ┌────────▼────────┐
+                  │ Depth Mapping   │  norm * (max-min) + min
+                  │ [2000, 65535]   │  像素值范围
+                  └────────┬────────┘
+                           │
+                   depth_pred [B,1,H,W]  ← 最终深度图
+```
+
+#### 🎯 深度范围投影机制
+
+```python
+# DepthDecoder 深度投影代码
+raw_pred = self.pred(x)                    # Conv2d(48→1)
+normalized_pred = torch.tanh(raw_pred)     # 激活到[-1,1]
+normalized_pred = (normalized_pred + 1.0) / 2.0  # 映射到[0,1]
+
+# 投影到实际深度范围 [2000, 65535] 像素值
+depth_pred = normalized_pred * (self.max_depth - self.min_depth) + self.min_depth
+```
+
+**深度输出特性：**
+- **连续预测**: 输出连续深度值，非离散标签
+- **像素值范围**: `[2000, 65535]` 对应真实深度传感器范围
+- **tanh约束**: 防止深度预测发散，提升训练稳定性
+- **自适应范围**: 可配置 `min_depth` 和 `max_depth` 参数
+
+#### 📊 深度特征传递 (depth_feats)
+
+DepthDecoder 不仅输出深度预测，还提供多尺度深度特征用于 RGB 引导：
+
+```
+depth_feats 构建机制:
+
+Level 0 (浅层):  x [B,48,H,W]         ← 最终解码特征
+Level 1:         level_features[-1]   ← 96通道中间特征  
+Level 2:         level_features[-2]   ← 192通道中间特征
+Level 3 (深层):  original_bottleneck  ← 384通道瓶颈特征
+
+返回: depth_feats = [feat_48, feat_96, feat_192, feat_384]
+```
+
+**特征传递用途：**
+- **Cross-Attention**: 为 RGB 编码器提供深度引导信息
+- **多尺度融合**: 不同层级的深度语义用于不同分辨率的 RGB 特征
+- **梯度流通**: 实现深度到 RGB 的有效梯度传播

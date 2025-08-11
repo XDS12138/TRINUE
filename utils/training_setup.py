@@ -166,13 +166,17 @@ def _create_model(config, device):
 def _create_criterion(config, device):
     """创建损失函数"""
     criterion = TotalLoss(
-        lambda_img=config['loss']['lambda_img'],
-        lambda_ssim=config['loss']['lambda_ssim'],
-        lambda_perc=config['loss']['lambda_perc'],
-        lambda_fft=config['loss']['lambda_fft'],
-        lambda_grad=config['loss']['lambda_grad'],
-        lambda_depth=config['loss']['lambda_depth'],
         lambda_smooth=config['loss']['lambda_smooth'],
+        # fine-grained lambdas (manual weighting)
+        lambda_img_l1=config['loss'].get('lambda_img_l1', 1.0),
+        lambda_img_ssim=config['loss'].get('lambda_img_ssim', 1.0),
+        lambda_img_perc=config['loss'].get('lambda_img_perc', 1.0),
+        lambda_img_fft=config['loss'].get('lambda_img_fft', 1.0),
+        lambda_img_grad=config['loss'].get('lambda_img_grad', 1.0),
+        lambda_depth_decoder=config['loss'].get('lambda_depth_decoder', 1.0),
+        lambda_depth_smooth=config['loss'].get('lambda_depth_smooth', 1.0),
+        lambda_depth_rec=config['loss'].get('lambda_depth_rec', 1.0),
+        lambda_cons=config['loss'].get('lambda_attncons', 1.0),
         
         # 🔥 CMCL相关参数
         lambda_cmcl=config['loss'].get('lambda_cmcl', 0.1),

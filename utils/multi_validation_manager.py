@@ -371,10 +371,16 @@ class MultiValidationManager:
                 # 解析批次数据
                 raw_imgs, depth_gt, gt = self._parse_batch_data(batch, val_type)
                 
-                # 前向传播
-                outputs = model.multi_forward(raw_imgs, depth_gt, gt)
+                # 前向传播（统一入口，兼容DDP返回dict）
+                outputs = model(raw_imgs, depth_gt, gt, enable_multi_input_consistency=False)
+                if isinstance(outputs, dict):
+                    out_enhanced = outputs.get('enhanced')
+                    out_depth = outputs.get('depth_pred')
+                else:
+                    out_enhanced = outputs.enhanced
+                    out_depth = outputs.depth_pred
                 
-                # 计算指标
+                # 计算指标（函数内部也将兼容dict/对象）
                 batch_metrics = self._compute_batch_metrics(
                     outputs, gt, depth_gt, val_set['metrics'], val_type, val_set
                 )
@@ -387,7 +393,7 @@ class MultiValidationManager:
                 # 保存图像
                 if saved_images < max_save_images:
                     self._save_comparison_images(
-                        raw_imgs, outputs.enhanced, gt, depth_gt, outputs.depth_pred,
+                        raw_imgs, out_enhanced, gt, depth_gt, out_depth,
                         save_dir, saved_images, val_type, batch_metrics
                     )
                     saved_images += 1
@@ -453,7 +459,7 @@ class MultiValidationManager:
         try:
             if val_type in ['enhancement_with_reference', 'enhancement_no_reference']:
                 # 图像增强指标
-                enhanced = outputs.enhanced
+                enhanced = outputs['enhanced'] if isinstance(outputs, dict) else outputs.enhanced
                 if enhanced is None:
                     return batch_metrics
                 
@@ -510,7 +516,8 @@ class MultiValidationManager:
             
             elif val_type == 'depth_prediction':
                 # 深度预测指标
-                if outputs.depth_pred is not None and depth_gt is not None:
+                out_depth = outputs['depth_pred'] if isinstance(outputs, dict) else outputs.depth_pred
+                if out_depth is not None and depth_gt is not None:
                     # 从配置中获取深度评估参数
                     val_config = val_set['config']
                     depth_params = {
@@ -521,7 +528,7 @@ class MultiValidationManager:
                     }
                     
                     depth_metrics = evaluate_depth_estimation(
-                        outputs.depth_pred, depth_gt, **depth_params
+                        out_depth, depth_gt, **depth_params
                     )
                     
                     for metric_name in metrics_list:
@@ -610,14 +617,17 @@ class MultiValidationManager:
             file_exists = os.path.exists(csv_path)
             
             with open(csv_path, 'a', newline='') as csvfile:
-                fieldnames = ['epoch'] + list(metrics.keys())
+                # 使用配置定义的指标顺序，缺失用空值占位，确保列稳定
+                requested = val_set.get('metrics', [])
+                fieldnames = ['epoch'] + requested
                 writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
                 
                 if not file_exists:
                     writer.writeheader()
                 
                 row = {'epoch': epoch + 1}
-                row.update(metrics)
+                for m in requested:
+                    row[m] = metrics.get(m, '')
                 writer.writerow(row)
                 
             self.val_logger.info(f"验证集 {val_set['name']} 结果已保存到: {csv_path}")
@@ -636,23 +646,24 @@ class MultiValidationManager:
             
             # 准备数据行
             row_data = {'epoch': epoch + 1}
-            for set_id, metrics in all_results.items():
-                set_name = self.validation_sets[set_id]['name']
-                for metric_name, metric_value in metrics.items():
-                    row_data[f"{set_name}_{metric_name}"] = metric_value
+            # 遍历所有验证集，按配置顺序稳定写列
+            for set_id, set_cfg in self.validation_sets.items():
+                set_name = set_cfg['name']
+                requested = set_cfg.get('metrics', [])
+                results = all_results.get(set_id, {}) or {}
+                for metric_name in requested:
+                    key = f"{set_name}_{metric_name}"
+                    row_data[key] = results.get(metric_name, '')
             
             # 检查文件是否存在
             file_exists = os.path.exists(comprehensive_csv)
             
             with open(comprehensive_csv, 'a', newline='') as csvfile:
-                if row_data:
-                    fieldnames = list(row_data.keys())
-                    writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-                    
-                    if not file_exists:
-                        writer.writeheader()
-                    
-                    writer.writerow(row_data)
+                fieldnames = list(row_data.keys())
+                writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+                if not file_exists:
+                    writer.writeheader()
+                writer.writerow(row_data)
             
             self.val_logger.info(f"综合验证结果已保存到: {comprehensive_csv}")
             

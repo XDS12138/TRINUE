@@ -66,9 +66,8 @@ class MultiFileLogger:
         if self.console_level <= logging.DEBUG:
             self.console_categories = list(self.categories.keys())
 
-        # 创建日志目录结构
-        for cat in list(self.categories.keys()) + ['general']:
-            os.makedirs(os.path.join(self.log_dir, cat), exist_ok=True)
+        # 创建日志目录结构（统一到单一目录，不再为每个类别创建子目录）
+        os.makedirs(self.log_dir, exist_ok=True)
 
         # 各logger实例及其当前文件handler
         self.loggers = {}
@@ -139,13 +138,22 @@ class MultiFileLogger:
         warnings.showwarning = custom_showwarning
 
     def _attach_epoch_file_handlers(self, epoch: int):
-        """为所有logger创建按epoch划分的文件handler"""
+        """为所有logger创建单一的按epoch划分的文件handler（所有类别写入同一文件）"""
         if self.current_epoch == epoch:
             return
 
         self.current_epoch = epoch
 
-        # 更新为新定义的日志类别
+        # 统一日志文件路径：每个epoch一个文件
+        file_path = os.path.join(self.log_dir, f'epoch_{epoch+1}.log')
+        os.makedirs(os.path.dirname(file_path), exist_ok=True)
+
+        # 准备新的单文件handler
+        new_handler = logging.FileHandler(file_path, encoding='utf-8')
+        new_handler.setLevel(self.file_level)
+        new_handler.setFormatter(self.file_formatter)
+
+        # 目标：所有类别logger + 根logger都挂载相同的文件handler
         target_categories = list(self.categories.keys()) + ['general']
 
         for cat in target_categories:
@@ -155,17 +163,14 @@ class MultiFileLogger:
             old_handler = self.file_handlers.get(cat)
             if old_handler:
                 logger.removeHandler(old_handler)
-                old_handler.close()
+                try:
+                        old_handler.close()
+                except Exception:
+                    pass
 
-            file_path = os.path.join(self.log_dir, cat, f'epoch_{epoch+1}.log')
-            os.makedirs(os.path.dirname(file_path), exist_ok=True)
-
-            handler = logging.FileHandler(file_path, encoding='utf-8')
-            handler.setLevel(self.file_level)
-            handler.setFormatter(self.file_formatter)
-            logger.addHandler(handler)
-
-            self.file_handlers[cat] = handler
+            # 附加新的handler
+            logger.addHandler(new_handler)
+            self.file_handlers[cat] = new_handler
     
     def get_logger(self, logger_type: str) -> logging.Logger:
         """
@@ -179,7 +184,7 @@ class MultiFileLogger:
         """
         if logger_type not in self.categories:
             self.loggers['warning'].warning(f"请求了未知类型的logger: '{logger_type}'，使用debug logger代替")
-            return self.loggers['debug']
+            return self.loggers['train']
         return self.loggers[logger_type]
     
     def log_training_start(self, config: dict):

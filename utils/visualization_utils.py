@@ -61,7 +61,7 @@ def log_training_visualization(raw_imgs, outputs, depth_gt, gt, metric_logger,
     
     Args:
         raw_imgs: 输入图像
-        outputs: 模型输出
+        outputs: 模型输出（支持dict或对象）
         depth_gt: 深度真值
         gt: 图像真值
         metric_logger: 指标记录器
@@ -83,22 +83,52 @@ def log_training_visualization(raw_imgs, outputs, depth_gt, gt, metric_logger,
         vis_depth_first_item = depth_gt[0].unsqueeze(0) if depth_gt is not None else None
         vis_gt_first_item = gt[0].unsqueeze(0) if gt is not None else None
 
+        # 解析输出（兼容 dict / 对象）
+        if isinstance(outputs, dict):
+            out_enh = outputs.get('enhanced')
+            out_pred_gate = outputs.get('pred_gate')
+            out_depth = outputs.get('depth_pred')
+            out_feats = outputs.get('student_feats')
+            out_attn = outputs.get('attention_maps')
+        else:
+            out_enh = getattr(outputs, 'enhanced', None)
+            out_pred_gate = getattr(outputs, 'pred_gate', None)
+            out_depth = getattr(outputs, 'depth_pred', None)
+            out_feats = getattr(outputs, 'student_feats', None)
+            out_attn = getattr(outputs, 'attention_maps', None)
+
         # 记录深度相关可视化
         if vis_depth_first_item is not None:
             _log_depth_visualization(vis_depth_first_item, metric_logger, step, config, vis_logger)
 
         with torch.no_grad():
-            # 模型前向传播，获取可视化数据
-            _log_model_outputs(raw_imgs[0:1], vis_depth_first_item, vis_gt_first_item,
-                             outputs, metric_logger, step, vis_logger)
+            # 模型输出可视化
+            _log_model_outputs(
+                vis_raw_first_item,
+                vis_depth_first_item,
+                vis_gt_first_item,
+                out_enh,
+                out_pred_gate,
+                out_depth,
+                out_attn,
+                metric_logger,
+                step,
+                vis_logger
+            )
             
             # 记录RGB图像对比
-            _log_rgb_comparison(vis_raw_first_item, outputs.enhanced[0:1] if outputs.enhanced is not None else None,
-                              vis_gt_first_item, metric_logger, step, vis_logger)
+            _log_rgb_comparison(
+                vis_raw_first_item,
+                out_enh[0:1] if out_enh is not None else None,
+                vis_gt_first_item,
+                metric_logger,
+                step,
+                vis_logger
+            )
             
             # 记录特征图
-            if outputs.student_feats:
-                _log_feature_maps(outputs.student_feats, metric_logger, step, vis_logger)
+            if out_feats:
+                _log_feature_maps(out_feats, metric_logger, step, vis_logger)
 
         vis_logger.info(f"======== 可视化数据记录完成，步骤: {step} ========")
         
@@ -129,20 +159,15 @@ def _log_depth_visualization(depth_gt, metric_logger, step, config, vis_logger):
     vis_logger.info(f"  - 已记录 'train/depth_gt_normalized'")
 
 
-def _log_model_outputs(vis_raw, vis_depth, vis_gt, outputs, metric_logger, step, vis_logger):
-    """记录模型输出可视化"""
-    # 解析输出结果
-    vis_outputs = outputs.enhanced[0:1] if outputs.enhanced is not None else None
-    vis_pred_gate = outputs.pred_gate[0:1] if outputs.pred_gate is not None else None
-    vis_depth_pred = outputs.depth_pred[0:1] if outputs.depth_pred is not None else None
-    attention_maps = outputs.attention_maps if hasattr(outputs, 'attention_maps') else None
-    
+def _log_model_outputs(vis_raw, vis_depth, vis_gt, enhanced, pred_gate, depth_pred, attention_maps, metric_logger, step, vis_logger):
+    """记录模型输出可视化（兼容dict提取后的张量）"""
     # 可视化注意力图（如果有）
     if attention_maps is not None:
         _log_attention_maps(attention_maps, metric_logger, step, vis_logger)
     
     # 连续深度预测可视化
-    if vis_depth_pred is not None:
+    if depth_pred is not None:
+        vis_depth_pred = depth_pred[0:1]
         depth_pred_norm = vis_depth_pred.clone().detach()
         if depth_pred_norm.min() != depth_pred_norm.max():
             depth_pred_norm = (depth_pred_norm - depth_pred_norm.min()) / (depth_pred_norm.max() - depth_pred_norm.min())
@@ -150,8 +175,8 @@ def _log_model_outputs(vis_raw, vis_depth, vis_gt, outputs, metric_logger, step,
         vis_logger.info(f"  - 已记录 'depth_pred_continuous'")
     
     # 深度门控可视化
-    if vis_pred_gate is not None:
-        _log_depth_gate_visualization(vis_pred_gate, metric_logger, step, vis_logger)
+    if pred_gate is not None:
+        _log_depth_gate_visualization(pred_gate[0:1], metric_logger, step, vis_logger)
 
 
 def _log_attention_maps(attention_maps, metric_logger, step, vis_logger):

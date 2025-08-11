@@ -8,8 +8,36 @@
 import os
 import logging
 from torch.utils.data import DataLoader
+import torch
 
 logger = logging.getLogger(__name__)
+
+
+def multi_degradation_collate_fn_global(batch):
+    """Top-level collate_fn to support multiprocessing pickling (DDP + spawn)."""
+    raw_imgs = []
+    depths = []
+    gts = []
+    num_degradations = []
+    basenames = []
+    for sample in batch:
+        raw_imgs.append(sample['raw_imgs'])  # [N, C, H, W]
+        depths.append(sample['depth'])       # [1, H, W]
+        gts.append(sample['gt'])             # [C, H, W]
+        num_degradations.append(sample['num_degradations'])
+        basenames.append(sample['basename'])
+    
+    raw_imgs_batch = torch.stack(raw_imgs, dim=0)  # [B, N, C, H, W]
+    depths_batch = torch.stack(depths, dim=0)      # [B, 1, H, W]
+    gts_batch = torch.stack(gts, dim=0)            # [B, C, H, W]
+    
+    return {
+        'raw_imgs': raw_imgs_batch,
+        'depth': depths_batch,
+        'gt': gts_batch,
+        'num_degradations': torch.tensor(num_degradations),
+        'basename': basenames
+    }
 
 
 def prepare_data(config, args):
@@ -66,6 +94,36 @@ def prepare_data(config, args):
     prefetch_factor = config['data'].get('prefetch_factor', 2)
     pin_memory = config['data'].get('pin_memory', True)
     
+    # 🔥 创建自定义的collate函数，正确处理多退化数据
+    def multi_degradation_collate_fn(batch):
+        """处理多退化数据的collate函数"""
+        import torch
+        raw_imgs = []
+        depths = []
+        gts = []
+        num_degradations = []
+        basenames = []
+        
+        for sample in batch:
+            raw_imgs.append(sample['raw_imgs'])  # [N, C, H, W]
+            depths.append(sample['depth'])       # [1, H, W] 
+            gts.append(sample['gt'])             # [C, H, W]
+            num_degradations.append(sample['num_degradations'])
+            basenames.append(sample['basename'])
+        
+        # 堆叠为batch格式
+        raw_imgs_batch = torch.stack(raw_imgs, dim=0)  # [B, N, C, H, W]
+        depths_batch = torch.stack(depths, dim=0)      # [B, 1, H, W]
+        gts_batch = torch.stack(gts, dim=0)            # [B, C, H, W] 
+        
+        return {
+            'raw_imgs': raw_imgs_batch,
+            'depth': depths_batch,
+            'gt': gts_batch,
+            'num_degradations': torch.tensor(num_degradations),
+            'basename': basenames
+        }
+    
     # 数据加载器
     train_loader = DataLoader(
         train_dataset,
@@ -76,7 +134,8 @@ def prepare_data(config, args):
         sampler=train_sampler,
         drop_last=True,
         persistent_workers=persistent_workers if num_workers > 0 else False,
-        prefetch_factor=prefetch_factor if num_workers > 0 else None
+        prefetch_factor=prefetch_factor if num_workers > 0 else None,
+        collate_fn=multi_degradation_collate_fn_global  # 🔥 使用顶层可picklable的collate函数
     )
     
     # 只有当val_dataset不为None时才创建val_loader

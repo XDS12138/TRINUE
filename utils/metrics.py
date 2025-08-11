@@ -45,11 +45,15 @@ def calculate_psnr(img1, img2):
         psnr_value: PSNR值
     """
     try:
-        # 确保图像在[0, 1]范围内
-        if img1.max() > 1.0:
-            img1 = img1.astype(np.float32) / 255.0
-        if img2.max() > 1.0:
-            img2 = img2.astype(np.float32) / 255.0
+        # 转为float并规范范围
+        img1 = img1.astype(np.float32)
+        img2 = img2.astype(np.float32)
+        if img1.max() > 1.5:
+            img1 = img1 / 255.0
+        if img2.max() > 1.5:
+            img2 = img2 / 255.0
+        img1 = np.clip(img1, 0.0, 1.0)
+        img2 = np.clip(img2, 0.0, 1.0)
         
         if SKIMAGE_AVAILABLE:
             return psnr_skimage(img1, img2, data_range=1.0)
@@ -63,6 +67,7 @@ def calculate_psnr(img1, img2):
         print(f"Error calculating PSNR: {e}")
         return 0.0
 
+
 def calculate_ssim(img1, img2):
     """
     计算SSIM (Structural Similarity Index)
@@ -75,19 +80,28 @@ def calculate_ssim(img1, img2):
         ssim_value: SSIM值
     """
     try:
-        # 确保图像在[0, 1]范围内
-        if img1.max() > 1.0:
-            img1 = img1.astype(np.float32) / 255.0
-        if img2.max() > 1.0:
-            img2 = img2.astype(np.float32) / 255.0
+        # 转为float并规范范围
+        img1 = img1.astype(np.float32)
+        img2 = img2.astype(np.float32)
+        if img1.max() > 1.5:
+            img1 = img1 / 255.0
+        if img2.max() > 1.5:
+            img2 = img2 / 255.0
+        img1 = np.clip(img1, 0.0, 1.0)
+        img2 = np.clip(img2, 0.0, 1.0)
         
         if SKIMAGE_AVAILABLE:
-            if len(img1.shape) == 3:
-                # 彩色图像
-                return ssim_skimage(img1, img2, multichannel=True, data_range=1.0)
-            else:
-                # 灰度图像
-                return ssim_skimage(img1, img2, data_range=1.0)
+            # 兼容新版/旧版skimage API
+            try:
+                if len(img1.shape) == 3:
+                    return ssim_skimage(img1, img2, channel_axis=-1, data_range=1.0)
+                else:
+                    return ssim_skimage(img1, img2, data_range=1.0)
+            except TypeError:
+                if len(img1.shape) == 3:
+                    return ssim_skimage(img1, img2, multichannel=True, data_range=1.0)
+                else:
+                    return ssim_skimage(img1, img2, data_range=1.0)
         else:
             # 简化的SSIM计算（基于均值和方差）
             if len(img1.shape) == 3:
@@ -106,7 +120,7 @@ def calculate_ssim(img1, img2):
             
             ssim_val = ((2 * mu1 * mu2 + C1) * (2 * sigma12 + C2)) / \
                       ((mu1 ** 2 + mu2 ** 2 + C1) * (sigma1 + sigma2 + C2))
-            return ssim_val
+            return float(ssim_val)
     except Exception as e:
         print(f"Error calculating SSIM: {e}")
         return 0.0

@@ -57,21 +57,20 @@ class CrossAttention(nn.Module):
         x = x.view(B, C, Hp//ws, ws, Wp//ws, ws)       # B,C,Nh,ws,Nw,ws
         x = x.permute(0, 2, 4, 1, 3, 5).contiguous()   # B,Nh,Nw,C,ws,ws
         windows = x.view(-1, C, ws, ws)                # nW*B,C,ws,ws
-        return windows, (Hp, Wp)
+        return windows, (Hp, Wp, H, W)  # 保存填充后和原始尺寸
 
-    def _window_reverse(self, windows, pad_hw, B):
+    def _window_reverse(self, windows, size_info, B):
         """windows:[nW*B,C,ws,ws] → [B,C,H,W] (去掉补零)"""
         if self.window_size == 0:
             return windows
-        Hp, Wp = pad_hw
+        Hp, Wp, H, W = size_info  # 解包填充后和原始尺寸
         ws = self.window_size
         C = windows.size(1)
         x = windows.view(B, Hp//ws, Wp//ws, C, ws, ws) \
                 .permute(0, 3, 1, 4, 2, 5).contiguous() \
                 .view(B, C, Hp, Wp)
-        # 去掉 padding
-        return x[..., :Hp - (ws - Hp % ws) % ws,
-                 :Wp - (ws - Wp % ws) % ws]
+        # 直接切片到原始尺寸，避免复杂的填充计算
+        return x[..., :H, :W]
                  
     def enable_attention_saving(self, enable=True):
         """启用或禁用注意力图保存功能"""
@@ -82,8 +81,12 @@ class CrossAttention(nn.Module):
         """获取最近一次计算的注意力图"""
         return self.last_attn
 
-    def _chunked_attention(self, q, k, v):
-        """分块计算注意力，减少内存使用"""
+    def _chunked_attention(self, q, k, v, save_max_batch: int = 1):
+        """分块计算注意力，减少内存使用
+        Args:
+            q, k, v: [B_, heads, d_k, N]
+            save_max_batch: 保存注意力图时最多保留的 batch 数（避免为所有窗口分配内存）
+        """
         B_, heads, d_k, N = q.shape
         chunk_size = min(self.chunk_size, N)
         
@@ -91,31 +94,49 @@ class CrossAttention(nn.Module):
         out = torch.zeros_like(q)
         attn_weights = None
         
-        # 保存注意力权重用于可视化（仅保存第一个chunk）
+        # 仅保存最多 save_max_batch 个样本的第一个chunk的注意力（避免 B_*nW 的巨量内存）
         if self.save_attention:
             first_chunk_size = min(chunk_size, N)
-            attn_weights = torch.zeros(B_, heads, first_chunk_size, N, 
-                                     device=q.device, dtype=q.dtype)
+            B_save = min(save_max_batch, B_)
+            attn_weights = torch.zeros(B_save, heads, first_chunk_size, N,
+                                       device=q.device, dtype=q.dtype)
         
-        # 分块处理
+        scale = 1.0 / math.sqrt(self.d_k)
+        
+        # 进一步在窗口批维度 B_ 上分块，限制每次分配的注意力张量大小
+        # 目标显存预算（单次 attn_chunk），可按需调整（单位：字节）
+        target_bytes = 256 * 1024 * 1024  # 256 MB
+        elem_size = q.element_size()
+        # 单块 attn_chunk 的大小 ~ Bb * heads * chunk_size * N * elem_size
+        # 计算 B_ 分块大小以满足内存预算
+        denom = max(1, heads * chunk_size * N * elem_size)
+        b_chunk = max(1, min(B_, target_bytes // denom))
+        
+                # 分块处理
         for i in range(0, N, chunk_size):
             end_i = min(i + chunk_size, N)
-            q_chunk = q[:, :, :, i:end_i]  # [B_, heads, d_k, chunk_size]
-            
-            # 计算当前chunk的注意力
-            attn_chunk = torch.einsum('bhcI,bhcJ->bhIJ', q_chunk, k) / math.sqrt(d_k)
-            attn_chunk = torch.softmax(attn_chunk, dim=-1)
-            
-            # 保存第一个chunk的注意力权重
-            if self.save_attention and i == 0:
-                attn_weights[:, :, :, :] = attn_chunk
-            
-            # 计算输出
-            out_chunk = torch.einsum('bhIJ,bhcJ->bhcI', attn_chunk, v)
-            out[:, :, :, i:end_i] = out_chunk
-            
-            # 清理中间变量
-            del attn_chunk, out_chunk
+            # 在 B_ 维度上进一步分块
+            for b0 in range(0, B_, b_chunk):
+                b1 = min(b0 + b_chunk, B_)
+                q_chunk = q[b0:b1, :, :, i:end_i]  # [Bb, heads, d_k, chunk_size]
+                k_chunk = k[b0:b1]
+                v_chunk = v[b0:b1]
+
+                # 计算当前chunk的注意力
+                attn_chunk = torch.einsum('bhcI,bhcJ->bhIJ', q_chunk, k_chunk) * scale
+                attn_chunk = torch.softmax(attn_chunk, dim=-1)
+                
+                # 保存第一个i-chunk且第一个b-chunk的小批次注意力权重
+                if self.save_attention and i == 0 and b0 == 0 and attn_weights is not None:
+                    B_save = attn_weights.size(0)
+                    attn_weights[:, :, :, :] = attn_chunk[:B_save]
+                
+                # 计算输出
+                out_chunk = torch.einsum('bhIJ,bhcJ->bhcI', attn_chunk, v_chunk)
+                out[b0:b1, :, :, i:end_i] = out_chunk
+                
+                # 清理中间变量
+                del attn_chunk, out_chunk, q_chunk, k_chunk, v_chunk
         
         return out, attn_weights
 
@@ -146,13 +167,13 @@ class CrossAttention(nn.Module):
 
         # 窗口切分（若 ws>0 且分辨率足够大）
         if self.window_size > 0 and max(H, W) > self.window_size:
-            q, pad_hw = self._window_partition(q)
-            k, _      = self._window_partition(k)
-            v, _      = self._window_partition(v)
+            q, size_info = self._window_partition(q)
+            k, _         = self._window_partition(k)
+            v, _         = self._window_partition(v)
             B_ = q.size(0)                             # = nW*B
             H_ = W_ = self.window_size
         else:
-            pad_hw = None
+            size_info = None
             B_ = B
             H_, W_ = H, W
 
@@ -162,18 +183,13 @@ class CrossAttention(nn.Module):
         v = v.view(B_, self.heads, self.d_k, H_*W_)
         
         # 使用分块计算注意力
-        out, attn_weights = self._chunked_attention(q, k, v)
+        out, attn_weights = self._chunked_attention(q, k, v, save_max_batch=B)
         
         # 保存注意力图（如果启用）
         if self.save_attention and attn_weights is not None:
-            if pad_hw is not None:
-                # 窗口注意力情况
-                self.last_attn = attn_weights[:B, :, :, :].detach().clone()
-                # print(f"[CrossAttention] 保存窗口注意力图: shape={self.last_attn.shape}")
-            else:
-                self.last_attn = attn_weights.detach().clone()
-                # print(f"[CrossAttention] 保存全局注意力图: shape={self.last_attn.shape}")
-        
+            # 直接保存已裁剪的小批次注意力图
+            self.last_attn = attn_weights.detach().clone()
+            
             # 立即断开与原始计算图的所有连接
             self.last_attn.requires_grad_(False)
             
@@ -181,8 +197,8 @@ class CrossAttention(nn.Module):
         out = out.contiguous().view(B_, C, H_, W_)
 
         # 还原窗口
-        if pad_hw is not None:
-            out = self._window_reverse(out, pad_hw, B)
+        if size_info is not None:
+            out = self._window_reverse(out, size_info, B)
 
         # 恢复原始窗口大小设置
         if original_window_size is not None:
