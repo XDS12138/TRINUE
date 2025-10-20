@@ -448,13 +448,12 @@ def calculate_niqe(img):
         return float(niqe_score)
         
     except ImportError as e:
-        print(f"Error: pyiqa library is required for NIQE calculation: {e}")
-        print("Please install it with: pip install pyiqa")
-        return 0.0
+        # 抛出异常让验证管理器记录，而不是返回0.0
+        raise ImportError(f"pyiqa library is required for NIQE calculation: {e}. Please install it with: pip install pyiqa")
         
     except Exception as e:
-        print(f"Error calculating NIQE: {e}")
-        return 0.0
+        # 抛出异常让验证管理器记录
+        raise RuntimeError(f"Error calculating NIQE: {e}")
 
 # ===============================
 # 深度估计评估指标
@@ -703,6 +702,19 @@ def evaluate_depth_estimation(pred, gt, epsilon=1e-8,
     # 确保pred和gt是浮点数
     pred = pred.float()
     gt = gt.float()
+    
+    # 🔥 修复维度不匹配问题：处理5维张量
+    # 确保两个张量都是4维 (B, C, H, W)
+    while len(pred.shape) > 4:
+        pred = pred.squeeze(0)
+    while len(gt.shape) > 4:
+        gt = gt.squeeze(0)
+    
+    # 如果是3维，添加batch维度
+    if len(pred.shape) == 3:
+        pred = pred.unsqueeze(0)
+    if len(gt.shape) == 3:
+        gt = gt.unsqueeze(0)
 
     # --- 1. 单位归一化 ---
     # 将GT统一转换为米
@@ -723,6 +735,14 @@ def evaluate_depth_estimation(pred, gt, epsilon=1e-8,
     
     # --- 3. 中值尺度对齐 (Median Scaling) ---
     # 在有效区域内计算尺度因子
+    if valid_mask.sum() == 0:
+        # 如果没有有效像素，返回默认值
+        return {
+            'depth_mae': 0, 'depth_rmse': 0, 'depth_abs_rel': 0, 'depth_sq_rel': 0,
+            'depth_delta1': 0, 'depth_delta2': 0, 'depth_delta3': 0,
+            'median_scale': 1.0
+        }
+        
     median_scale = torch.median(gt[valid_mask]) / torch.median(pred_clamped[valid_mask])
     pred_scaled = pred_clamped * median_scale
 

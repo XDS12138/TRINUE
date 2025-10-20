@@ -466,53 +466,63 @@ class MultiValidationManager:
                 # 归一化到[0,1]范围
                 enhanced_norm = self._normalize_images(enhanced)
                 
-                if val_type == 'enhancement_with_reference' and gt is not None:
+                # 转换一次为numpy，避免重复
+                enhanced_np = self._tensor_to_numpy_image(enhanced_norm)
+                gt_np = None
+                if gt is not None:
                     gt_norm = self._normalize_images(gt)
+                    gt_np = self._tensor_to_numpy_image(gt_norm)
                     
-                    # 全参考指标
+                if val_type == 'enhancement_with_reference' and gt_np is not None:
+                    # 同时支持全参考与无参考指标（按metrics_list请求）
                     for metric_name in metrics_list:
-                        if metric_name == 'psnr':
-                            # 转换为numpy数组
-                            enhanced_np = self._tensor_to_numpy_image(enhanced_norm)
-                            gt_np = self._tensor_to_numpy_image(gt_norm)
-                            batch_metrics['psnr'] = calculate_psnr(enhanced_np, gt_np)
-                        elif metric_name == 'ssim':
-                            enhanced_np = self._tensor_to_numpy_image(enhanced_norm)
-                            gt_np = self._tensor_to_numpy_image(gt_norm)
-                            batch_metrics['ssim'] = calculate_ssim(enhanced_np, gt_np)
-                        elif metric_name == 'ciede2000':
-                            try:
-                                enhanced_np = self._tensor_to_numpy_image(enhanced_norm)
-                                gt_np = self._tensor_to_numpy_image(gt_norm)
-                                batch_metrics['ciede2000'] = calculate_ciede2000(enhanced_np, gt_np)
-                            except Exception as e:
-                                self.val_logger.warning(f"CIEDE2000计算失败: {e}")
-                                pass  # CIEDE2000计算失败时跳过
-                        elif metric_name == 'lpips':
-                            try:
-                                enhanced_np = self._tensor_to_numpy_image(enhanced_norm)
-                                gt_np = self._tensor_to_numpy_image(gt_norm)
-                                batch_metrics['lpips'] = calculate_lpips(enhanced_np, gt_np)
-                            except Exception as e:
-                                self.val_logger.warning(f"LPIPS计算失败: {e}")
-                                pass  # LPIPS计算失败时跳过
+                        try:
+                            if metric_name == 'psnr':
+                                batch_metrics['psnr'] = calculate_psnr(enhanced_np, gt_np)
+                            elif metric_name == 'ssim':
+                                ssim_val = calculate_ssim(enhanced_np, gt_np)
+                                if ssim_val is not None and ssim_val > 0:
+                                    batch_metrics['ssim'] = ssim_val
+                                else:
+                                    self.val_logger.warning(f"SSIM计算返回无效值: {ssim_val}")
+                            elif metric_name == 'ciede2000':
+                                ciede_val = calculate_ciede2000(enhanced_np, gt_np)
+                                if ciede_val is not None and ciede_val > 0:
+                                    batch_metrics['ciede2000'] = ciede_val
+                                else:
+                                    self.val_logger.warning(f"CIEDE2000计算返回无效值: {ciede_val}")
+                            elif metric_name == 'lpips':
+                                lpips_val = calculate_lpips(enhanced_np, gt_np)
+                                if lpips_val is not None:
+                                    batch_metrics['lpips'] = lpips_val
+                                else:
+                                    self.val_logger.warning(f"LPIPS计算返回无效值: {lpips_val}")
+                            elif metric_name == 'uciqe':
+                                batch_metrics['uciqe'] = calculate_uciqe(enhanced_np)
+                            elif metric_name == 'uiqm':
+                                batch_metrics['uiqm'] = calculate_uiqm(enhanced_np)
+                            elif metric_name == 'niqe':
+                                niqe_val = calculate_niqe(enhanced_np)
+                                if niqe_val is not None and niqe_val > 0:
+                                    batch_metrics['niqe'] = niqe_val
+                                else:
+                                    self.val_logger.warning(f"NIQE计算返回无效值: {niqe_val}")
+                        except Exception as e:
+                            self.val_logger.warning(f"{metric_name}计算失败: {e}")
                 
                 elif val_type == 'enhancement_no_reference':
                     # 无参考指标
                     for metric_name in metrics_list:
                         if metric_name == 'uciqe':
-                            enhanced_np = self._tensor_to_numpy_image(enhanced_norm)
                             batch_metrics['uciqe'] = calculate_uciqe(enhanced_np)
                         elif metric_name == 'uiqm':
-                            enhanced_np = self._tensor_to_numpy_image(enhanced_norm)
                             batch_metrics['uiqm'] = calculate_uiqm(enhanced_np)
                         elif metric_name == 'niqe':
                             try:
-                                enhanced_np = self._tensor_to_numpy_image(enhanced_norm)
                                 batch_metrics['niqe'] = calculate_niqe(enhanced_np)
                             except Exception as e:
                                 self.val_logger.warning(f"NIQE计算失败: {e}")
-                                pass  # NIQE计算失败时跳过
+                        # 其他未实现的指标跳过
             
             elif val_type == 'depth_prediction':
                 # 深度预测指标
@@ -659,11 +669,11 @@ class MultiValidationManager:
             file_exists = os.path.exists(comprehensive_csv)
             
             with open(comprehensive_csv, 'a', newline='') as csvfile:
-                fieldnames = list(row_data.keys())
-                writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-                if not file_exists:
-                    writer.writeheader()
-                writer.writerow(row_data)
+                    fieldnames = list(row_data.keys())
+                    writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+                    if not file_exists:
+                        writer.writeheader()
+                    writer.writerow(row_data)
             
             self.val_logger.info(f"综合验证结果已保存到: {comprehensive_csv}")
             

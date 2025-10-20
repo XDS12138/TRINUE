@@ -252,20 +252,21 @@ class UnderwaterDatasetBase(Dataset):
             canvas_np[:paste_y, :] = top_padding
             
             # 下填充
-            bottom_start = paste_y + img_h
-            # 计算实际需要的下填充高度
-            bottom_height = canvas_np.shape[0] - bottom_start
-            if bottom_height > 0:
-                # 从已填充区域取相应高度的像素
-                bottom_source_height = min(bottom_height, paste_y, img_h)
-                bottom_padding = canvas_np[bottom_start-bottom_source_height:bottom_start, :]  # 取下边缘
-                bottom_padding = np.flipud(bottom_padding)  # 垂直翻转
-                # 如果需要更多填充，重复边缘像素
-                if bottom_height > bottom_source_height:
-                    edge_row = bottom_padding[-1:, :]  # 最下边的行
-                    extra_padding = np.repeat(edge_row, bottom_height - bottom_source_height, axis=0)
-                    bottom_padding = np.concatenate([bottom_padding, extra_padding], axis=0)
-                canvas_np[bottom_start:bottom_start+bottom_height, :] = bottom_padding[:bottom_height, :]
+            if paste_y + img_h < canvas_np.shape[0]:
+                bottom_start = paste_y + img_h
+                # 计算实际需要的下填充高度
+                bottom_height = canvas_np.shape[0] - bottom_start
+                if bottom_height > 0:
+                    # 从已填充区域取相应高度的像素
+                    bottom_source_height = min(bottom_height, paste_y, img_h)
+                    bottom_padding = canvas_np[bottom_start-bottom_source_height:bottom_start, :]  # 取下边缘
+                    bottom_padding = np.flipud(bottom_padding)  # 垂直翻转
+                    # 如果需要更多填充，重复边缘像素
+                    if bottom_height > bottom_source_height:
+                        edge_row = bottom_padding[-1:, :]  # 最下边的行
+                        extra_padding = np.repeat(edge_row, bottom_height - bottom_source_height, axis=0)
+                        bottom_padding = np.concatenate([bottom_padding, extra_padding], axis=0)
+                    canvas_np[bottom_start:bottom_start+bottom_height, :] = bottom_padding[:bottom_height, :]
         
         return Image.fromarray(canvas_np)
     

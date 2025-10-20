@@ -109,11 +109,8 @@ validation_sets:
     metrics:
       - "psnr"
       - "ssim" 
-      - "ms_ssim"
       - "ciede2000"
       - "lpips"
-      - "fid"
-      - "sam"
     save_images: 5
     folder_structure:
       input: "input"
@@ -128,11 +125,8 @@ validation_sets:
     metrics:
       - "psnr"
       - "ssim"
-      - "ms_ssim"
       - "ciede2000"
       - "lpips"
-      - "fid"
-      - "sam"
     save_images: 5
     folder_structure:
       input: "input"
@@ -147,11 +141,8 @@ validation_sets:
     metrics:
       - "psnr"
       - "ssim"
-      - "ms_ssim"
       - "ciede2000"
       - "lpips"
-      - "fid"
-      - "sam"
     save_images: 5
     folder_structure:
       gt: "gt"
@@ -340,7 +331,7 @@ loss:
     cmcl_var: 0.65
     cmcl_rgb: 0.65
     cmcl_depth: 0.65
-  
+
   # 仅在 use_uncertainty_weighting=false 时生效的手动权重（细粒度）
   lambda_smooth: 0.01        # 深度平滑项专用
   lambda_attncons: 1.0           # 注意力一致性项专用

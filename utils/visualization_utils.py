@@ -147,8 +147,8 @@ def _log_depth_visualization(depth_gt, metric_logger, step, config, vis_logger):
     
     # 从配置中获取深度范围
     depth_config = config['loss'].get('depth_processing', {})
-    min_depth = depth_config.get('min_depth_log', 5000.0)
-    max_depth = depth_config.get('max_depth_log', 65000.0)
+    min_depth = depth_config.get('min_depth_log', 2000.0)
+    max_depth = depth_config.get('max_depth_log', 65535.0)
     log_min = torch.log(torch.tensor(min_depth, device=depth_gt.device) + 1.0)
     log_max = torch.log(torch.tensor(max_depth, device=depth_gt.device) + 1.0)
     norm_depth = (log_depth - log_min) / (log_max - log_min + 1e-6)

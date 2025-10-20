@@ -68,7 +68,7 @@ def ensure_normalized_depth(
 
     # If max value is very small (e.g. < 2.0) and min is non-negative, it's likely normalized.
     # This threshold (2.0) is a heuristic and might need adjustment based on typical raw depth scales.
-    # Consider min_depth_config from YAML which is e.g. 5000.0 for raw depth.
+    # Consider min_depth_config from YAML which is e.g. 2000.0 for raw depth.
     if current_max_val < min_depth and current_max_val <= 2.0 and current_min_val >= 0: # Heuristic
         logger.debug(f"[{source_tag}] Depth tensor heuristically determined as ALREADY normalized. Shape: {depth_tensor.shape}, Range: [{current_min_val:.4f}, {current_max_val:.4f}]")
         depth_tensor._depth_processed = True

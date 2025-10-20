@@ -121,7 +121,7 @@ class CrossAttention(nn.Module):
                 q_chunk = q[b0:b1, :, :, i:end_i]  # [Bb, heads, d_k, chunk_size]
                 k_chunk = k[b0:b1]
                 v_chunk = v[b0:b1]
-
+                
                 # 计算当前chunk的注意力
                 attn_chunk = torch.einsum('bhcI,bhcJ->bhIJ', q_chunk, k_chunk) * scale
                 attn_chunk = torch.softmax(attn_chunk, dim=-1)

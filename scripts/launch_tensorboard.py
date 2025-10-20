@@ -136,34 +136,62 @@ def find_latest_experiment(base_dirs=None, config_path="configs/train.yaml"):
     print(f"🎯 选择最新实验: {latest_exp}")
     return latest_exp
 
-def find_tensorboard_dir(exp_dir):
-    """查找实验目录中的TensorBoard日志目录"""
+def find_tensorboard_dirs(exp_dir):
+    """收集实验目录中所有包含 TensorBoard 事件文件的子目录，返回列表"""
+    candidates = []
     possible_paths = [
         os.path.join(exp_dir, "tensorboard"),
         os.path.join(exp_dir, "logs"),
-        exp_dir  # 如果直接在实验目录下
+        exp_dir  # 兜底：直接在实验目录下
     ]
     
-    for path in possible_paths:
-        if os.path.exists(path):
-            # 检查是否包含event文件
-            for root, dirs, files in os.walk(path):
+    seen = set()
+    for base in possible_paths:
+        if not os.path.exists(base):
+            continue
+        for root, dirs, files in os.walk(base):
                 for file in files:
                     if "events.out.tfevents" in file:
-                        print(f"📊 找到TensorBoard日志: {root}")
-                        return root
+                    if root not in seen:
+                        seen.add(root)
+                        candidates.append(root)
     
-    # 如果没找到event文件，返回tensorboard目录（如果存在）
+    # 如果没找到具体事件文件，但有 tensorboard 目录，至少返回该目录
+    if not candidates:
     tb_dir = os.path.join(exp_dir, "tensorboard")
     if os.path.exists(tb_dir):
-        return tb_dir
-    
-    return exp_dir
+            candidates.append(tb_dir)
+        else:
+            candidates.append(exp_dir)
 
-def launch_tensorboard_autodl(log_dir, port=6007):
-    """在AutoDL环境中启动TensorBoard"""
+    print("📊 将使用以下TensorBoard日志目录：")
+    for p in candidates:
+        print(f"  - {p}")
+    return candidates
+
+def launch_tensorboard_autodl(log_dirs, port=6007):
+    """在AutoDL环境中启动TensorBoard，支持多目录"""
+    if isinstance(log_dirs, str):
+        log_dirs = [log_dirs]
+
+    # 构建多目录规范：使用 name:path 的逗号分隔
+    # name 使用目录名，避免重复
+    specs = []
+    used_names = set()
+    for p in log_dirs:
+        name = os.path.basename(p.rstrip(os.sep)) or os.path.basename(os.path.dirname(p.rstrip(os.sep)))
+        # 确保名称唯一
+        base_name = name
+        idx = 1
+        while name in used_names:
+            idx += 1
+            name = f"{base_name}_{idx}"
+        used_names.add(name)
+        specs.append(f"{name}:{p}")
+    logdir_spec = ",".join(specs)
+
     print(f"🚀 在AutoDL环境中启动TensorBoard...")
-    print(f"📂 监控目录: {log_dir}")
+    print(f"📂 监控目录: {logdir_spec}")
     print(f"🌐 端口: {port}")
     print(f"🔗 访问地址: http://localhost:{port}")
     print()
@@ -174,7 +202,7 @@ def launch_tensorboard_autodl(log_dir, port=6007):
     print()
     
     # 启动TensorBoard命令
-    cmd = ["tensorboard", "--logdir", log_dir, "--port", str(port), "--host", "0.0.0.0"]
+    cmd = ["tensorboard", "--logdir_spec", logdir_spec, "--port", str(port), "--host", "0.0.0.0"]
     
     print(f"执行命令: {' '.join(cmd)}")
     print("🔄 正在启动TensorBoard...")
@@ -228,16 +256,17 @@ def main():
         print("   3. 检查 configs/train.yaml 中的 output_dir 设置")
         sys.exit(1)
     
-    # 查找TensorBoard日志目录
-    tb_dir = find_tensorboard_dir(exp_dir)
+    # 查找TensorBoard日志目录（支持多目录）
+    tb_dirs = find_tensorboard_dirs(exp_dir)
     
-    if not os.path.exists(tb_dir):
-        print(f"❌ TensorBoard日志目录不存在: {tb_dir}")
+    # 简单校验任意一个目录存在
+    if not any(os.path.exists(p) for p in tb_dirs):
+        print(f"❌ TensorBoard日志目录不存在: {tb_dirs}")
         print("💡 请确保训练已开始并启用了TensorBoard日志记录")
         sys.exit(1)
     
     # 启动TensorBoard
-    success = launch_tensorboard_autodl(tb_dir, args.port)
+    success = launch_tensorboard_autodl(tb_dirs, args.port)
     
     if not success:
         sys.exit(1)

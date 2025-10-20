@@ -494,6 +494,15 @@ class UnderwaterEnhanceNet(nn.Module):
                 if log_this_step: self.logger.info(f"  - Using ReconHead with residuals. Output shape: {out.shape}, Refined depth shape: {depth_pred_refine.shape}")
             
             # 为了保持兼容性，从残差重新计算J_D和I_A
+            # 🔥 修复尺寸不匹配问题：确保残差与原图尺寸一致
+            target_size = raw.shape[-2:]  # (H, W)
+            
+            if res_d is not None and res_d.shape[-2:] != target_size:
+                res_d = F.interpolate(res_d, size=target_size, mode='bilinear', align_corners=False)
+                
+            if res_c is not None and res_c.shape[-2:] != target_size:
+                res_c = F.interpolate(res_c, size=target_size, mode='bilinear', align_corners=False)
+                
             J_D = raw + res_d if res_d is not None else None
             I_A = raw + res_c if res_c is not None else None
 

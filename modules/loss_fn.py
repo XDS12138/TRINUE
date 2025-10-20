@@ -225,7 +225,7 @@ class EdgeAwareDepthLoss(nn.Module):
 
     结合了L1损失和边缘加权梯度损失，能够更好地保留深度边界
     """
-    def __init__(self, edge_weight=0.5, min_depth=5000.0, max_depth=65000.0):
+    def __init__(self, edge_weight=0.5, min_depth=2000.0, max_depth=65535.0):
         super().__init__()
         self.l1 = nn.L1Loss()
         self.edge_weight = edge_weight
@@ -325,7 +325,7 @@ class EdgeAwareDepthLoss(nn.Module):
         if hasattr(target, '_depth_processed') and target._depth_processed:
             target_normalized = True
         # 2. 通过值域检测
-        elif target_max < 5000.0 or (target_max <= 1.0 and target_min >= 0.0):
+        elif target_max < self.min_depth or (target_max <= 1.0 and target_min >= 0.0):
             target_normalized = True
         
         # 3. 检查预测深度是否已归一化
@@ -593,7 +593,7 @@ class DepthLoss(nn.Module):
         lambda_depth: 深度预测损失权重
         lambda_smooth: 深度平滑损失权重
     """
-    def __init__(self, lambda_depth=1.0, lambda_smooth=0.01, min_depth=5000.0, max_depth=65000.0):
+    def __init__(self, lambda_depth=1.0, lambda_smooth=0.01, min_depth=2000.0, max_depth=65535.0):
         super().__init__()
         self.lambda_depth = lambda_depth
         self.lambda_smooth = lambda_smooth
@@ -722,11 +722,11 @@ class TotalLoss(nn.Module):
                   lambda_cmcl_var=1.0,     # 方差损失权重
                   lambda_cmcl_rgb=1.0,     # RGB一致性权重  
                   lambda_cmcl_depth=1.0,   # 深度一致性权重
-                  cmcl_k_decay=1.0,        # 深度衰减系数
-                  use_uncertainty_weighting=True,
-                  sigma_init=None,
-                  min_depth=5000.0,
-                  max_depth=65000.0):
+                 cmcl_k_decay=1.0,        # 深度衰减系数
+                 use_uncertainty_weighting=True,
+                 sigma_init=None,
+                 min_depth=2000.0,
+                 max_depth=65535.0):
         super().__init__()
         
         # 获取日志记录器
