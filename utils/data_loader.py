@@ -222,30 +222,30 @@ def _create_folder_datasets(config, height, width, augment_prob, dataset_type):
 
 def _create_lmdb_datasets(config, height, width, augment_prob, augmentations):
     """创建LMDB格式的数据集"""
-    # LMDB格式暂时只支持标准的单输入方式
-    # 未来可考虑实现MultiDegradationLMDBDataset
     
     train_lmdb = config['data']['lmdb_paths']['train']
-    val_lmdb = config['data']['lmdb_paths']['val']
+    val_lmdb = config['data']['lmdb_paths'].get('val', None)
     
-    # 实例化训练集和验证集
-    from data.lmdb_dataset import UnderwaterLMDBDataset
-    train_dataset = UnderwaterLMDBDataset(
+    # 导入多退化LMDB数据集类
+    from modules.datasets import MultiDegradationLMDBDataset
+    
+    # 实例化训练集
+    train_dataset = MultiDegradationLMDBDataset(
         lmdb_path=train_lmdb,
-        resolution=(height, width),
-        augment_prob=augment_prob,
-        augmentations=augmentations,
-        mode='train'
+        patch_size=(height, width),
+        augment=augment_prob > 0
     )
     
-    val_dataset = UnderwaterLMDBDataset(
-        lmdb_path=val_lmdb,
-        resolution=(height, width),
-        augment_prob=0.0,  # 验证时不使用增强
-        mode='val'
-    )
+    # 实例化验证集（如果有）
+    val_dataset = None
+    if val_lmdb and os.path.exists(val_lmdb):
+        val_dataset = MultiDegradationLMDBDataset(
+            lmdb_path=val_lmdb,
+            patch_size=(height, width),
+            augment=False  # 验证时不使用增强
+        )
     
-    logger.warning("LMDB格式目前仅支持单退化输入")
+    logger.info(f"LMDB数据集加载完成: 训练{len(train_dataset)}样本")
     
     return train_dataset, val_dataset
 

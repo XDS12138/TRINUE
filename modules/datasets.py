@@ -9,6 +9,14 @@ import torchvision.transforms as T
 import numpy as np
 import glob
 
+# LMDB支持（可选）
+try:
+    import lmdb
+    import pickle
+    LMDB_AVAILABLE = True
+except ImportError:
+    LMDB_AVAILABLE = False
+
 def load_image(path, mode='RGB'):
     """Load an image as PIL Image with specified mode."""
     try:
@@ -517,4 +525,147 @@ class MultiDegradationDataset(UnderwaterDatasetBase):
         raw_batch = torch.stack(raw_tensors, dim=0)
 
         return {'raw_imgs': raw_batch, 'depth': depth_t, 'gt': gt_t,
-                'num_degradations': len(raw_tensors), 'basename': basename} 
+                'num_degradations': len(raw_tensors), 'basename': basename}
+
+
+class MultiDegradationLMDBDataset(Dataset):
+    """
+    多退化LMDB数据集
+    
+    支持从LMDB文件中读取多退化训练数据
+    LMDB中每个样本包含:
+    - raw_imgs: [15, 3, H, W] numpy数组
+    - gt: [3, H, W] numpy数组
+    - depth: [1, H, W] numpy数组
+    - basename: 文件名
+    """
+    
+    def __init__(self, lmdb_path, patch_size=256, augment=True):
+        """
+        Args:
+            lmdb_path: LMDB文件路径
+            patch_size: 裁剪尺寸
+            augment: 是否进行数据增强
+        """
+        if not LMDB_AVAILABLE:
+            raise ImportError("LMDB格式需要安装lmdb库: pip install lmdb")
+        
+        self.lmdb_path = lmdb_path
+        self.patch_size = patch_size if isinstance(patch_size, tuple) else (patch_size, patch_size)
+        self.augment = augment
+        
+        # 打开LMDB环境（只读）
+        self.env = lmdb.open(lmdb_path, readonly=True, lock=False, 
+                            readahead=False, meminit=False)
+        
+        # 读取元数据
+        with self.env.begin(write=False) as txn:
+            meta_bytes = txn.get(b'__meta__')
+            if meta_bytes:
+                self.meta = pickle.loads(meta_bytes)
+                self.num_samples = self.meta['num_samples']
+                self.num_degradations = self.meta.get('num_degradations', 15)
+            else:
+                # 如果没有元数据，尝试计算样本数
+                self.num_samples = txn.stat()['entries'] - 1  # 减去meta键
+                self.num_degradations = 15
+        
+        print(f"[LMDB Dataset] 加载完成: {self.num_samples} 样本, {self.num_degradations} 种退化")
+    
+    def __len__(self):
+        return self.num_samples
+    
+    def __getitem__(self, idx):
+        """获取单个样本"""
+        # 从LMDB读取
+        with self.env.begin(write=False) as txn:
+            key = f"sample_{idx:06d}".encode('ascii')
+            value = txn.get(key)
+            
+            if value is None:
+                raise KeyError(f"样本不存在: {key}")
+            
+            sample = pickle.loads(value)
+        
+        # 解析数据
+        raw_imgs = sample['raw_imgs']  # [15, 3, H, W] uint8
+        gt = sample['gt']              # [3, H, W] uint8
+        depth = sample['depth']        # [1, H, W] uint16
+        basename = sample.get('basename', f'sample_{idx}')
+        
+        # 转换为PIL图像列表
+        # raw_imgs: [15, 3, H, W] -> list of 15 PIL Images
+        raw_imgs_pil = []
+        for i in range(raw_imgs.shape[0]):
+            # [3, H, W] -> [H, W, 3]
+            img_array = np.transpose(raw_imgs[i], (1, 2, 0))
+            img_pil = Image.fromarray(img_array.astype(np.uint8))
+            raw_imgs_pil.append(img_pil)
+        
+        # GT: [3, H, W] -> PIL
+        gt_array = np.transpose(gt, (1, 2, 0))
+        gt_pil = Image.fromarray(gt_array.astype(np.uint8))
+        
+        # Depth: [1, H, W] -> [H, W] numpy
+        depth_array = depth.squeeze(0) if depth.ndim == 3 else depth
+        
+        # 数据增强（如果启用）
+        if self.augment:
+            raw_imgs_pil, gt_pil, depth_array = self._apply_augmentations(
+                raw_imgs_pil, gt_pil, depth_array
+            )
+        
+        # 转换为tensor
+        raw_tensors = []
+        for img in raw_imgs_pil:
+            tensor = F.to_tensor(img)  # [3, H, W], [0, 1]
+            tensor = tensor * 2.0 - 1.0  # 归一化到[-1, 1]
+            raw_tensors.append(tensor)
+        
+        raw_batch = torch.stack(raw_tensors, dim=0)  # [15, 3, H, W]
+        
+        gt_tensor = F.to_tensor(gt_pil)  # [3, H, W], [0, 1]
+        gt_tensor = gt_tensor * 2.0 - 1.0  # 归一化到[-1, 1]
+        
+        # 深度图归一化到[0, 1]
+        depth_tensor = torch.from_numpy(depth_array.copy().astype(np.float32))
+        depth_tensor = depth_tensor / 65535.0  # 假设16位深度图
+        depth_tensor = depth_tensor.unsqueeze(0)  # [1, H, W]
+        
+        return {
+            'raw_imgs': raw_batch,      # [15, 3, H, W]
+            'depth': depth_tensor,      # [1, H, W]
+            'gt': gt_tensor,            # [3, H, W]
+            'num_degradations': self.num_degradations,
+            'basename': basename
+        }
+    
+    def _apply_augmentations(self, raw_imgs_pil, gt_pil, depth_array):
+        """应用数据增强"""
+        # 随机裁剪（简化版）
+        if self.patch_size:
+            w, h = raw_imgs_pil[0].size
+            ps_h, ps_w = self.patch_size
+            
+            if w > ps_w and h > ps_h:
+                left = random.randint(0, w - ps_w)
+                top = random.randint(0, h - ps_h)
+                
+                # 裁剪所有图像
+                raw_imgs_pil = [img.crop((left, top, left + ps_w, top + ps_h)) 
+                               for img in raw_imgs_pil]
+                gt_pil = gt_pil.crop((left, top, left + ps_w, top + ps_h))
+                depth_array = depth_array[top:top + ps_h, left:left + ps_w]
+        
+        # 随机翻转
+        if random.random() < 0.5:
+            raw_imgs_pil = [F.hflip(img) for img in raw_imgs_pil]
+            gt_pil = F.hflip(gt_pil)
+            depth_array = np.fliplr(depth_array)
+        
+        return raw_imgs_pil, gt_pil, depth_array
+    
+    def __del__(self):
+        """关闭LMDB环境"""
+        if hasattr(self, 'env'):
+            self.env.close()

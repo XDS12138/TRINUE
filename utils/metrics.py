@@ -717,11 +717,25 @@ def evaluate_depth_estimation(pred, gt, epsilon=1e-8,
         gt = gt.unsqueeze(0)
 
     # --- 1. 单位归一化 ---
-    # 将GT统一转换为米
+    # 将GT统一转换为米（或保持像素值）
     if gt_units == 'mm':
         gt = gt / 1000.0
         valid_min_m = valid_min / 1000.0
         valid_max_m = valid_max / 1000.0
+    elif gt_units == 'pixel' or gt_units == 'relative':
+        # 🔥 像素值或相对深度：不转换单位，直接使用
+        # 归一化到[0,1]范围用于计算
+        gt_min = gt[gt > 0].min() if (gt > 0).any() else 0.0
+        gt_max = gt.max()
+        if gt_max > gt_min:
+            gt = (gt - gt_min) / (gt_max - gt_min + epsilon)
+            # 预测值也需要归一化到相似范围
+            pred_min = pred[pred > 0].min() if (pred > 0).any() else 0.0
+            pred_max = pred.max()
+            if pred_max > pred_min:
+                pred = (pred - pred_min) / (pred_max - pred_min + epsilon)
+        valid_min_m = 0.01  # 归一化后的最小值
+        valid_max_m = 1.0   # 归一化后的最大值
     else: # 默认为 'm'
         valid_min_m = valid_min
         valid_max_m = valid_max

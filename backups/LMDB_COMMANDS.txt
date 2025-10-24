@@ -1,0 +1,17 @@
+# LMDB转换命令（已修复内存溢出问题）
+
+## 终端1 - 多输入LMDB（D盘 → F盘）
+python -u scripts/create_lmdb.py --data-root "D:/UBB_train" --output "F:/DATASATES/UBB_train.lmdb" --map-size-gb 1024
+
+## 终端2 - 单输入LMDB（D盘 → E盘）
+python -u scripts/create_lmdb_single_input.py --input-dir "D:/UBB_train_single_input/input" --gt-dir "D:/UBB_train_single_input/gt" --output "E:/DATASATES/UBB_train_single_input.lmdb" --map-size-gb 1024
+
+---
+修复内容:
+✅ 每500个样本提交一次（多输入）
+✅ 每1000个样本提交一次（单输入）
+✅ 自动创建输出目录
+✅ 避免内存溢出
+
+
+

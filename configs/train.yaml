@@ -69,7 +69,7 @@ gpu:
 data:
   format: "folder"  # 数据格式: "folder" 或 "lmdb"
   dataset_type: multi_degradation
-  train_root: "DATA/train"  # 训练数据集路径
+  train_root: "DATA/UBB_train"  # 🔥 训练数据集路径（11,098样本，已排除验证集）
   val_root: null  # 禁用旧验证集，使用多验证集配置
   folder_structure:  # 固定文件夹结构，仅在format="folder"时有效
     gt: "gt"        # 目标图像文件夹名
@@ -99,78 +99,84 @@ data:
 
 # 🔥 多验证集配置
 validation_sets:
-  # 📸 水下图像增强 - 有参考验证集（使用全部7个指标）
-  uieb_test:
-    name: "UIEB_Test"
+  # 🔥 UBB有参考验证集（新增，1,500样本）
+  ubb_reference:
+    name: "UBB_Reference"
     type: "enhancement_with_reference"
-    data_root: "DATA/color_val/UIEB_test"
+    data_root: "DATA/validation/UBB-M_reference"
     enabled: true
-    description: "UIEB测试集 - 水下图像增强全参考评估"
+    description: "UBB有参考验证集 - 1,500样本（100个/退化）"
+    metrics:
+      - "psnr"
+      - "ssim"
+      - "ciede2000"
+      - "lpips"
+    save_images: 10
+    folder_structure:
+      input: "input"
+      gt: "gt"
+
+  # 📸 UIEB有参考验证集
+  uieb_reference:
+    name: "UIEB_Reference"
+    type: "enhancement_with_reference"
+    data_root: "DATA/validation/UIEB_reference"
+    enabled: true
+    description: "UIEB有参考验证集 - 水下图像增强全参考评估"
     metrics:
       - "psnr"
       - "ssim" 
       - "ciede2000"
       - "lpips"
-    save_images: 5
+    save_images: 10
     folder_structure:
       input: "input"
       gt: "gt"
     
-  lsui_test:
-    name: "LSUI_Test"
+  lsui_reference:
+    name: "LSUI_Reference"
     type: "enhancement_with_reference"
-    data_root: "DATA/color_val/LSUI_test"
+    data_root: "DATA/validation/LSUI_reference"
     enabled: true
-    description: "LSUI测试集 - 水下图像增强全参考评估"
+    description: "LSUI有参考验证集 - 水下图像增强全参考评估"
     metrics:
       - "psnr"
       - "ssim"
       - "ciede2000"
       - "lpips"
-    save_images: 5
+    save_images: 10
     folder_structure:
       input: "input"
       gt: "gt"
 
-  ubb_test:
-    name: "UBB_Test"
+  ubb_test_old:
+    name: "UBB_Test_Old"
     type: "enhancement_with_reference"
     data_root: "DATA/color_val/UBB-test"
-    enabled: true
-    description: "UBB测试集 - 水下图像增强全参考评估"
-    metrics:
-      - "psnr"
-      - "ssim"
-      - "ciede2000"
-      - "lpips"
-    save_images: 5
-    folder_structure:
-      gt: "gt"
-      input: "color_BG_1"  # 默认输入文件夹
-    multi_input: true  # 标记为多输入验证集
-    input_folders:  # 所有退化类型文件夹
-      - "color_B_1"
-      - "color_B_2"
-      - "color_B_3"
-      - "color_BG_1"
-      - "color_BG_2"
-      - "color_BG_3"
-      - "color_G_1"
-      - "color_G_2"
-      - "color_G_3"
-      - "color_Y_1"
-      - "color_Y_2"
-      - "color_Y_3"
-      - "color_YG_1"
-      - "color_YG_2"
-      - "color_YG_3"
+    enabled: false  # 🔧 禁用（使用新的UBB验证集）
+    description: "旧UBB测试集"
 
-  # 🌊 水下图像增强 - 无参考验证集（仅使用无参考指标）
+  # 🔥 UBB无参考验证集（新增，1,500样本）
+  ubb_noreference:
+    name: "UBB_NoReference"
+    type: "enhancement_no_reference"
+    data_root: "DATA/validation/UBB-M_noreference"
+    enabled: true
+    description: "UBB无参考验证集 - 1,500样本"
+    metrics:
+      - "uciqe"
+      - "uiqm"
+      - "niqe"
+    save_images: 10
+    folder_structure:
+      input: "input"
+
+  # 🌊 UIEB挑战集（如果存在）
   uieb_challenging:
     name: "UIEB_Challenging_NoRef"
     type: "enhancement_no_reference"
     data_root: "DATA/color_val/UIEB_challenging"
-    enabled: true
+    enabled: false  # 🔧 禁用（目录不存在）
     description: "UIEB挑战性测试集 - 无参考质量评估"
     metrics:
       - "uciqe"
@@ -180,10 +186,25 @@ validation_sets:
     folder_structure:
       input: "."
 
-  squid_noref:
-    name: "SQUID_NoRef"
+  # 🌊 UIEB无参考验证集
+  uieb_noreference:
+    name: "UIEB_NoReference"
     type: "enhancement_no_reference"
-    data_root: "DATA/color_val/SQUID"
+    data_root: "DATA/validation/UIEB_noreference"
+    enabled: true
+    description: "UIEB无参考验证集"
+    metrics:
+      - "uciqe"
+      - "uiqm"
+      - "niqe"
+    save_images: 10
+    folder_structure:
+      input: "."
+
+  squid_noreference:
+    name: "SQUID_NoReference"
+    type: "enhancement_no_reference"
+    data_root: "DATA/validation/SQUID_noreference"
     enabled: true
     description: "SQUID数据集 - 无参考质量评估"
     metrics:
@@ -194,17 +215,42 @@ validation_sets:
     folder_structure:
       input: "."
 
-  # 🏔️ 深度预测验证集
+  # 🔥 UBB深度验证集（新增，1,500对）
+  ubb_depth:
+    name: "UBB_Depth"
+    type: "depth_prediction"
+    data_root: "DATA/validation/UBB-M_depth"
+    enabled: true
+    description: "UBB深度验证集 - 1,500样本（RGB-Depth配对）"
+    depth_gt_units: "pixel"      # 🔥 16位PNG像素值，自动归一化
+    depth_valid_min: 100.0       # 有效像素值范围（避免噪声）
+    depth_valid_max: 65535.0     # 16位最大值
+    metrics:
+      - "depth_mae"
+      - "depth_rmse"
+      - "depth_abs_rel"
+      - "depth_sq_rel"
+      - "depth_log10"
+      - "depth_delta1"
+      - "depth_delta2"
+      - "depth_delta3"
+    save_images: 10
+    folder_structure:
+      rgb: "input"  # 🔧 注意：是input不是rgb
+      depth: "depth"
+    depth_format: "png"  # 🔥 使用PNG格式（16位）
+
+  # 🏔️ SeaThru深度（如果需要）
   seathru_depth:
     name: "SeaThru_Depth"
     type: "depth_prediction"
-    data_root: "DATA/depth_val/SeaThru_D3_D5_TestSet/test"
+    data_root: "DATA/validation/SeaThru_D3_D5_TestSet/test"
     enabled: true
     description: "SeaThru D3&D5 深度预测测试集"
-    depth_gt_units: "m"      # 深度图单位: m (米)
-    depth_valid_min: 0.1     # 有效深度最小值 (m)
-    depth_valid_max: 26.0    # 有效深度最大值 (m)
-    pred_clamp_val: 26.0     # 预测值计算scale前的最大钳位值 (m)
+    depth_gt_units: "m"          # 保持原单位配置
+    depth_valid_min: 0.1         # 有效深度最小值 (m)
+    depth_valid_max: 26.0        # 有效深度最大值 (m)
+    pred_clamp_val: 26.0         # 预测钳位值
     metrics:
       - "depth_mae"
       - "depth_rmse"
@@ -218,18 +264,18 @@ validation_sets:
     folder_structure:
       rgb: "rgb"        # RGB图像文件夹
       depth: "depth"    # 深度图像文件夹
-    depth_format: "npy"  # 🔧 指定深度文件格式为numpy
+    depth_format: "png"  # 🔥 统一使用PNG格式（16位）
 
   squid_depth:
     name: "SQUID_Depth"
     type: "depth_prediction"
-    data_root: "DATA/depth_val/SQUID_Monocular_Left_Camera_TestSet/test"
+    data_root: "DATA/validation/SQUID_Monocular_Left_Camera_TestSet/test"
     enabled: true
     description: "SQUID单目深度预测测试集"
-    depth_gt_units: "mm"     # 深度图单位: mm (毫米)
-    depth_valid_min: 1.0     # 有效深度最小值 (mm)
-    depth_valid_max: 115.0   # 有效深度最大值 (mm)
-    pred_clamp_val: 0.115    # 预测值计算scale前的最大钳位值 (m, 115mm)
+    depth_gt_units: "mm"         # 保持原单位配置
+    depth_valid_min: 1.0         # 有效深度最小值 (mm)
+    depth_valid_max: 115.0       # 有效深度最大值 (mm)
+    pred_clamp_val: 0.115        # 预测钳位值 (m)
     metrics:
       - "depth_mae"
       - "depth_rmse"
@@ -243,15 +289,15 @@ validation_sets:
     folder_structure:
       rgb: "rgb"
       depth: "depth"
-    depth_format: "npy"
+    depth_format: "npy"  # 使用npy深度文件对齐官方格式
 
 
 
-  ubb_depth_test:
-    name: "UBB_Depth_Test"
+  ubb_depth_test_old:
+    name: "UBB_Depth_Test_Old"
     type: "depth_prediction"
     data_root: "DATA/depth_val/UBB-depthtest"
-    enabled: true
+    enabled: false  # 🔧 禁用（使用新的UBB深度验证集）
     description: "UBB深度预测验证集"
     depth_gt_units: "relative"  # 相对深度单位
     depth_valid_min: 0.1      # 有效深度最小值
